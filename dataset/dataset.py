@@ -59,7 +59,8 @@ configs = {
         "SideRearCam01",  #左后
         "SideRearCam02"   #右后
     ],
-    
+    # 3D 检测类别：与 convert_det 输出的 object_infos[].sub_category 对应，用于映射到类别下标
+    "det_class_names": ["car", "truck", "bus", "pedestrian", "bicycle", "motorcycle", "traffic_cone", "barrier"],
 }
 
 def get_rot(h):
@@ -201,8 +202,53 @@ class Dataset(torch.utils.data.Dataset):
     def get_annos_det2D(self,):
         pass
 
-    def get_annos_det3D(self):
-        pass
+    def get_annos_det3D(self, rec):
+        """
+        从 rec 中每帧的 label json 读取 object_infos，转为 docs/DATA_FORMAT 约定的 3D 检测真值。
+        与 convert_det.py 输出的标准格式一致：object_infos[track_id] = {
+            "category", "sub_category", "position": {x,y,z}, "rotation": {yaw,...}, "dimension": {width, length, height}
+        }
+        Returns:
+            gt_labels_per_frame: list of length T，每元素 (N_t,) long，类别下标
+            gt_bboxes_per_frame: list of length T，每元素 (N_t, 10)，解码格式 [x,y,z,w,l,h,yaw,vx,vy,vz]
+            yaw 为弧度；无速度填 0。
+        """
+        gt_labels_per_frame = []
+        gt_bboxes_per_frame = []
+        class_names = self.config.get("det_class_names", ["car", "truck", "bus", "pedestrian", "bicycle"])
+        for label_path in rec:
+            with open(label_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            object_infos = data.get("object_infos", {})
+            labels_list = []
+            bboxes_list = []
+            for track_id, obj in object_infos.items():
+                pos = obj.get("position")
+                rot = obj.get("rotation")
+                dim = obj.get("dimension")
+                if pos is None or rot is None or dim is None:
+                    continue
+                sub = obj.get("sub_category", "car")
+                try:
+                    cls_id = class_names.index(sub)
+                except ValueError:
+                    cls_id = 0
+                x = float(pos.get("x", 0))
+                y = float(pos.get("y", 0))
+                z = float(pos.get("z", 0))
+                yaw = float(rot.get("yaw", 0.0))
+                w = float(dim.get("width", 0))
+                length = float(dim.get("length", 0))
+                h = float(dim.get("height", 0))
+                bboxes_list.append([x, y, z, w, length, h, yaw, 0.0, 0.0, 0.0])
+                labels_list.append(cls_id)
+            if len(labels_list) == 0:
+                gt_labels_per_frame.append(torch.zeros(0, dtype=torch.long))
+                gt_bboxes_per_frame.append(torch.zeros(0, 10, dtype=torch.float32))
+            else:
+                gt_labels_per_frame.append(torch.tensor(labels_list, dtype=torch.long))
+                gt_bboxes_per_frame.append(torch.tensor(bboxes_list, dtype=torch.float32))
+        return gt_labels_per_frame, gt_bboxes_per_frame
 
     def get_anno_map2D(self):
         pass
@@ -221,14 +267,25 @@ class Dataset(torch.utils.data.Dataset):
 
     
 
-    def __getitem__(self,index):
+    def __getitem__(self, index):
         sces_len = self.sces_len
         scenes = self.scenes
         sce_id = [i for i in range(len(sces_len)) if (sum(sces_len[:i]) <= index and sum(sces_len[:i + 1]) > index)][0]
         sce_id_ind = index - sum(sces_len[:sce_id])
-        rec = self.ixes[scenes[sce_id]][sce_id_ind:sce_id_ind+self.total_len]
+        rec = self.ixes[scenes[sce_id]][sce_id_ind:sce_id_ind + self.total_len]
         imgs, rots, trans, intrins, distorts, post_rots, post_trans = self.get_image_data(rec)
-        print(index,len(rec))
+        gt_labels_3d, gt_bboxes_3d = self.get_annos_det3D(rec)
+        return {
+            "x": imgs,
+            "rots": rots,
+            "trans": trans,
+            "intrins": intrins,
+            "distorts": distorts,
+            "post_rots": post_rots,
+            "post_trans": post_trans,
+            "gt_labels_3d": gt_labels_3d,
+            "gt_bboxes_3d": gt_bboxes_3d,
+        }
 
     def __len__(self):
         return sum([(len(self.ixes[i]) - self.total_len) for i in self.ixes.keys()])
