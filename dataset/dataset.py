@@ -6,6 +6,17 @@
 @E-mail       :afb5szh@bosch.com
 @Version      :V1.0.0
 @Description  :
+    数据处理逻辑：
+    一次forward需要91帧的数据：当前帧是第40帧，即历史是0-39，未来是41-90 # 历史40帧，未来50帧，再加当前帧
+    任务包含：
+    第一阶段2D图像表针学习 
+    第二阶段BEV表征学习
+        检测：             输入                36 37 38 39 40 
+        地图:              输入                36 37 38 39 40
+    第三阶段轨迹交互
+        目标车轨迹：        输入     10 20 30               40   预测 50 60 70 80 90  --从动态拿instance
+        端到端静态：        输入     10 20 30               40   预测 50 60 70 80 90  --从静态拿instance
+        端到端动态：        输入     10 20 30               40   预测 50 60 70 80 90
 
 '''
 
@@ -21,9 +32,15 @@ import torch
 
 configs = {
     # 总的参数
+    "grid_conf" : {
+        'xbound': [-80.0, 120.0, 1],
+        'ybound': [-40.0, 40.0, 1],
+        'zbound': [-2.0, 4.0, 1.0]
+    },
+
     "clip_paths":{
-        "dyo":["/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/det.txt"],
-        "lane":["/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/map.txt"],
+        "dynamic":["/workspace/afb5szh-01/models/e2e_model/e2e_dataset_10Hz_dyo.txt"],
+        "static":["/workspace/afb5szh-01/models/e2e_model/e2e_dataset_10Hz_lane.txt"],
     },
     "camera_infos":{
         "FrontCam02":{
@@ -45,10 +62,38 @@ configs = {
 
 
 
+
     "train_clips":2, # -1 所有，[]指定几个，xxx.txt写进txt中指定的，>0前N个
     
     "total_len":91,
     "current_frame_index":40,#0 1 2 ... 40 ...90 当前帧往前用作网络输入，当前帧往后用作未来真值
+    
+
+    "task_flag":{
+        "det2D":True,
+        "det3D":True,
+
+        "map2D":True,
+        "map3D":True,
+
+        "obj_dynamic_traj":True,
+        "e2e_static_traj":True,
+        "e2e_dynamic_traj":True,
+    },
+    "task_indexs":{
+        "det2D":[36,37,38,39,40],
+        "det3D":  [36,37,38,39,40],
+        
+        "map2D":[36,37,38,39,40],
+        "map3D":  [36,37,38,39,40],
+
+        "obj_dynamic_traj": [10,20,30,40],
+        "e2e_dynamic_traj": [10,20,30,40],
+        "e2e_static_traj":  [10,20,30,40],
+
+    },
+
+
 
 
     "camera_names":[
@@ -62,6 +107,26 @@ configs = {
     # 3D 检测类别：与 convert_det 输出的 object_infos[].sub_category 对应，用于映射到类别下标
     "det_class_names": ["car", "truck", "bus", "pedestrian", "bicycle", "motorcycle", "traffic_cone", "barrier"],
 }
+
+
+
+def quaternion_to_rotation_matrix( x: float, y: float, z: float,w: float) -> np.ndarray:
+    R = np.array([
+        [1 - 2*y*y - 2*z*z,     2*x*y - 2*z*w,     2*x*z + 2*y*w],
+        [2*x*y + 2*z*w,     1 - 2*x*x - 2*z*z,     2*y*z - 2*x*w],
+        [2*x*z - 2*y*w,     2*y*z + 2*x*w,     1 - 2*x*x - 2*y*y]
+    ])
+    
+    return R
+
+def TransformationmatrixEgo(orientation,position):
+    w,x,y,z = orientation
+    rotation_matrix = quaternion_to_rotation_matrix(x,y,z,w)
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] = rotation_matrix
+    transform[:3, 3] = position
+    return transform
+
 
 def get_rot(h):
     return torch.Tensor([
@@ -108,13 +173,28 @@ def img_transform(img,
 class Dataset(torch.utils.data.Dataset):
     def __init__(self,config):
         self.config = config
+
+        self.grid_conf = config["grid_conf"] # bev网格配置
+        self.bevh = self.grid_conf["xbound"][1] - self.grid_conf["xbound"][0]
+        self.bevw = self.grid_conf["ybound"][1] - self.grid_conf["ybound"][0]
+
+        # 相机
+        self.cns = config["camera_names"]#使用几个相机
+        self.cnis = config["camera_infos"]#每个相机增强参数
+
+        self.fH, self.fW  = config["final_dim"] # 网络输入的大小
+
         self.total_len =config["total_len"]
         self.current_frame_index = config["current_frame_index"]
-        self.cns = config["camera_names"]
-        self.fH, self.fW  = config["final_dim"]
-        self.cnis = config["camera_infos"]
+        
+        
 
+        # 联合训练配置
+        self.task_flags = config["task_flag"]
+        self.task_indexs = config["task_indexs"]
+        self.useful_indexs,self.group_indexs = self.get_input_indexs()
 
+        # 数据准备
         self.get_all_paths()
         self.prepro()
         self.sces_len = [(len(self.ixes[i]) - self.total_len ) for i in self.ixes.keys()]
@@ -158,12 +238,12 @@ class Dataset(torch.utils.data.Dataset):
                 rot = lidar2camera[:3,:3]
                 tran =  lidar2camera[:3,3]
                 # 获取图像信息
-                # image_name = os.path.basename(image_paths[cn])
-                # image_path = os.path.join(
-                #     os.path.dirname(label_path).replace("label",cn),
-                #     image_name
-                # )
-                image_path = label_path.replace("label",cn).replace(".json",".jpg")
+                image_name = os.path.basename(image_paths[cn])
+                image_path = os.path.join(
+                    os.path.dirname(label_path).replace("label",cn),
+                    image_name
+                )
+                # image_path = label_path.replace("label",cn).replace(".json",".jpg")
                 #如果图像不存在的话，给置成全0黑图，参数就全部初始化一下----这里默认所有视角的图片都存在
                 # 数据增强的参数
                 resize_lims,bot_pct_lims,rot_lim,flip = self.cnis[cn]["resize_lim"],self.cnis[cn]["bot_pct_lim"],self.config["rot_lim"],self.config["flip"]
@@ -199,10 +279,19 @@ class Dataset(torch.utils.data.Dataset):
         return torch.stack(imgs), torch.stack(rots), torch.stack(trans), \
                 torch.stack(intrins), torch.stack(distorts), torch.stack(post_rots), torch.stack(post_trans)
 
-    def get_annos_det2D(self,):
-        pass
+    def get_anno_det2D(self,recs):
+        return {
+            "gt_labels_det2D":None,
+            "gt_bboxes_det2D":None
+        }
 
-    def get_annos_det3D(self, rec):
+    def get_anno_map2D(self,recs):
+        return {
+            "gt_labels_map2D":None,
+            "gt_bboxes_map2D":None
+        }
+
+    def get_anno_det3D(self,recs):
         """
         从 rec 中每帧的 label json 读取 object_infos，转为 docs/DATA_FORMAT 约定的 3D 检测真值。
         与 convert_det.py 输出的标准格式一致：object_infos[track_id] = {
@@ -216,7 +305,7 @@ class Dataset(torch.utils.data.Dataset):
         gt_labels_per_frame = []
         gt_bboxes_per_frame = []
         class_names = self.config.get("det_class_names", ["car", "truck", "bus", "pedestrian", "bicycle"])
-        for label_path in rec:
+        for label_path in recs:
             with open(label_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             object_infos = data.get("object_infos", {})
@@ -248,44 +337,166 @@ class Dataset(torch.utils.data.Dataset):
             else:
                 gt_labels_per_frame.append(torch.tensor(labels_list, dtype=torch.long))
                 gt_bboxes_per_frame.append(torch.tensor(bboxes_list, dtype=torch.float32))
-        return gt_labels_per_frame, gt_bboxes_per_frame
+        # return gt_labels_per_frame, gt_bboxes_per_frame
+        return {
+            "gt_labels_det3D":gt_labels_per_frame,
+            "gt_bboxes_det3D":gt_bboxes_per_frame
+        }
 
-    def get_anno_map2D(self):
-        pass
-
-    def get_anno_map3D(self):
-        pass
+    def get_anno_map3D(self,recs):
+        return {
+            "gt_labels_map3D":None,
+            "gt_bboxes_map3D":None,
+        }
     
-    def get_anno_object_trajectory(self):
-        pass
+    def get_anno_obj_dynamic_traj(self,recs):
+        return {
+            "gt_obj_dynamic_traj":None
+        }
 
-    def get_anno_ego_trajectory(self):
-        pass
+    def get_anno_e2e_dynamic_traj(self,recs):
+        return {
+            "gt_e2e_dynamic_traj":None
+        }
 
-    def get_algin_theta_mat(self):
-        pass
+    def get_anno_e2e_static_traj(self,recs):
+        return {
+            "gt_e2e_static_traj":None
+        }
 
+    def get_algin_theta_mat(self,recs):
+        theta_mats = []
+        for i ,rec in enumerate(recs):
+            label = json.load(open(rec,"r"))
+            ego_pose = label["ego_pose"]
+            T_ego2wld_cur = TransformationmatrixEgo(ego_pose["orientation"],ego_pose["position"])
+            if i == 0:
+                T_ego2wld_pre = T_ego2wld_cur
+                theta_mat = np.array([
+                    [1.,0.,0.],
+                    [0.,1.,0.]
+                ])
+            else:
+                sx = self.bevh / 2
+                sy = self.bevw / 2
+                pose_diff = np.linalg.inv(T_ego2wld_pre)@T_ego2wld_cur
+                yaw = np.arctan2(pose_diff[1,0], pose_diff[0,0])
+                dx = pose_diff[0, 3]
+                dy = pose_diff[1, 3]
+                cos = np.cos(yaw)
+                sin = np.sin(yaw)
+                eye = np.zeros((3,3),dtype=np.float32)
+                rel_pose = eye.copy()
+                rel_pose[2,2]=1
+                rel_pose[0,0],rel_pose[0,1],rel_pose[0,2] = cos,-sin,dx
+                rel_pose[1,0],rel_pose[1,1],rel_pose[1,2] = sin,cos,dy
+                pre_mat = np.array([[0., 1./sy, 0.], # 车头往上
+                                    [1./sx, 0., 1/5],
+                                    [0., 0., 1.]])
+                post_mat = np.array([[0., sx, -sx/5],
+                                    [sy, 0., 0.],
+                                    [0., 0., 1.]])
+                theta_mat = (pre_mat@(rel_pose@post_mat))[:2,:]
+            theta_mats.append(theta_mat)
+        return theta_mats
+
+    def dynamic_static_data(self,clip_name):
+        for mode,clip_names in self.mode2clip.items():
+            if clip_name in clip_names:
+                return mode
     
+    def get_input_indexs(self):
+        indexs = []
+        group_indexs = []
+        for task,useful in self.task_flags.items():
+            if useful:
+                sub_index = self.task_indexs[task]
+                indexs += sub_index
+                if sub_index not in group_indexs:
+                    group_indexs.append(sub_index)
+        return sorted(list(set(indexs))),group_indexs
 
     def __getitem__(self, index):
         sces_len = self.sces_len
         scenes = self.scenes
         sce_id = [i for i in range(len(sces_len)) if (sum(sces_len[:i]) <= index and sum(sces_len[:i + 1]) > index)][0]
+        clip_name = scenes[sce_id]
         sce_id_ind = index - sum(sces_len[:sce_id])
-        rec = self.ixes[scenes[sce_id]][sce_id_ind:sce_id_ind + self.total_len]
-        imgs, rots, trans, intrins, distorts, post_rots, post_trans = self.get_image_data(rec)
-        gt_labels_3d, gt_bboxes_3d = self.get_annos_det3D(rec)
-        return {
+        rec = self.ixes[clip_name][sce_id_ind:sce_id_ind + self.total_len]
+        mode = self.dynamic_static_data(clip_name)
+        
+        #数据增强部分
+        image_rec = [rec[i] for i in self.useful_indexs]
+        imgs, rots, trans, intrins, distorts, post_rots, post_trans = self.get_image_data(image_rec)
+        images_parma = {
             "x": imgs,
             "rots": rots,
             "trans": trans,
             "intrins": intrins,
             "distorts": distorts,
             "post_rots": post_rots,
-            "post_trans": post_trans,
-            "gt_labels_3d": gt_labels_3d,
-            "gt_bboxes_3d": gt_bboxes_3d,
+            "post_trans": post_trans
         }
+
+        #时序对其部分
+        algin_matrixs = {}
+        for indexs in self.group_indexs:
+            str_index = "_".join(list(map(str,indexs)))
+            algin_recs = [rec[i] for i in indexs]
+            theta_mats = self.get_algin_theta_mat(algin_recs)
+            algin_matrixs[str_index] = theta_mats
+
+        anno_infos = {
+            "gt_labels_det2D":None,
+            "gt_bboxes_det2D":None,
+            "gt_labels_map2D":None,
+            "gt_bboxes_map2D":None,
+
+            "gt_labels_det3D":None,
+            "gt_bboxes_det3D":None,
+            "gt_labels_map3D":None,
+            "gt_bboxes_map3D":None,
+
+            "gt_obj_dynamic_traj":None,
+            "gt_e2e_dynamic_traj":None,
+            "gt_e2e_static_traj":None
+        }
+        
+        if mode == "dynamic" or mode == "static":
+            if self.task_flags["e2e_dynamic_traj"]:
+                gt_recs = [rec[i] for i in self.task_indexs["e2e_dynamic_traj"]]
+                anno_infos.update(self.get_anno_e2e_dynamic_traj(gt_recs))
+            
+            if mode == "dynamic":
+                if self.task_flags["det2D"]:
+                    gt_recs = [rec[i] for i in self.task_indexs["det2D"]]
+                    anno_infos.update(self.get_anno_det2D(gt_recs))
+                if self.task_flags["det3D"]:
+                    gt_recs = [rec[i] for i in self.task_indexs["det3D"]]
+                    anno_infos.update(self.get_anno_det3D(gt_recs))
+                if self.task_flags["obj_dynamic_traj"]:
+                    gt_recs = [rec[i] for i in self.task_indexs["obj_dynamic_traj"]]
+                    anno_infos.update(self.get_anno_obj_dynamic_traj(gt_recs))
+            else:
+                if self.task_flags["map2D"]:
+                    gt_recs = [rec[i] for i in self.task_indexs["map2D"]]
+                    anno_infos.update(self.get_anno_map2D(gt_recs))
+                if self.task_flags["map3D"]:
+                    gt_recs = [rec[i] for i in self.task_indexs["map3D"]]
+                    anno_infos.update(self.get_anno_map3D(gt_recs))
+                if self.task_flags["e2e_static_traj"]:
+                    gt_recs = [rec[i] for i in self.task_indexs["e2e_static_traj"]]
+                    anno_infos.update(self.get_anno_e2e_static_traj(gt_recs))
+        else:
+            print("没有动静态的数据，没办法训练")
+
+        out = {}
+        out.update(images_parma)
+        out.update(algin_matrixs)
+        out.update(anno_infos)
+
+        return out
+
 
     def __len__(self):
         return sum([(len(self.ixes[i]) - self.total_len) for i in self.ixes.keys()])
@@ -343,7 +554,7 @@ class Dataset(torch.utils.data.Dataset):
                         all_paths.append(p)
                         clip_name = p.strip(os.sep).split(os.sep)[-1]
                         clip2path[clip_name] = p
-                        if name in clip2path.keys():
+                        if name in mode2clip.keys():
                             mode2clip[name].append(clip_name)
                         else:
                             mode2clip[name] = [clip_name]
