@@ -10,10 +10,11 @@
     一次forward需要91帧的数据：当前帧是第40帧，即历史是0-39，未来是41-90 # 历史40帧，未来50帧，再加当前帧
     任务包含：
     第一阶段2D图像表针学习 
-    第二阶段BEV表征学习
+    第二阶段BEV重建学习
+    第三阶段BEV表征学习
         检测：             输入                36 37 38 39 40 
         地图:              输入                36 37 38 39 40
-    第三阶段轨迹交互
+    第四阶段轨迹交互
         目标车轨迹：        输入     10 20 30               40   预测 50 60 70 80 90  --从动态拿instance
         端到端静态：        输入     10 20 30               40   预测 50 60 70 80 90  --从静态拿instance
         端到端动态：        输入     10 20 30               40   预测 50 60 70 80 90
@@ -304,14 +305,24 @@ class Dataset(torch.utils.data.Dataset):
         """
         gt_labels_per_frame = []
         gt_bboxes_per_frame = []
+        gt_labels_per_frame_mask = []
+        gt_bboxes_per_frame_mask = []
         class_names = self.config.get("det_class_names", ["car", "truck", "bus", "pedestrian", "bicycle"])
         for label_path in recs:
+            obj_traj_path = label_path.replace(".json","_object_trajectory.npy")
+            if os.path.exists(obj_traj_path):
+                object_trajectorys =  np.load(obj_traj_path, allow_pickle=True).item()
+            else:
+                object_trajectorys = {}
+            
             with open(label_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             object_infos = data.get("object_infos", {})
             labels_list = []
             bboxes_list = []
+            labels_maks_list,bboxes_mask_list = [],[]
             for track_id, obj in object_infos.items():
+                label_mask,bboxes_mask = 1,1
                 pos = obj.get("position")
                 rot = obj.get("rotation")
                 dim = obj.get("dimension")
@@ -322,15 +333,19 @@ class Dataset(torch.utils.data.Dataset):
                     cls_id = class_names.index(sub)
                 except ValueError:
                     cls_id = 0
-                x = float(pos.get("x", 0))
-                y = float(pos.get("y", 0))
-                z = float(pos.get("z", 0))
-                yaw = float(rot.get("yaw", 0.0))
-                w = float(dim.get("width", 0))
-                length = float(dim.get("length", 0))
-                h = float(dim.get("height", 0))
-                bboxes_list.append([x, y, z, w, length, h, yaw, 0.0, 0.0, 0.0])
+                    label_mask = 0
+                x = self.gt_value("x",pos,bboxes_mask)# float(pos.get("x", 0))
+                y = self.gt_value("y",pos,bboxes_mask)#float(pos.get("y", 0))
+                z = self.gt_value("z",pos,bboxes_mask)#float(pos.get("z", 0))
+                yaw = self.gt_value("yaw",rot,bboxes_mask)#float(rot.get("yaw", 0.0))
+                w = self.gt_value("width",dim,bboxes_mask)#float(dim.get("width", 0))
+                length = self.gt_value("length",dim,bboxes_mask)#float(dim.get("length", 0))
+                h = self.gt_value("height",dim,bboxes_mask)# float(dim.get("height", 0))
+                vx,vy,vz = self.diff(object_trajectorys,track_id,bboxes_mask,dt=0.1)
+                bboxes_list.append([x, y, z, w, length, h, yaw, vx,vy,vz])
                 labels_list.append(cls_id)
+                labels_maks_list.append(label_mask)
+                bboxes_mask_list.append(bboxes_mask)
             if len(labels_list) == 0:
                 gt_labels_per_frame.append(torch.zeros(0, dtype=torch.long))
                 gt_bboxes_per_frame.append(torch.zeros(0, 10, dtype=torch.float32))
@@ -349,9 +364,40 @@ class Dataset(torch.utils.data.Dataset):
             "gt_bboxes_map3D":None,
         }
     
-    def get_anno_obj_dynamic_traj(self,recs):
+    def get_anno_obj_dynamic_traj(self,recs,dt=0.1):
+
+        label_path = recs[-1]# 只选择最后一帧作为真值
+        obj_traj_path = label_path.replace(".json","_object_trajectory.npy")
+        if os.path.exists(obj_traj_path):
+            object_trajectorys =  np.load(obj_traj_path, allow_pickle=True).item()
+        else:
+            object_trajectorys = {}
+        trackids = []
+        obj_trajs = []
+        masks = []
+        for trackid,trajs in object_trajectorys.items():
+            traj_mask = trajs["obj_trajectory_in_ego"] # (600, 4)
+            traj = traj_mask[:,:3]
+            mask = traj_mask[:,-1].reshape(-1).tolist()
+            cur_idx = mask.index(0)
+            start_idx,end_idx = cur_idx-40 , cur_idx + 50
+            traj = traj[start_idx:end_idx+1]
+            #对mask为-1的地方进行插值
+            # traj = 插值()
+            # mask = 插值后的mask
+            traj_v = (traj[1:] - traj[:-1]) / dt
+            trackids.append(trackid)
+            obj_trajs.append(traj_v)
+            masks.append(mask)
+            print(traj.shape)
+
+
         return {
-            "gt_obj_dynamic_traj":None
+            "gt_obj_dynamic_traj":{
+                "trackids":trackids,
+                "dynamic_trajs":obj_trajs,
+                "masks":masks
+            }
         }
 
     def get_anno_e2e_dynamic_traj(self,recs):
@@ -399,6 +445,34 @@ class Dataset(torch.utils.data.Dataset):
                 theta_mat = (pre_mat@(rel_pose@post_mat))[:2,:]
             theta_mats.append(theta_mat)
         return theta_mats
+
+    def gt_value(self,m,src,mask):
+        v = src.get(m,False)
+        if v:
+            return float(v)
+        else:
+            mask = 0
+            return 0.
+    def diff(self,object_trajectorys,track_id,bboxes_mask,dt=0.1):
+        traj =  object_trajectorys.get(track_id,None)
+        if traj  is None:
+            bboxes_mask = 0
+            return 0,0,0
+        traj_obj = traj["obj_trajectory_in_obj"]
+        masks = traj_obj[:,-1]
+        ci = masks.reshape(-1).tolist().index(0)
+        pi = masks[ci-1]
+        if pi != 1:
+            bboxes_mask = 0
+            return 0,0,0
+        traj_obj_sub =  traj_obj[ci-1:ci+1][:,:3]
+        diff = (traj_obj_sub[-1] - traj_obj_sub[0] ) / dt
+        return diff[0],diff[1],diff[2]
+
+
+
+
+        
 
     def dynamic_static_data(self,clip_name):
         for mode,clip_names in self.mode2clip.items():
