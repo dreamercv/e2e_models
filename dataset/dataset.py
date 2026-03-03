@@ -364,39 +364,78 @@ class Dataset(torch.utils.data.Dataset):
             "gt_bboxes_map3D":None,
         }
     
-    def get_anno_obj_dynamic_traj(self,recs,dt=0.1):
+    def get_anno_obj_dynamic_traj(self, recs, dt=0.1):
+        """
+        从 object_trajectory_in_ego 中获取目标在自车坐标系下的动态轨迹，并做插值补全：
+        - mask=-1: 该帧目标消失
+        - mask=0: 该帧为“当前帧”
+        - mask=1: 该帧存在目标
+        对于每个轨迹，在第一次出现 1 和最后一次出现 1 之间，将 mask=-1 的位置用线性插值
+        补全 xyz，并将这些位置的 mask 置为 1。
+        然后在当前帧附近截取一个时间窗（默认前 40 帧、后 50 帧），计算速度轨迹。
+        """
 
-        label_path = recs[-1]# 只选择最后一帧作为真值
-        obj_traj_path = label_path.replace(".json","_object_trajectory.npy")
+        label_path = recs[-1]  # 只选择最后一帧作为真值
+        obj_traj_path = label_path.replace(".json", "_object_trajectory.npy")
         if os.path.exists(obj_traj_path):
-            object_trajectorys =  np.load(obj_traj_path, allow_pickle=True).item()
+            object_trajectorys = np.load(obj_traj_path, allow_pickle=True).item()
         else:
             object_trajectorys = {}
+
         trackids = []
         obj_trajs = []
         masks = []
-        for trackid,trajs in object_trajectorys.items():
-            traj_mask = trajs["obj_trajectory_in_ego"] # (600, 4)
-            traj = traj_mask[:,:3]
-            mask = traj_mask[:,-1].reshape(-1).tolist()
-            cur_idx = mask.index(0)
-            start_idx,end_idx = cur_idx-40 , cur_idx + 50
-            traj = traj[start_idx:end_idx+1]
-            #对mask为-1的地方进行插值
-            # traj = 插值()
-            # mask = 插值后的mask
-            traj_v = (traj[1:] - traj[:-1]) / dt
+
+        for trackid, trajs in object_trajectorys.items():
+            traj_mask = trajs["obj_trajectory_in_ego"]  # (T, 4), [:3] 为 xyz, 最后一维为 mask
+            coords_full = traj_mask[:, :3].astype(np.float32)  # (T, 3)
+            mask_full = traj_mask[:, -1].astype(np.float32)    # (T,)
+
+            # 当前帧索引（mask==0），若不存在则跳过该轨迹
+            cur_idx_arr = np.where(mask_full == 0)[0]
+            if cur_idx_arr.size == 0:
+                continue
+            cur_idx = int(cur_idx_arr[0])
+
+            T = coords_full.shape[0]
+            start_idx = max(0, cur_idx - 40)
+            end_idx = min(T - 1, cur_idx + 50)
+
+            coords = coords_full[start_idx:end_idx + 1].copy()  # (L, 3)
+            mask = mask_full[start_idx:end_idx + 1].copy()      # (L,)
+
+            # 在当前窗口内，找第一次和最后一次出现 1 的位置
+            one_idx = np.where(mask == 1)[0]
+            if one_idx.size >= 2:
+                s = int(one_idx[0])
+                e = int(one_idx[-1])
+                x = np.arange(s, e + 1, dtype=np.float32)
+                # 有效点：mask>=0（包括 0 和 1）
+                valid = mask[s:e + 1] >= 0
+                x_valid = x[valid]
+                if x_valid.size >= 2:
+                    for d in range(3):
+                        y_seg = coords[s:e + 1, d]
+                        y_valid = y_seg[valid]
+                        # 用相邻有效点对 -1 位置做线性插值
+                        y_interp = np.interp(x, x_valid, y_valid)
+                        missing = mask[s:e + 1] < 0
+                        coords[s:e + 1, d][missing] = y_interp[missing]
+                    # 被插值的位置视作存在目标
+                    mask[s:e + 1][mask[s:e + 1] < 0] = 1.0
+
+            # 计算速度：一阶差分 / dt，长度为 L-1
+            traj_v = (coords[1:] - coords[:-1]) / dt
+
             trackids.append(trackid)
             obj_trajs.append(traj_v)
-            masks.append(mask)
-            print(traj.shape)
-
+            masks.append(mask.tolist())
 
         return {
-            "gt_obj_dynamic_traj":{
-                "trackids":trackids,
-                "dynamic_trajs":obj_trajs,
-                "masks":masks
+            "gt_obj_dynamic_traj": {
+                "trackids": trackids,
+                "dynamic_trajs": obj_trajs,
+                "masks": masks,
             }
         }
 
