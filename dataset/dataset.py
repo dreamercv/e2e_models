@@ -439,15 +439,69 @@ class Dataset(torch.utils.data.Dataset):
             }
         }
 
-    def get_anno_e2e_dynamic_traj(self,recs):
+    def get_anno_e2e_dynamic_static_traj(self, recs, dt=0.1, num_static_pts=20):
+        """
+        自车动静态轨迹：
+        - 动态轨迹：取当前帧前 40 帧、后 50 帧的自车位置信息，做一阶差分 / dt 得到速度轨迹。
+        - 静态轨迹：从当前帧到 clip 结束的自车位置中，找到“到达 BEV 范围边缘的点”，
+          然后将当前点到该边缘点之间的路径按等步长插值成 num_static_pts 个点。
+        """
+        label_path = recs[-1]  # 只选择最后一帧作为真值
+        ego_traj_path = label_path.replace(".json", "_ego_trajectory.npy")
+        traj_mask = np.load(ego_traj_path)  # (T, 4): xyz + mask
+        coords_full = traj_mask[:, :3].astype(np.float32)  # (T, 3)
+        mask_full = traj_mask[:, -1].astype(np.float32)    # (T,)
+
+        # 当前帧索引：mask == 0
+        cur_idx_arr = np.where(mask_full == 0)[0]
+        if cur_idx_arr.size == 0:
+            return {
+                "gt_e2e_dynamic_traj": None,
+                "gt_e2e_static_traj": None,
+            }
+        cur_idx = int(cur_idx_arr[0])
+
+        # -------- 动态轨迹：前 40 帧 + 后 50 帧，速度序列 --------
+        T = coords_full.shape[0]
+        start_idx = max(0, cur_idx - 40)
+        end_idx = min(T - 1, cur_idx + 50)
+        dyn_coords = coords_full[start_idx:end_idx + 1].copy()  # (L, 3)
+        if dyn_coords.shape[0] >= 2:
+            dynamic_traj_v = (dyn_coords[1:] - dyn_coords[:-1]) / dt  # (L-1, 3)
+        else:
+            dynamic_traj_v = np.zeros((0, 3), dtype=np.float32)
+
+        # -------- 静态轨迹：从当前到 BEV 范围边缘，等步长插值为 num_static_pts 点 --------
+        x_min, x_max = self.grid_conf["xbound"][0], self.grid_conf["xbound"][1]
+        y_min, y_max = self.grid_conf["ybound"][0], self.grid_conf["ybound"][1]
+        xs = coords_full[:, 0]
+        ys = coords_full[:, 1]
+        inside = (xs >= x_min) & (xs <= x_max) & (ys >= y_min) & (ys <= y_max)
+
+        # 从当前帧往后，找到最后一个仍在 BEV 范围内的点，视为“边缘点”
+        inside_after = inside[cur_idx:]
+        if inside_after.any():
+            last_inside_rel = np.where(inside_after)[0][-1]
+            edge_idx = cur_idx + int(last_inside_rel)
+        else:
+            # 当前之后都不在 BEV 范围内，则静态轨迹退化为当前点
+            edge_idx = cur_idx
+
+        p_start = coords_full[cur_idx].astype(np.float32)
+        p_end = coords_full[edge_idx].astype(np.float32)
+
+        if num_static_pts <= 1:
+            static_traj = p_end[None, :]
+        else:
+            # 等步长插值 num_static_pts 个点（包含起点和终点）
+            alphas = np.linspace(0.0, 1.0, num_static_pts, dtype=np.float32)[:, None]  # (N, 1)
+            static_traj = p_start[None, :] + alphas * (p_end[None, :] - p_start[None, :])  # (N, 3)
+
         return {
-            "gt_e2e_dynamic_traj":None
+            "gt_e2e_dynamic_traj": dynamic_traj_v,
+            "gt_e2e_static_traj": static_traj,
         }
 
-    def get_anno_e2e_static_traj(self,recs):
-        return {
-            "gt_e2e_static_traj":None
-        }
 
     def get_algin_theta_mat(self,recs):
         theta_mats = []
@@ -578,7 +632,8 @@ class Dataset(torch.utils.data.Dataset):
         if mode == "dynamic" or mode == "static":
             if self.task_flags["e2e_dynamic_traj"]:
                 gt_recs = [rec[i] for i in self.task_indexs["e2e_dynamic_traj"]]
-                anno_infos.update(self.get_anno_e2e_dynamic_traj(gt_recs))
+                anno_infos.update(self.get_anno_e2e_dynamic_static_traj(self, gt_recs, dt=0.1, num_static_pts=20))
+
             
             if mode == "dynamic":
                 if self.task_flags["det2D"]:
@@ -597,9 +652,9 @@ class Dataset(torch.utils.data.Dataset):
                 if self.task_flags["map3D"]:
                     gt_recs = [rec[i] for i in self.task_indexs["map3D"]]
                     anno_infos.update(self.get_anno_map3D(gt_recs))
-                if self.task_flags["e2e_static_traj"]:
-                    gt_recs = [rec[i] for i in self.task_indexs["e2e_static_traj"]]
-                    anno_infos.update(self.get_anno_e2e_static_traj(gt_recs))
+                # if self.task_flags["e2e_static_traj"]:
+                #     gt_recs = [rec[i] for i in self.task_indexs["e2e_static_traj"]]
+                #     anno_infos.update(self.get_anno_e2e_static_traj(gt_recs))
         else:
             print("没有动静态的数据，没办法训练")
 
