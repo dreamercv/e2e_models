@@ -358,11 +358,166 @@ class Dataset(torch.utils.data.Dataset):
             "gt_bboxes_det3D":gt_bboxes_per_frame
         }
 
-    def get_anno_map3D(self,recs):
-        return {
-            "gt_labels_map3D":None,
-            "gt_bboxes_map3D":None,
+    def get_anno_map3D(self, recs):
+        """
+        将 clip_dataset/map 中的静态地图标注转换为 MapTR 所需的 3D 地图真值。
+        参考 demo_map.md / MAP_DATA_FORMAT.md：
+        - 仅使用当前帧（默认取 recs[-1]）的地图标注；
+        - 从 groups 中抽取折线/多边形，投影到 ego 坐标，并裁剪到 pc_range(grid_conf.xbound/ybound) 内；
+        - 生成：
+          * gt_labels_map3D / gt_bboxes_map3D（方便调试）；
+          * gt_map_bboxes / gt_map_labels / gt_map_pts（MapHead.loss 直接使用）。
+        """
+        # 只取当前帧（最后一帧）的 map 标注
+        label_path = recs[-1]
+        with open(label_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        ego_pose = data["ego_pose"]
+        T_ego2wld = TransformationmatrixEgo(ego_pose["orientation"], ego_pose["position"])
+        T_wld2ego = np.linalg.inv(T_ego2wld)
+
+        groups = data.get("groups", {})
+
+        # pc_range（BEV 范围）
+        x_min, x_max = self.grid_conf["xbound"][0], self.grid_conf["xbound"][1]
+        y_min, y_max = self.grid_conf["ybound"][0], self.grid_conf["ybound"][1]
+
+        # MapTR 中常用的 3 类：0=divider, 1=ped_crossing, 2=boundary
+        polylines = []      # 每条线的 (num_pts, 2)
+        labels = []         # 每条线的类别下标
+        geom_types = []     # 每条线对应的几何类型：line_3d / polygon_3d
+
+        # 统一的重采样点数 & 多顺序个数
+        # 按论文思路：开曲线至少正/反 2 种，闭合折线可有 N*2 种（N=num_pts）
+        # 这里对所有线统一使用 num_orders = 2 * num_pts：
+        #   - 前 num_pts 个顺序：正向循环移位
+        #   - 后 num_pts 个顺序：反向循环移位
+        num_pts = self.config.get("map_num_pts", 20)
+        num_orders = 2 * num_pts
+
+        def resample_polyline(coords_xy, num_pts):
+            """按均匀参数 t∈[0,1] 对折线做一维线性插值，得到固定点数。"""
+            n = coords_xy.shape[0]
+            if n <= 1 or n == num_pts:
+                return coords_xy.astype(np.float32)
+            t_old = np.linspace(0.0, 1.0, n, dtype=np.float32)
+            t_new = np.linspace(0.0, 1.0, num_pts, dtype=np.float32)
+            x_new = np.interp(t_new, t_old, coords_xy[:, 0])
+            y_new = np.interp(t_new, t_old, coords_xy[:, 1])
+            return np.stack([x_new, y_new], axis=1).astype(np.float32)
+
+        for _, grp in groups.items():
+            gtype = grp.get("type", "")
+            props = grp.get("properties", {})
+
+            # 映射到 3 类：divider / ped_crossing / boundary
+            cls_id = None
+            if gtype in ["lane_line", "real_lane_line", "imaginary_lane_line", "lane_center_line"]:
+                cls_id = 0  # divider
+            elif gtype == "road_marker_line":
+                # 仅把 category==3 (斑马线) 当作人行横道，其它暂不作为 map GT
+                cat = str(props.get("category", "-1"))
+                if cat == "3":
+                    cls_id = 1  # ped_crossing
+            elif gtype in ["road_edge", "non_drivable_area"]:
+                cls_id = 2  # boundary / non-drivable
+            else:
+                continue
+
+            if cls_id is None:
+                continue
+
+            objects = grp.get("objects", [])
+            for obj in objects:
+                # 仅使用 LidarFusion 的 3D 几何
+                if obj.get("sensor", "") != "LidarFusion":
+                    continue
+                geom = obj.get("geometry", "")
+                if geom not in ["line_3d", "polygon_3d"]:
+                    continue
+
+                pts3d = obj.get("points", [])
+                if len(pts3d) < 2:
+                    continue
+
+                coords = []
+                for p in pts3d:
+                    pw = np.array([p["x"], p["y"], p["z"], 1.0], dtype=np.float64)
+                    pe = (T_wld2ego @ pw)[:3]  # ego 坐标
+                    coords.append([pe[0], pe[1]])  # 只保留 x,y
+                coords = np.asarray(coords, dtype=np.float32)  # (N, 2)
+
+                # 与 pc_range 的粗裁剪：若整条线都在范围外，则忽略
+                xs, ys = coords[:, 0], coords[:, 1]
+                if xs.max() < x_min or xs.min() > x_max or ys.max() < y_min or ys.min() > y_max:
+                    continue
+
+                # 将点裁剪到 pc_range 内，避免 bbox 超界
+                coords[:, 0] = np.clip(coords[:, 0], x_min, x_max)
+                coords[:, 1] = np.clip(coords[:, 1], y_min, y_max)
+
+                # 重采样为固定 num_pts
+                coords_rs = resample_polyline(coords, num_pts)  # (num_pts, 2)
+
+                polylines.append(coords_rs)
+                labels.append(cls_id)
+                geom_types.append(geom)
+
+        if len(polylines) == 0:
+            gt_labels = torch.zeros(0, dtype=torch.long)
+            gt_bboxes = torch.zeros(0, 4, dtype=torch.float32)
+            # 多顺序 GT：形状 (N, num_orders, num_pts, 2)
+            gt_pts = torch.zeros(0, num_orders, num_pts, 2, dtype=torch.float32)
+        else:
+            polys = np.stack(polylines, axis=0)  # (N, num_pts, 2)
+            labels_arr = np.asarray(labels, dtype=np.int64)  # (N,)
+
+            x1 = polys[:, :, 0].min(axis=1)
+            y1 = polys[:, :, 1].min(axis=1)
+            x2 = polys[:, :, 0].max(axis=1)
+            y2 = polys[:, :, 1].max(axis=1)
+            bboxes_arr = np.stack([x1, y1, x2, y2], axis=1).astype(np.float32)  # (N, 4)
+
+            gt_labels = torch.from_numpy(labels_arr).long()
+            gt_bboxes = torch.from_numpy(bboxes_arr).float()
+
+            # 多顺序 GT：分开/闭合两种情况
+            # - 开曲线（line_3d）：只需要正序 + 反序 2 种表示，其余 order 用重复填充占位
+            # - 闭合折线（polygon_3d）：正序 + 反序 + 循环移位，共 2*num_pts 种表示
+            all_orders = []
+            for poly, gtype in zip(polys, geom_types):
+                pts = torch.from_numpy(poly).float()  # (num_pts, 2)
+                orders = []
+                if gtype == "polygon_3d":
+                    # 闭合折线：正向 & 反向的所有循环移位 → N*2 种
+                    for k in range(num_pts):
+                        orders.append(torch.roll(pts, shifts=-k, dims=0))
+                    pts_rev = torch.flip(pts, dims=[0])
+                    for k in range(num_pts):
+                        orders.append(torch.roll(pts_rev, shifts=-k, dims=0))
+                else:
+                    # 开曲线：只保留正序 + 反序两种表示，其它 order 用正序重复填充
+                    orders.append(pts)                    # 正序
+                    orders.append(torch.flip(pts, [0]))   # 反序
+                    while len(orders) < num_orders:
+                        orders.append(pts)
+                orders = torch.stack(orders, dim=0)  # (num_orders, num_pts, 2)
+                all_orders.append(orders)
+            gt_pts = torch.stack(all_orders, dim=0)  # (N, num_orders, num_pts, 2)
+
+        # map3D 内部使用（可选）
+        out = {
+            "gt_labels_map3D": gt_labels,
+            "gt_bboxes_map3D": gt_bboxes,
         }
+        # MapHead.loss 直接使用的格式（单样本 → list 长度 1）
+        out.update({
+            "gt_map_bboxes": [gt_bboxes],
+            "gt_map_labels": [gt_labels],
+            "gt_map_pts": [gt_pts],
+        })
+        return out
     
     def get_anno_obj_dynamic_traj(self, recs, dt=0.1):
         """
