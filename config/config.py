@@ -2,6 +2,13 @@ import os
 
 configs = {
     "epoch":100,
+    
+    "log_dir":"/home/fb/project/models/Sparse4D-main/projects/e2e_models/logs",
+    "log_save_interval":100,
+    "log_print_interval":10,
+
+
+
     "load_types":{ # 具体加载哪几种数据，加载不同的数据，会对应着不同的任务
         "dynamic":True,
         "static":True,
