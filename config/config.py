@@ -1,6 +1,13 @@
 import os
 
 configs = {
+    "epoch":100,
+    "load_types":{ # 具体加载哪几种数据，加载不同的数据，会对应着不同的任务
+        "dynamic":True,
+        "static":True,
+        "dynamic_static":False,
+        "e2e":False,
+    },
     # 总的参数
     "grid_conf" : {
         'xbound': [-80.0, 120.0, 1],
@@ -31,7 +38,9 @@ configs = {
     'final_dim': (128, 384),
 
     "mode":"dynamic",
-
+    "is_train":True,
+    "batch_size":1,
+    "num_workers":1,
 
     "train_clips":2, # -1 所有，[]指定几个，xxx.txt写进txt中指定的，>0前N个
     
@@ -45,7 +54,7 @@ configs = {
         "det3D":True,
 
         "map2D":False,
-        "map3D":False,
+        "map3D":True,
 
         "obj_dynamic_traj":False,
         "e2e_static_traj":False,

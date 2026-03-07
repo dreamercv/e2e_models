@@ -215,9 +215,10 @@ def img_transform(img,
     return img, post_rot, post_tran
 
 class Dataset(torch.utils.data.Dataset):
-    def __init__(self,config):
+    def __init__(self,config,mode="dynamic"):
         self.config = config
-        self.mode = config["mode"]
+        self.mode = mode if mode is not None else config.get("mode","dynamic") # 默认加载动态数据
+        self.is_train = config.get("is_train",True) # 默认训练
 
         self.grid_conf = config["grid_conf"] # bev网格配置
         self.bevh = self.grid_conf["xbound"][1] - self.grid_conf["xbound"][0]
@@ -253,7 +254,10 @@ class Dataset(torch.utils.data.Dataset):
 
     def gen_aug_params(self,H,W,resize_lim,bot_pct_lim,rot_lim):
         fH, fW = self.fH, self.fW
-        resize = np.random.uniform(*resize_lim)
+        if self.is_train:
+            resize = np.random.uniform(*resize_lim)
+        else:
+            resize = np.mean(resize_lim)
         resize_dims = (int(W * resize), int(H * resize))
         newW, newH = resize_dims
         # 保证 resize 后至少能裁出 (fW, fH)，否则用下限
@@ -262,13 +266,20 @@ class Dataset(torch.utils.data.Dataset):
             resize = min(1.0, resize * scale)
             resize_dims = (int(W * resize), int(H * resize))
             newW, newH = resize_dims
-        crop_h = int((1 - np.random.uniform(*bot_pct_lim)) * newH) - fH
+        if self.is_train:
+            crop_h = int((1 - np.random.uniform(*bot_pct_lim)) * newH) - fH
+        else:
+            crop_h = int(np.mean(bot_pct_lim) * newH) - fH
         crop_w = int(max(0, newW - fW) / 2)
         crop_h = int(np.clip(crop_h, 0, max(0, newH - fH)))
         crop_w = int(np.clip(crop_w, 0, max(0, newW - fW)))
         crop = (crop_w, crop_h, crop_w + fW, crop_h + fH)
-        rotate = np.random.uniform(*rot_lim)
+        if self.is_train:
+            rotate = np.random.uniform(*rot_lim)
+        else:
+            rotate = 0.
         return resize,resize_dims,crop,rotate
+        
 
     def get_image_data(self,recs):
         "输出增强后的图片(裁剪/旋转)，以及增强的参数，相关的内外惨"
@@ -778,13 +789,23 @@ class Dataset(torch.utils.data.Dataset):
             bboxes_mask = 0
             return 0,0,0
         traj_obj = traj["obj_trajectory_in_obj"]
+        if traj_obj is None or len(traj_obj) == 0:
+            bboxes_mask = 0
+            return 0,0,0
         masks = traj_obj[:,-1]
-        ci = masks.reshape(-1).tolist().index(0)
+        try:
+            ci = masks.reshape(-1).tolist().index(0)
+        except ValueError:
+            bboxes_mask = 0
+            return 0,0,0
         pi = masks[ci-1]
         if pi != 1:
             bboxes_mask = 0
             return 0,0,0
         traj_obj_sub =  traj_obj[ci-1:ci+1][:,:3]
+        if traj_obj_sub.shape[0] == 0:
+            bboxes_mask = 0
+            return 0,0,0
         diff = (traj_obj_sub[-1] - traj_obj_sub[0] ) / dt
         return diff[0],diff[1],diff[2]
 
@@ -797,9 +818,11 @@ class Dataset(torch.utils.data.Dataset):
         """"
         看该clip属于动态还是静态,还是端到端数据
         """
-        for mode,clip_names in self.mode2clip.items():
-            if clip_name in clip_names:
-                return mode
+        # if self.mode is not None:
+        return self.mode
+        # for mode,clip_names in self.mode2clip.items():
+        #     if clip_name in clip_names:
+        #         return mode
     
     def gen_random_history_indexs(self,len=5,mode="dynamic"):
         indexs_dict = {}
@@ -885,6 +908,10 @@ class Dataset(torch.utils.data.Dataset):
         if self.task_flags["e2e_dynamic_traj"] or self.task_flags["e2e_static_traj"] or mode == "dynamic_static":
             anno_infos.update(self.get_anno_e2e_dynamic_static_traj(recs, dt=dt, num_static_pts=20))
         
+        # 避免 DataLoader default_collate 遇到 None 报错：未参与任务的键保持为 None 时改为可 collate 的占位
+        for k in list(anno_infos.keys()):
+            if anno_infos[k] is None:
+                anno_infos[k] = []
 
         out = {}
         out.update(images_parma)
@@ -959,18 +986,39 @@ class Dataset(torch.utils.data.Dataset):
         self.all_paths = all_paths
         self.clip2path = clip2path
 
-        
 
+from torch.utils.data.distributed import DistributedSampler 
+from torch.utils.data.sampler import SequentialSampler
+from torch.utils.data import DataLoader
 
+def worker_rnd_init(x):
+    np.random.seed(13 + x)
 
-if __name__ == '__main__':
-    dataset = Dataset(configs)
-    print(dataset.__len__())
-    dataset.__getitem__(0)
-    # for i in range(dataset.__len__()):
-    #     dataset.__getitem__(i)
-    # root = "/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/map"
-    # save_root = root.rstrip(os.sep) + ".txt"
-    # with open(save_root,"w") as f:
-    #     for file in os.listdir(root):
-    #         f.write(os.path.join(root,file) + "\n")
+def build_dataloader(config, mode="dynamic"):
+    dataset = Dataset(config, mode)
+    if config["is_train"]:
+        # 仅当已调用 torch.distributed.init_process_group() 时才用 DistributedSampler，否则单卡/本地调试会报错
+        if torch.distributed.is_initialized():
+            sampler = DistributedSampler(dataset)
+            shuffle = False
+        else:
+            sampler = None
+            shuffle = True
+        pin_memory = False
+    else:
+        sampler = SequentialSampler(dataset)
+        shuffle = False
+        pin_memory = True
+    dataloader = DataLoader(
+        dataset,
+        batch_size=config["batch_size"],
+        sampler=sampler,
+        shuffle=shuffle,
+        num_workers=config["num_workers"],
+        drop_last=True,
+        pin_memory=pin_memory,
+        worker_init_fn=worker_rnd_init
+    )
+
+    return dataloader,sampler
+    
