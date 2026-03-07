@@ -280,4 +280,38 @@ if __name__ == '__main__':
     clip_root = "/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/demo"
     files = ["frame_001.json"]
     clip_folder = "/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset"
-    convert_engjson2standardjson(clip_root,files,clip_folder)
+    # convert_engjson2standardjson(clip_root,files,clip_folder)
+    clip_folder = "/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/map"
+    files = [file for file in os.listdir(clip_folder)]
+    # # for file in files:
+    # #     gen_ego_trajectory(os.path.join(clip_folder,file))
+
+    # ori_path = "/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/det/det_clip_000002/label/20260226213350.368_ego_trajectory.npy"
+    # for file in files:
+    #     clip_path = os.path.join(clip_folder,file)
+    #     label_files = os.listdir(os.path.join(clip_path,"label"))
+    #     for label_file in label_files:
+    #         print(label_file)
+    #         npy_name = label_file.replace(".json", "_ego_trajectory.npy")
+    #         npy_path = os.path.join(clip_path,"label",npy_name)
+    #         os.system(f"cp {ori_path} {npy_path}")
+    #         print(f"cp {ori_path} {npy_path}")
+
+    det_clip_folder = "/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/det"
+    map_clip_folder = "/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/map"
+    
+    for file in files:
+        det_clip_path = os.path.join(det_clip_folder,file.replace("map","det"))
+        map_clip_path = os.path.join(map_clip_folder,file)
+        det_label_files = sorted([file for file in os.listdir(os.path.join(det_clip_path,"label")) if file.endswith(".json")])
+        map_label_files = sorted([file for file in os.listdir(os.path.join(map_clip_path,"label")) if file.endswith(".json")])
+        for det_label_file,map_label_file in zip(det_label_files,map_label_files):
+            print(det_label_file,map_label_file)
+            det_npy_name = det_label_file.replace(".json", "_ego_trajectory.npy")
+            map_npy_name = map_label_file.replace(".json", "_ego_trajectory.npy")
+            det_npy_path = os.path.join(det_clip_path,"label",det_npy_name)
+            map_npy_path = os.path.join(map_clip_path,"label",map_npy_name)
+            os.system(f"cp {det_npy_path} {map_npy_path}")
+            
+        
+

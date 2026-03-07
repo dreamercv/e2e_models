@@ -19,6 +19,16 @@
         端到端静态：        输入     10 20 30               40   预测 50 60 70 80 90  --从静态拿instance
         端到端动态：        输入     10 20 30               40   预测 50 60 70 80 90
 
+
+
+由于数据不同源，所以训练逻辑如下：
+    1、假设在dynamic数据上，可以先训练3d+目标轨迹，再训练端到端轨迹
+    2、假设在static数据上，可以选训练map+静态轨迹，再训练端到端轨迹
+    3、假设既要3d表征和map表征以及目标轨迹和静态轨迹，分阶段训练：
+        3.1、先训练3d表征和目标轨迹
+        3.2、再训练map表征和静态轨迹
+        3.3、将上述输入到端到端，最后训练端到端轨迹
+    4、假设想要端到端的训练(图像输入，轨迹输出)，那么就是同源数据，直接训练即可
 '''
 
 
@@ -30,84 +40,117 @@ import numpy as np
 import torchvision
 
 import torch
+import random
 
-configs = {
-    # 总的参数
-    "grid_conf" : {
-        'xbound': [-80.0, 120.0, 1],
-        'ybound': [-40.0, 40.0, 1],
-        'zbound': [-2.0, 4.0, 1.0]
-    },
+# configs = {
+#     # 总的参数
+#     "grid_conf" : {
+#         'xbound': [-80.0, 120.0, 1],
+#         'ybound': [-40.0, 40.0, 1],
+#         'zbound': [-2.0, 4.0, 1.0]
+#     },
 
-    "clip_paths":{
-        "dynamic":["/workspace/afb5szh-01/models/e2e_model/e2e_dataset_10Hz_dyo.txt"],
-        "static":["/workspace/afb5szh-01/models/e2e_model/e2e_dataset_10Hz_lane.txt"],
-    },
-    "camera_infos":{
-        "FrontCam02":{
-            "resize_lim": [(0.1, 0.1),  (0.17,0.23), (0.35, 0.45)],
-            "bot_pct_lim":[(0.15, 0.25),(0.27, 0.37),(0.37,0.47)]
-        },     #前 大
-        "RearCam01":     {"resize_lim":[(0.2, 0.3)],"bot_pct_lim":[(0.2, 0.5)]},      #后方
-        "SideFrontCam01":{"resize_lim":[(0.2, 0.3)],"bot_pct_lim":[(0.2, 0.5)]}, #左前
-        "SideFrontCam02":{"resize_lim":[(0.2, 0.3)],"bot_pct_lim":[(0.2, 0.5)]}, #右前
-        "SideRearCam01": {"resize_lim":[(0.2, 0.3)],"bot_pct_lim":[(0.2, 0.5)]},  #左后
-        "SideRearCam02": {"resize_lim":[(0.2, 0.3)],"bot_pct_lim":[(0.2, 0.5)]}   #右后
-    },
-    'rot_lim': (-0.0, 0.0),
-    "flip":False,
+#     "clip_paths":{
+#         "dynamic":["/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/det.txt"],
+#         "static":["/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/map.txt"],
+#         "dynamic_static":["/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/dynamic_static.txt"],
+#         "e2e":["/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/e2e.txt"],
+#     },
+#     "camera_infos":{
+#         "FrontCam02":{
+#             "resize_lim": [(0.1, 0.1),  (0.17,0.23), (0.35, 0.45)],
+#             "bot_pct_lim":[(0.15, 0.25),(0.27, 0.37),(0.37,0.47)]
+#         },     #前 大
+#         "RearCam01":     {"resize_lim":[(0.2, 0.3)],"bot_pct_lim":[(0.2, 0.5)]},      #后方
+#         "SideFrontCam01":{"resize_lim":[(0.2, 0.3)],"bot_pct_lim":[(0.2, 0.5)]}, #左前
+#         "SideFrontCam02":{"resize_lim":[(0.2, 0.3)],"bot_pct_lim":[(0.2, 0.5)]}, #右前
+#         "SideRearCam01": {"resize_lim":[(0.2, 0.3)],"bot_pct_lim":[(0.2, 0.5)]},  #左后
+#         "SideRearCam02": {"resize_lim":[(0.2, 0.3)],"bot_pct_lim":[(0.2, 0.5)]}   #右后
+#     },
+#     'rot_lim': (-0.0, 0.0),
+#     "flip":False,
 
-    'final_dim': (128, 384),
+#     'final_dim': (128, 384),
+
+#     "mode":"dynamic",
 
 
-
-
-
-
-    "train_clips":2, # -1 所有，[]指定几个，xxx.txt写进txt中指定的，>0前N个
+#     "train_clips":2, # -1 所有，[]指定几个，xxx.txt写进txt中指定的，>0前N个
     
-    "total_len":91,
-    "current_frame_index":40,#0 1 2 ... 40 ...90 当前帧往前用作网络输入，当前帧往后用作未来真值
+#     "total_len":20+1+50, # 一共71帧，当前帧是第21帧，往前20帧，往后50帧 ，最后一帧索引对应着70 ，未来50帧为了获取真值
+#     "current_frame_index":20,# 0 1 2 3 4 5 ... [20] 21 22 23 ... 70
     
 
-    "task_flag":{
-        "det2D":True,
-        "det3D":True,
 
-        "map2D":True,
-        "map3D":True,
+#     "task_flag":{
+#         "det2D":False,
+#         "det3D":True,
 
-        "obj_dynamic_traj":True,
-        "e2e_static_traj":True,
-        "e2e_dynamic_traj":True,
-    },
-    "task_indexs":{
-        "det2D":[36,37,38,39,40],
-        "det3D":  [36,37,38,39,40],
-        
-        "map2D":[36,37,38,39,40],
-        "map3D":  [36,37,38,39,40],
+#         "map2D":False,
+#         "map3D":False,
 
-        "obj_dynamic_traj": [10,20,30,40],
-        "e2e_dynamic_traj": [10,20,30,40],
-        "e2e_static_traj":  [10,20,30,40],
+#         "obj_dynamic_traj":False,
+#         "e2e_static_traj":False,
+#         "e2e_dynamic_traj":False,
+#     },
+#     "task_class_names":{
+#         "dynamic":["det3D","obj_dynamic_traj","det2D","e2e_dynamic_traj"], 
+#         "static":["map3D","map2D","e2e_static_traj","e2e_dynamic_traj"],
+#         "dynamic_static":[
+#             "det3D","obj_dynamic_traj","det2D",
+#             "map3D","map2D","e2e_static_traj",
+#             "e2e_dynamic_traj"
+#             ],
+#         "e2e":[
+#             "e2e_static_traj",
+#             "e2e_dynamic_traj"
+#             ],
+#     },
+#     "task_indexs":{ # 在每次getitem时，随机取值
+#         # 在dyo的label上取值
+#         "det2D":[0,20], # 起始帧和结束帧                #输入N帧输出N帧
+#         "det3D":  [0,20], # 起始帧和结束帧              #输入N帧输出N帧
+#         "obj_dynamic_traj": [0,20], # 起始帧和结束帧    #输入N帧，预测最后一帧的轨迹
+#         # 在lane的label上取值
+#         "map2D":[0,20], # 起始帧和结束帧                #输入N帧输出N帧
+#         "map3D":  [0,20], # 起始帧和结束帧              #输入N帧输出N帧
 
-    },
+#         # 在自车位姿上取值
+#         "e2e_dynamic_traj": [0,20], # 起始帧和结束帧    #输入N帧，预测最后一帧的轨迹
+#         "e2e_static_traj":  [0,20], # 起始帧和结束帧    #输入N帧，预测最后一帧的轨迹
+#     },
+#     "seq_len":5, 
+#     "seq_len_random":True,
+
+#     # 预测任务的参数
+#     "his_lens":{ # 历史长度 ,对于预测任务来说，需要输入历史真值才能预测未来真值，所以上述task_indexs需要减去历史长度
+#         "obj_dynamic_traj":5, # seq_len 必须大于等于 his_lens 否则无法制作真值
+#         "e2e_dynamic_traj":5,
+#     },
+#     "fur_lens":{ # 未来长度
+#         "obj_dynamic_traj": 50,
+#         "e2e_dynamic_traj": 50,
+#     }, # his_lens , fur_lens 即输入历史真值预测未来轨迹
+#     "frequency":{ # 频率 10Hz
+#         "obj_dynamic_traj": 10, # 真值插值成10Hz,即5秒内真值为50个点
+#         "e2e_dynamic_traj": 10, # 真值插值成10Hz,即5秒内真值为50个点
+#     },
 
 
 
 
-    "camera_names":[
-        "FrontCam02",     #前 
-        "RearCam01",      #后方
-        "SideFrontCam01", #左前
-        "SideFrontCam02", #右前
-        "SideRearCam01",  #左后
-        "SideRearCam02"   #右后
-    ],
-    # 3D 检测类别：与 convert_det 输出的 object_infos[].sub_category 对应，用于映射到类别下标
-    "det_class_names": ["car", "truck", "bus", "pedestrian", "bicycle", "motorcycle", "traffic_cone", "barrier"],
-}
+
+#     "camera_names":[
+#         "FrontCam02",     #前 
+#         "RearCam01",      #后方
+#         "SideFrontCam01", #左前
+#         "SideFrontCam02", #右前
+#         "SideRearCam01",  #左后
+#         "SideRearCam02"   #右后
+#     ],
+#     # 3D 检测类别：与 convert_det 输出的 object_infos[].sub_category 对应，用于映射到类别下标
+#     "det_class_names": ["car", "truck", "bus", "pedestrian", "bicycle", "motorcycle", "traffic_cone", "barrier"],
+# }
 
 
 
@@ -174,6 +217,7 @@ def img_transform(img,
 class Dataset(torch.utils.data.Dataset):
     def __init__(self,config):
         self.config = config
+        self.mode = config["mode"]
 
         self.grid_conf = config["grid_conf"] # bev网格配置
         self.bevh = self.grid_conf["xbound"][1] - self.grid_conf["xbound"][0]
@@ -193,7 +237,13 @@ class Dataset(torch.utils.data.Dataset):
         # 联合训练配置
         self.task_flags = config["task_flag"]
         self.task_indexs = config["task_indexs"]
-        self.useful_indexs,self.group_indexs = self.get_input_indexs()
+        self.task_class_names = config["task_class_names"]
+        self.seq_len = config["seq_len"]
+        self.seq_len_random = config["seq_len_random"]
+        self.his_lens = config["his_lens"]
+        self.fur_lens = config["fur_lens"]
+        self.frequency = config["frequency"]
+        # self.useful_indexs,self.group_indexs = self.get_input_indexs()
 
         # 数据准备
         self.get_all_paths()
@@ -239,12 +289,12 @@ class Dataset(torch.utils.data.Dataset):
                 rot = lidar2camera[:3,:3]
                 tran =  lidar2camera[:3,3]
                 # 获取图像信息
-                image_name = os.path.basename(image_paths[cn])
-                image_path = os.path.join(
-                    os.path.dirname(label_path).replace("label",cn),
-                    image_name
-                )
-                # image_path = label_path.replace("label",cn).replace(".json",".jpg")
+                # image_name = os.path.basename(image_paths[cn])
+                # image_path = os.path.join(
+                #     os.path.dirname(label_path).replace("label",cn),
+                #     image_name
+                # )
+                image_path = label_path.replace("label",cn).replace(".json",".jpg")
                 #如果图像不存在的话，给置成全0黑图，参数就全部初始化一下----这里默认所有视角的图片都存在
                 # 数据增强的参数
                 resize_lims,bot_pct_lims,rot_lim,flip = self.cnis[cn]["resize_lim"],self.cnis[cn]["bot_pct_lim"],self.config["rot_lim"],self.config["flip"]
@@ -368,155 +418,162 @@ class Dataset(torch.utils.data.Dataset):
           * gt_labels_map3D / gt_bboxes_map3D（方便调试）；
           * gt_map_bboxes / gt_map_labels / gt_map_pts（MapHead.loss 直接使用）。
         """
+        gt_labels_seq = []
+        gt_bboxes_seq = []
+        gt_pts_seq = []
+        for label_path in recs:
         # 只取当前帧（最后一帧）的 map 标注
-        label_path = recs[-1]
-        with open(label_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+            label_path = recs[-1]
+            with open(label_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
 
-        ego_pose = data["ego_pose"]
-        T_ego2wld = TransformationmatrixEgo(ego_pose["orientation"], ego_pose["position"])
-        T_wld2ego = np.linalg.inv(T_ego2wld)
+            ego_pose = data["ego_pose"]
+            T_ego2wld = TransformationmatrixEgo(ego_pose["orientation"], ego_pose["position"])
+            T_wld2ego = np.linalg.inv(T_ego2wld)
 
-        groups = data.get("groups", {})
+            groups = data.get("groups", {})
 
-        # pc_range（BEV 范围）
-        x_min, x_max = self.grid_conf["xbound"][0], self.grid_conf["xbound"][1]
-        y_min, y_max = self.grid_conf["ybound"][0], self.grid_conf["ybound"][1]
+            # pc_range（BEV 范围）
+            x_min, x_max = self.grid_conf["xbound"][0], self.grid_conf["xbound"][1]
+            y_min, y_max = self.grid_conf["ybound"][0], self.grid_conf["ybound"][1]
 
-        # MapTR 中常用的 3 类：0=divider, 1=ped_crossing, 2=boundary
-        polylines = []      # 每条线的 (num_pts, 2)
-        labels = []         # 每条线的类别下标
-        geom_types = []     # 每条线对应的几何类型：line_3d / polygon_3d
+            # MapTR 中常用的 3 类：0=divider, 1=ped_crossing, 2=boundary
+            polylines = []      # 每条线的 (num_pts, 2)
+            labels = []         # 每条线的类别下标
+            geom_types = []     # 每条线对应的几何类型：line_3d / polygon_3d
 
-        # 统一的重采样点数 & 多顺序个数
-        # 按论文思路：开曲线至少正/反 2 种，闭合折线可有 N*2 种（N=num_pts）
-        # 这里对所有线统一使用 num_orders = 2 * num_pts：
-        #   - 前 num_pts 个顺序：正向循环移位
-        #   - 后 num_pts 个顺序：反向循环移位
-        num_pts = self.config.get("map_num_pts", 20)
-        num_orders = 2 * num_pts
+            # 统一的重采样点数 & 多顺序个数
+            # 按论文思路：开曲线至少正/反 2 种，闭合折线可有 N*2 种（N=num_pts）
+            # 这里对所有线统一使用 num_orders = 2 * num_pts：
+            #   - 前 num_pts 个顺序：正向循环移位
+            #   - 后 num_pts 个顺序：反向循环移位
+            num_pts = self.config.get("map_num_pts", 20)
+            num_orders = 2 * num_pts
 
-        def resample_polyline(coords_xy, num_pts):
-            """按均匀参数 t∈[0,1] 对折线做一维线性插值，得到固定点数。"""
-            n = coords_xy.shape[0]
-            if n <= 1 or n == num_pts:
-                return coords_xy.astype(np.float32)
-            t_old = np.linspace(0.0, 1.0, n, dtype=np.float32)
-            t_new = np.linspace(0.0, 1.0, num_pts, dtype=np.float32)
-            x_new = np.interp(t_new, t_old, coords_xy[:, 0])
-            y_new = np.interp(t_new, t_old, coords_xy[:, 1])
-            return np.stack([x_new, y_new], axis=1).astype(np.float32)
+            def resample_polyline(coords_xy, num_pts):
+                """按均匀参数 t∈[0,1] 对折线做一维线性插值，得到固定点数。"""
+                n = coords_xy.shape[0]
+                if n <= 1 or n == num_pts:
+                    return coords_xy.astype(np.float32)
+                t_old = np.linspace(0.0, 1.0, n, dtype=np.float32)
+                t_new = np.linspace(0.0, 1.0, num_pts, dtype=np.float32)
+                x_new = np.interp(t_new, t_old, coords_xy[:, 0])
+                y_new = np.interp(t_new, t_old, coords_xy[:, 1])
+                return np.stack([x_new, y_new], axis=1).astype(np.float32)
 
-        for _, grp in groups.items():
-            gtype = grp.get("type", "")
-            props = grp.get("properties", {})
+            for _, grp in groups.items():
+                gtype = grp.get("type", "")
+                props = grp.get("properties", {})
 
-            # 映射到 3 类：divider / ped_crossing / boundary
-            cls_id = None
-            if gtype in ["lane_line", "real_lane_line", "imaginary_lane_line", "lane_center_line"]:
-                cls_id = 0  # divider
-            elif gtype == "road_marker_line":
-                # 仅把 category==3 (斑马线) 当作人行横道，其它暂不作为 map GT
-                cat = str(props.get("category", "-1"))
-                if cat == "3":
-                    cls_id = 1  # ped_crossing
-            elif gtype in ["road_edge", "non_drivable_area"]:
-                cls_id = 2  # boundary / non-drivable
-            else:
-                continue
-
-            if cls_id is None:
-                continue
-
-            objects = grp.get("objects", [])
-            for obj in objects:
-                # 仅使用 LidarFusion 的 3D 几何
-                if obj.get("sensor", "") != "LidarFusion":
-                    continue
-                geom = obj.get("geometry", "")
-                if geom not in ["line_3d", "polygon_3d"]:
-                    continue
-
-                pts3d = obj.get("points", [])
-                if len(pts3d) < 2:
-                    continue
-
-                coords = []
-                for p in pts3d:
-                    pw = np.array([p["x"], p["y"], p["z"], 1.0], dtype=np.float64)
-                    pe = (T_wld2ego @ pw)[:3]  # ego 坐标
-                    coords.append([pe[0], pe[1]])  # 只保留 x,y
-                coords = np.asarray(coords, dtype=np.float32)  # (N, 2)
-
-                # 与 pc_range 的粗裁剪：若整条线都在范围外，则忽略
-                xs, ys = coords[:, 0], coords[:, 1]
-                if xs.max() < x_min or xs.min() > x_max or ys.max() < y_min or ys.min() > y_max:
-                    continue
-
-                # 将点裁剪到 pc_range 内，避免 bbox 超界
-                coords[:, 0] = np.clip(coords[:, 0], x_min, x_max)
-                coords[:, 1] = np.clip(coords[:, 1], y_min, y_max)
-
-                # 重采样为固定 num_pts
-                coords_rs = resample_polyline(coords, num_pts)  # (num_pts, 2)
-
-                polylines.append(coords_rs)
-                labels.append(cls_id)
-                geom_types.append(geom)
-
-        if len(polylines) == 0:
-            gt_labels = torch.zeros(0, dtype=torch.long)
-            gt_bboxes = torch.zeros(0, 4, dtype=torch.float32)
-            # 多顺序 GT：形状 (N, num_orders, num_pts, 2)
-            gt_pts = torch.zeros(0, num_orders, num_pts, 2, dtype=torch.float32)
-        else:
-            polys = np.stack(polylines, axis=0)  # (N, num_pts, 2)
-            labels_arr = np.asarray(labels, dtype=np.int64)  # (N,)
-
-            x1 = polys[:, :, 0].min(axis=1)
-            y1 = polys[:, :, 1].min(axis=1)
-            x2 = polys[:, :, 0].max(axis=1)
-            y2 = polys[:, :, 1].max(axis=1)
-            bboxes_arr = np.stack([x1, y1, x2, y2], axis=1).astype(np.float32)  # (N, 4)
-
-            gt_labels = torch.from_numpy(labels_arr).long()
-            gt_bboxes = torch.from_numpy(bboxes_arr).float()
-
-            # 多顺序 GT：分开/闭合两种情况
-            # - 开曲线（line_3d）：只需要正序 + 反序 2 种表示，其余 order 用重复填充占位
-            # - 闭合折线（polygon_3d）：正序 + 反序 + 循环移位，共 2*num_pts 种表示
-            all_orders = []
-            for poly, gtype in zip(polys, geom_types):
-                pts = torch.from_numpy(poly).float()  # (num_pts, 2)
-                orders = []
-                if gtype == "polygon_3d":
-                    # 闭合折线：正向 & 反向的所有循环移位 → N*2 种
-                    for k in range(num_pts):
-                        orders.append(torch.roll(pts, shifts=-k, dims=0))
-                    pts_rev = torch.flip(pts, dims=[0])
-                    for k in range(num_pts):
-                        orders.append(torch.roll(pts_rev, shifts=-k, dims=0))
+                # 映射到 3 类：divider / ped_crossing / boundary
+                cls_id = None
+                if gtype in ["lane_line", "real_lane_line", "imaginary_lane_line", "lane_center_line"]:
+                    cls_id = 0  # divider
+                elif gtype == "road_marker_line":
+                    # 仅把 category==3 (斑马线) 当作人行横道，其它暂不作为 map GT
+                    cat = str(props.get("category", "-1"))
+                    if cat == "3":
+                        cls_id = 1  # ped_crossing
+                elif gtype in ["road_edge", "non_drivable_area"]:
+                    cls_id = 2  # boundary / non-drivable
                 else:
-                    # 开曲线：只保留正序 + 反序两种表示，其它 order 用正序重复填充
-                    orders.append(pts)                    # 正序
-                    orders.append(torch.flip(pts, [0]))   # 反序
-                    while len(orders) < num_orders:
-                        orders.append(pts)
-                orders = torch.stack(orders, dim=0)  # (num_orders, num_pts, 2)
-                all_orders.append(orders)
-            gt_pts = torch.stack(all_orders, dim=0)  # (N, num_orders, num_pts, 2)
+                    continue
 
+                if cls_id is None:
+                    continue
+
+                objects = grp.get("objects", [])
+                for obj in objects:
+                    # 仅使用 LidarFusion 的 3D 几何
+                    if obj.get("sensor", "") != "LidarFusion":
+                        continue
+                    geom = obj.get("geometry", "")
+                    if geom not in ["line_3d", "polygon_3d"]:
+                        continue
+
+                    pts3d = obj.get("points", [])
+                    if len(pts3d) < 2:
+                        continue
+
+                    coords = []
+                    for p in pts3d:
+                        pw = np.array([p["x"], p["y"], p["z"], 1.0], dtype=np.float64)
+                        pe = (T_wld2ego @ pw)[:3]  # ego 坐标
+                        coords.append([pe[0], pe[1]])  # 只保留 x,y
+                    coords = np.asarray(coords, dtype=np.float32)  # (N, 2)
+
+                    # 与 pc_range 的粗裁剪：若整条线都在范围外，则忽略
+                    xs, ys = coords[:, 0], coords[:, 1]
+                    if xs.max() < x_min or xs.min() > x_max or ys.max() < y_min or ys.min() > y_max:
+                        continue
+
+                    # 将点裁剪到 pc_range 内，避免 bbox 超界
+                    coords[:, 0] = np.clip(coords[:, 0], x_min, x_max)
+                    coords[:, 1] = np.clip(coords[:, 1], y_min, y_max)
+
+                    # 重采样为固定 num_pts
+                    coords_rs = resample_polyline(coords, num_pts)  # (num_pts, 2)
+
+                    polylines.append(coords_rs)
+                    labels.append(cls_id)
+                    geom_types.append(geom)
+
+            if len(polylines) == 0:
+                gt_labels = torch.zeros(0, dtype=torch.long)
+                gt_bboxes = torch.zeros(0, 4, dtype=torch.float32)
+                # 多顺序 GT：形状 (N, num_orders, num_pts, 2)
+                gt_pts = torch.zeros(0, num_orders, num_pts, 2, dtype=torch.float32)
+            else:
+                polys = np.stack(polylines, axis=0)  # (N, num_pts, 2)
+                labels_arr = np.asarray(labels, dtype=np.int64)  # (N,)
+
+                x1 = polys[:, :, 0].min(axis=1)
+                y1 = polys[:, :, 1].min(axis=1)
+                x2 = polys[:, :, 0].max(axis=1)
+                y2 = polys[:, :, 1].max(axis=1)
+                bboxes_arr = np.stack([x1, y1, x2, y2], axis=1).astype(np.float32)  # (N, 4)
+
+                gt_labels = torch.from_numpy(labels_arr).long()
+                gt_bboxes = torch.from_numpy(bboxes_arr).float()
+
+                # 多顺序 GT：分开/闭合两种情况
+                # - 开曲线（line_3d）：只需要正序 + 反序 2 种表示，其余 order 用重复填充占位
+                # - 闭合折线（polygon_3d）：正序 + 反序 + 循环移位，共 2*num_pts 种表示
+                all_orders = []
+                for poly, gtype in zip(polys, geom_types):
+                    pts = torch.from_numpy(poly).float()  # (num_pts, 2)
+                    orders = []
+                    if gtype == "polygon_3d":
+                        # 闭合折线：正向 & 反向的所有循环移位 → N*2 种
+                        for k in range(num_pts):
+                            orders.append(torch.roll(pts, shifts=-k, dims=0))
+                        pts_rev = torch.flip(pts, dims=[0])
+                        for k in range(num_pts):
+                            orders.append(torch.roll(pts_rev, shifts=-k, dims=0))
+                    else:
+                        # 开曲线：只保留正序 + 反序两种表示，其它 order 用正序重复填充
+                        orders.append(pts)                    # 正序
+                        orders.append(torch.flip(pts, [0]))   # 反序
+                        while len(orders) < num_orders:
+                            orders.append(pts)
+                    orders = torch.stack(orders, dim=0)  # (num_orders, num_pts, 2)
+                    all_orders.append(orders)
+                gt_pts = torch.stack(all_orders, dim=0)  # (N, num_orders, num_pts, 2)
+            gt_labels_seq.append(gt_labels)
+            gt_bboxes_seq.append(gt_bboxes)
+            gt_pts_seq.append(gt_pts)
         # map3D 内部使用（可选）
         out = {
-            "gt_labels_map3D": gt_labels,
-            "gt_bboxes_map3D": gt_bboxes,
+            "gt_labels_map3D": gt_labels_seq,
+            "gt_bboxes_map3D": gt_bboxes_seq,
+            "gt_pts_map3D": gt_pts_seq,
         }
         # MapHead.loss 直接使用的格式（单样本 → list 长度 1）
-        out.update({
-            "gt_map_bboxes": [gt_bboxes],
-            "gt_map_labels": [gt_labels],
-            "gt_map_pts": [gt_pts],
-        })
+        # out.update({
+        #     "gt_map_bboxes": [gt_bboxes],
+        #     "gt_map_labels": [gt_labels],
+        #     "gt_map_pts": [gt_pts],
+        # })
         return out
     
     def get_anno_obj_dynamic_traj(self, recs, dt=0.1):
@@ -530,69 +587,84 @@ class Dataset(torch.utils.data.Dataset):
         然后在当前帧附近截取一个时间窗（默认前 40 帧、后 50 帧），计算速度轨迹。
         """
 
-        label_path = recs[-1]  # 只选择最后一帧作为真值
-        obj_traj_path = label_path.replace(".json", "_object_trajectory.npy")
-        if os.path.exists(obj_traj_path):
-            object_trajectorys = np.load(obj_traj_path, allow_pickle=True).item()
-        else:
-            object_trajectorys = {}
+        trackids_seq = []
+        obj_trajs_seq = []
+        masks_seq = []
+        for label_path in recs:
 
-        trackids = []
-        obj_trajs = []
-        masks = []
+            label_path = recs[-1]  # 只选择最后一帧作为真值
+            obj_traj_path = label_path.replace(".json", "_object_trajectory.npy")
+            if os.path.exists(obj_traj_path):
+                object_trajectorys = np.load(obj_traj_path, allow_pickle=True).item()
+            else:
+                object_trajectorys = {}
 
-        for trackid, trajs in object_trajectorys.items():
-            traj_mask = trajs["obj_trajectory_in_ego"]  # (T, 4), [:3] 为 xyz, 最后一维为 mask
-            coords_full = traj_mask[:, :3].astype(np.float32)  # (T, 3)
-            mask_full = traj_mask[:, -1].astype(np.float32)    # (T,)
+            trackids = []
+            obj_trajs = []
+            masks = []
 
-            # 当前帧索引（mask==0），若不存在则跳过该轨迹
-            cur_idx_arr = np.where(mask_full == 0)[0]
-            if cur_idx_arr.size == 0:
-                continue
-            cur_idx = int(cur_idx_arr[0])
+            for trackid, trajs in object_trajectorys.items():
+                traj_mask = trajs["obj_trajectory_in_ego"]  # (T, 4), [:3] 为 xyz, 最后一维为 mask
+                coords_full = traj_mask[:, :3].astype(np.float32)  # (T, 3)
+                mask_full = traj_mask[:, -1].astype(np.float32)    # (T,)
 
-            T = coords_full.shape[0]
-            start_idx = max(0, cur_idx - 40)
-            end_idx = min(T - 1, cur_idx + 50)
+                # 当前帧索引（mask==0），若不存在则跳过该轨迹
+                cur_idx_arr = np.where(mask_full == 0)[0]
+                if cur_idx_arr.size == 0:
+                    continue
+                cur_idx = int(cur_idx_arr[0])
 
-            coords = coords_full[start_idx:end_idx + 1].copy()  # (L, 3)
-            mask = mask_full[start_idx:end_idx + 1].copy()      # (L,)
+                T = coords_full.shape[0]
+                start_idx = max(0, cur_idx - 40)
+                end_idx = min(T - 1, cur_idx + 50)
 
-            # 在当前窗口内，找第一次和最后一次出现 1 的位置
-            one_idx = np.where(mask == 1)[0]
-            if one_idx.size >= 2:
-                s = int(one_idx[0])
-                e = int(one_idx[-1])
-                x = np.arange(s, e + 1, dtype=np.float32)
-                # 有效点：mask>=0（包括 0 和 1）
-                valid = mask[s:e + 1] >= 0
-                x_valid = x[valid]
-                if x_valid.size >= 2:
-                    for d in range(3):
-                        y_seg = coords[s:e + 1, d]
-                        y_valid = y_seg[valid]
-                        # 用相邻有效点对 -1 位置做线性插值
-                        y_interp = np.interp(x, x_valid, y_valid)
-                        missing = mask[s:e + 1] < 0
-                        coords[s:e + 1, d][missing] = y_interp[missing]
-                    # 被插值的位置视作存在目标
-                    mask[s:e + 1][mask[s:e + 1] < 0] = 1.0
+                coords = coords_full[start_idx:end_idx + 1].copy()  # (L, 3)
+                mask = mask_full[start_idx:end_idx + 1].copy()      # (L,)
 
-            # 计算速度：一阶差分 / dt，长度为 L-1
-            traj_v = (coords[1:] - coords[:-1]) / dt
+                # 在当前窗口内，找第一次和最后一次出现 1 的位置
+                one_idx = np.where(mask == 1)[0]
+                if one_idx.size >= 2:
+                    s = int(one_idx[0])
+                    e = int(one_idx[-1])
+                    x = np.arange(s, e + 1, dtype=np.float32)
+                    # 有效点：mask>=0（包括 0 和 1）
+                    valid = mask[s:e + 1] >= 0
+                    x_valid = x[valid]
+                    if x_valid.size >= 2:
+                        for d in range(3):
+                            y_seg = coords[s:e + 1, d]
+                            y_valid = y_seg[valid]
+                            # 用相邻有效点对 -1 位置做线性插值
+                            y_interp = np.interp(x, x_valid, y_valid)
+                            missing = mask[s:e + 1] < 0
+                            coords[s:e + 1, d][missing] = y_interp[missing]
+                        # 被插值的位置视作存在目标
+                        mask[s:e + 1][mask[s:e + 1] < 0] = 1.0
 
-            trackids.append(trackid)
-            obj_trajs.append(traj_v)
-            masks.append(mask.tolist())
+                # 计算速度：一阶差分 / dt，长度为 L-1
+                traj_v = (coords[1:] - coords[:-1]) / dt
+
+                trackids.append(trackid)
+                obj_trajs.append(traj_v)
+                masks.append(mask.tolist())
+            trackids_seq.append(trackids)
+            obj_trajs_seq.append(obj_trajs)
+            masks_seq.append(masks)
 
         return {
             "gt_obj_dynamic_traj": {
-                "trackids": trackids,
-                "dynamic_trajs": obj_trajs,
-                "masks": masks,
+                "trackids": trackids_seq,
+                "dynamic_trajs": obj_trajs_seq,
+                "masks": masks_seq,
             }
         }
+
+    def get_Hz_by_filename_from_json(self, paths):
+        filename1 = paths[0].strip(os.sep).split(os.sep)[-1].replace(".json", "")
+        filename2 = paths[1].strip(os.sep).split(os.sep)[-1].replace(".json", "")
+        dt = int(filename1.split(".")[-1]) - int(filename2.split(".")[-1]) / 1000 # 秒为单位
+        # Hz = 1 / dt # Hz为单位
+        return dt
 
     def get_anno_e2e_dynamic_static_traj(self, recs, dt=0.1, num_static_pts=20):
         """
@@ -601,60 +673,59 @@ class Dataset(torch.utils.data.Dataset):
         - 静态轨迹：从当前帧到 clip 结束的自车位置中，找到“到达 BEV 范围边缘的点”，
           然后将当前点到该边缘点之间的路径按等步长插值成 num_static_pts 个点。
         """
-        label_path = recs[-1]  # 只选择最后一帧作为真值
-        ego_traj_path = label_path.replace(".json", "_ego_trajectory.npy")
-        traj_mask = np.load(ego_traj_path)  # (T, 4): xyz + mask
-        coords_full = traj_mask[:, :3].astype(np.float32)  # (T, 3)
-        mask_full = traj_mask[:, -1].astype(np.float32)    # (T,)
+        dynamic_traj_vs = []
+        static_trajs = []
+        for label_path in recs:
+            ego_traj_path = label_path.replace(".json", "_ego_trajectory.npy")
+            traj_mask = np.load(ego_traj_path)  # (T, 4): xyz + mask
+            coords_full = traj_mask[:, :3].astype(np.float32)  # (T, 3)
+            mask_full = traj_mask[:, -1].astype(np.float32)    # (T,)
 
-        # 当前帧索引：mask == 0
-        cur_idx_arr = np.where(mask_full == 0)[0]
-        if cur_idx_arr.size == 0:
-            return {
-                "gt_e2e_dynamic_traj": None,
-                "gt_e2e_static_traj": None,
-            }
-        cur_idx = int(cur_idx_arr[0])
+            # 当前帧索引：mask == 0
+            cur_idx_arr = np.where(mask_full == 0)[0] # 做真值时要求必须存在当前帧
+            cur_idx = int(cur_idx_arr[0])
 
-        # -------- 动态轨迹：前 40 帧 + 后 50 帧，速度序列 --------
-        T = coords_full.shape[0]
-        start_idx = max(0, cur_idx - 40)
-        end_idx = min(T - 1, cur_idx + 50)
-        dyn_coords = coords_full[start_idx:end_idx + 1].copy()  # (L, 3)
-        if dyn_coords.shape[0] >= 2:
-            dynamic_traj_v = (dyn_coords[1:] - dyn_coords[:-1]) / dt  # (L-1, 3)
-        else:
-            dynamic_traj_v = np.zeros((0, 3), dtype=np.float32)
+            # -------- 动态轨迹：前 5 帧 + 后 50 帧，速度序列 --------
+            T = coords_full.shape[0]
+            start_idx = max(0, cur_idx - self.his_lens["e2e_dynamic_traj"])
+            end_idx = min(T - 1, cur_idx + self.fur_lens["e2e_dynamic_traj"])
+            dyn_coords = coords_full[start_idx:end_idx + 1].copy()  # (L, 3)
+            if dyn_coords.shape[0] >= 2:
+                dynamic_traj_v = (dyn_coords[1:] - dyn_coords[:-1]) / dt  # (L-1, 3)
+            else:
+                dynamic_traj_v = np.zeros((0, 3), dtype=np.float32)
 
-        # -------- 静态轨迹：从当前到 BEV 范围边缘，等步长插值为 num_static_pts 点 --------
-        x_min, x_max = self.grid_conf["xbound"][0], self.grid_conf["xbound"][1]
-        y_min, y_max = self.grid_conf["ybound"][0], self.grid_conf["ybound"][1]
-        xs = coords_full[:, 0]
-        ys = coords_full[:, 1]
-        inside = (xs >= x_min) & (xs <= x_max) & (ys >= y_min) & (ys <= y_max)
+            # -------- 静态轨迹：从当前到 BEV 范围边缘，等步长插值为 num_static_pts 点 --------
+            x_min, x_max = self.grid_conf["xbound"][0], self.grid_conf["xbound"][1]
+            y_min, y_max = self.grid_conf["ybound"][0], self.grid_conf["ybound"][1]
+            xs = coords_full[:, 0]
+            ys = coords_full[:, 1]
+            inside = (xs >= x_min) & (xs <= x_max) & (ys >= y_min) & (ys <= y_max)
 
-        # 从当前帧往后，找到最后一个仍在 BEV 范围内的点，视为“边缘点”
-        inside_after = inside[cur_idx:]
-        if inside_after.any():
-            last_inside_rel = np.where(inside_after)[0][-1]
-            edge_idx = cur_idx + int(last_inside_rel)
-        else:
-            # 当前之后都不在 BEV 范围内，则静态轨迹退化为当前点
-            edge_idx = cur_idx
+            # 从当前帧往后，找到最后一个仍在 BEV 范围内的点，视为“边缘点”
+            inside_after = inside[cur_idx:]
+            if inside_after.any():
+                last_inside_rel = np.where(inside_after)[0][-1]
+                edge_idx = cur_idx + int(last_inside_rel)
+            else:
+                # 当前之后都不在 BEV 范围内，则静态轨迹退化为当前点
+                edge_idx = cur_idx
 
-        p_start = coords_full[cur_idx].astype(np.float32)
-        p_end = coords_full[edge_idx].astype(np.float32)
+            p_start = coords_full[cur_idx].astype(np.float32)
+            p_end = coords_full[edge_idx].astype(np.float32)
 
-        if num_static_pts <= 1:
-            static_traj = p_end[None, :]
-        else:
-            # 等步长插值 num_static_pts 个点（包含起点和终点）
-            alphas = np.linspace(0.0, 1.0, num_static_pts, dtype=np.float32)[:, None]  # (N, 1)
-            static_traj = p_start[None, :] + alphas * (p_end[None, :] - p_start[None, :])  # (N, 3)
+            if num_static_pts <= 1:
+                static_traj = p_end[None, :]
+            else:
+                # 等步长插值 num_static_pts 个点（包含起点和终点）
+                alphas = np.linspace(0.0, 1.0, num_static_pts, dtype=np.float32)[:, None]  # (N, 1)
+                static_traj = p_start[None, :] + alphas * (p_end[None, :] - p_start[None, :])  # (N, 3)
 
+            dynamic_traj_vs.append(dynamic_traj_v)
+            static_trajs.append(static_traj)
         return {
-            "gt_e2e_dynamic_traj": dynamic_traj_v,
-            "gt_e2e_static_traj": static_traj,
+            "gt_e2e_dynamic_traj": dynamic_traj_vs,
+            "gt_e2e_static_traj": static_trajs,
         }
 
 
@@ -723,20 +794,38 @@ class Dataset(torch.utils.data.Dataset):
         
 
     def dynamic_static_data(self,clip_name):
+        """"
+        看该clip属于动态还是静态,还是端到端数据
+        """
         for mode,clip_names in self.mode2clip.items():
             if clip_name in clip_names:
                 return mode
     
-    def get_input_indexs(self):
+    def gen_random_history_indexs(self,len=5,mode="dynamic"):
+        indexs_dict = {}
+        for task in self.task_class_names[mode]:
+            if self.task_flags[task]:
+                sub_indexs = sorted(random.sample(
+                    [i for i in range(self.task_indexs[task][0]+len,self.task_indexs[task][1])], # 对预测任务来说
+                    len)) # 历史长度
+                indexs_dict[task] = sub_indexs
+        return indexs_dict
+
+
+    def get_input_indexs(self,mode="dynamic"):
+        #随机生成的轨迹合并，分成两大类：动态和静态，否则占资源
+        his_len = self.seq_len - 1 # 历史长度
+        task_indexs = self.gen_random_history_indexs(len=his_len,mode=mode)
         indexs = []
-        group_indexs = []
-        for task,useful in self.task_flags.items():
-            if useful:
-                sub_index = self.task_indexs[task]
-                indexs += sub_index
-                if sub_index not in group_indexs:
-                    group_indexs.append(sub_index)
-        return sorted(list(set(indexs))),group_indexs
+        for task in self.task_class_names[mode]:
+            if task in task_indexs:
+                indexs += task_indexs[task]
+        indexs = list(set(indexs))   
+        indexs = sorted(random.sample(indexs,his_len)) + [self.current_frame_index]
+        
+        return indexs
+        
+
 
     def __getitem__(self, index):
         sces_len = self.sces_len
@@ -745,73 +834,57 @@ class Dataset(torch.utils.data.Dataset):
         clip_name = scenes[sce_id]
         sce_id_ind = index - sum(sces_len[:sce_id])
         rec = self.ixes[clip_name][sce_id_ind:sce_id_ind + self.total_len]
-        mode = self.dynamic_static_data(clip_name)
-        
+        dt = self.get_Hz_by_filename_from_json(rec)
+        mode = self.dynamic_static_data(clip_name) # 判断那种数据类型，是否指标了动态数据，还是只标了静态数据，还是两者都标注了
+        indexs= self.get_input_indexs(mode)
         #数据增强部分
-        image_rec = [rec[i] for i in self.useful_indexs]
-        imgs, rots, trans, intrins, distorts, post_rots, post_trans = self.get_image_data(image_rec)
+        recs = [rec[i] for i in indexs]
+        imgs, rots, trans, intrins, distorts, post_rots, post_trans = self.get_image_data(recs)
         images_parma = {
-            "x": imgs,
-            "rots": rots,
+            "x": imgs,                  # 14 8 3 128 384 # 最后在batch上拼接 # bs * T * 8 * 3 * 128 * 384
+            "rots": rots,               # 14 8 3 3        
             "trans": trans,
-            "intrins": intrins,
-            "distorts": distorts,
-            "post_rots": post_rots,
+            "intrins": intrins,         # 14 8 3 3 3
+            "distorts": distorts,       # 14 8 3 1 8
+            "post_rots": post_rots,     # 14 8 3 2 2
             "post_trans": post_trans
         }
 
         #时序对其部分
-        algin_matrixs = {}
-        for indexs in self.group_indexs:
-            str_index = "_".join(list(map(str,indexs)))
-            algin_recs = [rec[i] for i in indexs]
-            theta_mats = self.get_algin_theta_mat(algin_recs)
-            algin_matrixs[str_index] = theta_mats
+        theta_mats = self.get_algin_theta_mat(recs)
+        algin_matrixs = {
+            "theta_mats": theta_mats
+        }
+
 
         anno_infos = {
             "gt_labels_det2D":None,
             "gt_bboxes_det2D":None,
             "gt_labels_map2D":None,
             "gt_bboxes_map2D":None,
-
-            "gt_labels_det3D":None,
-            "gt_bboxes_det3D":None,
+            "gt_labels_map2D":None,
+            "gt_bboxes_map2D":None,
             "gt_labels_map3D":None,
             "gt_bboxes_map3D":None,
-
-            "gt_obj_dynamic_traj":None,
-            "gt_e2e_dynamic_traj":None,
-            "gt_e2e_static_traj":None
         }
         
-        if mode == "dynamic" or mode == "static":
-            if self.task_flags["e2e_dynamic_traj"]:
-                gt_recs = [rec[i] for i in self.task_indexs["e2e_dynamic_traj"]]
-                anno_infos.update(self.get_anno_e2e_dynamic_static_traj(self, gt_recs, dt=0.1, num_static_pts=20))
 
-            
-            if mode == "dynamic":
-                if self.task_flags["det2D"]:
-                    gt_recs = [rec[i] for i in self.task_indexs["det2D"]]
-                    anno_infos.update(self.get_anno_det2D(gt_recs))
-                if self.task_flags["det3D"]:
-                    gt_recs = [rec[i] for i in self.task_indexs["det3D"]]
-                    anno_infos.update(self.get_anno_det3D(gt_recs))
-                if self.task_flags["obj_dynamic_traj"]:
-                    gt_recs = [rec[i] for i in self.task_indexs["obj_dynamic_traj"]]
-                    anno_infos.update(self.get_anno_obj_dynamic_traj(gt_recs))
-            else:
-                if self.task_flags["map2D"]:
-                    gt_recs = [rec[i] for i in self.task_indexs["map2D"]]
-                    anno_infos.update(self.get_anno_map2D(gt_recs))
-                if self.task_flags["map3D"]:
-                    gt_recs = [rec[i] for i in self.task_indexs["map3D"]]
-                    anno_infos.update(self.get_anno_map3D(gt_recs))
-                # if self.task_flags["e2e_static_traj"]:
-                #     gt_recs = [rec[i] for i in self.task_indexs["e2e_static_traj"]]
-                #     anno_infos.update(self.get_anno_e2e_static_traj(gt_recs))
-        else:
-            print("没有动静态的数据，没办法训练")
+        # 有哪些任务收集哪些真值
+        if mode == "dynamic" or mode == "dynamic_static":
+            if self.task_flags["det2D"]:
+                anno_infos.update(self.get_anno_det2D(recs))
+            if self.task_flags["det3D"]:
+                anno_infos.update(self.get_anno_det3D(recs))
+            if self.task_flags["obj_dynamic_traj"]:
+                anno_infos.update(self.get_anno_obj_dynamic_traj(recs))
+        if mode == "static" or mode == "dynamic_static":
+            if self.task_flags["map2D"]:
+                anno_infos.update(self.get_anno_map2D(recs))
+            if self.task_flags["map3D"]:
+                anno_infos.update(self.get_anno_map3D(recs))
+        if self.task_flags["e2e_dynamic_traj"] or self.task_flags["e2e_static_traj"] or mode == "dynamic_static":
+            anno_infos.update(self.get_anno_e2e_dynamic_static_traj(recs, dt=dt, num_static_pts=20))
+        
 
         out = {}
         out.update(images_parma)
@@ -869,6 +942,7 @@ class Dataset(torch.utils.data.Dataset):
         all_paths = []
         clip2path = {}
         for name,paths in self.config['clip_paths'].items():
+            if name != self.mode:continue
             for path in paths:
                 with open(path,"r") as f:
                     for line in f.readlines():
@@ -892,8 +966,9 @@ class Dataset(torch.utils.data.Dataset):
 if __name__ == '__main__':
     dataset = Dataset(configs)
     print(dataset.__len__())
-    for i in range(dataset.__len__()):
-        dataset.__getitem__(i)
+    dataset.__getitem__(0)
+    # for i in range(dataset.__len__()):
+    #     dataset.__getitem__(i)
     # root = "/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/map"
     # save_root = root.rstrip(os.sep) + ".txt"
     # with open(save_root,"w") as f:
