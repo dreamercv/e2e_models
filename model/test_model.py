@@ -260,7 +260,7 @@ def build_det2d_model(out_channels=256,det_class_num=3):
     return ModelDet2D(out_channels=out_channels,det_class_num=det_class_num)
 
 def build_seg2d_model(out_channels=256,seg_class_num=3,pos_weight=20.):
-    return ModelSeg2D(out_channels=out_channels,seg_class_num=seg_class_num)
+    return ModelSeg2D(out_channels=out_channels,seg_class_num=seg_class_num,pos_weight=pos_weight)
 
 def build_bev_backbone(channels,grid_conf,input_size=(128, 384),num_temporal=7):
     model = BEVBackbone(channels=channels,grid_conf=grid_conf, input_size=input_size,num_temporal=num_temporal)

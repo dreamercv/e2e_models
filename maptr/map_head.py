@@ -629,44 +629,44 @@ class MapHead(nn.Module):
         return out
 
 
+# def build_map_head(
+#     bev_feat_dim: int = 256,
+#     embed_dims: int = 256,
+#     num_vec: int = 100,
+#     num_pts_per_vec: int = 20,
+#     num_pts_per_gt_vec: int = 20,
+#     num_classes: int = 3,
+#     num_decoder_layers: int = 6,
+#     num_heads: int = 8,
+#     dropout: float = 0.1,
+#     feedforward_dims: int = 1024,
+#     pc_range: Optional[List[float]] = None,
+#     bev_bounds=None,
+#     row_num_embed: int = 80,
+#     col_num_embed: int = 40,
+#     **kwargs,
+# ) -> MapHead:
+#     """通用 MapHead 构建函数。"""
+#     return MapHead(
+#         bev_feat_dim=bev_feat_dim,
+#         embed_dims=embed_dims,
+#         num_vec=num_vec,
+#         num_pts_per_vec=num_pts_per_vec,
+#         num_pts_per_gt_vec=num_pts_per_gt_vec,
+#         num_classes=num_classes,
+#         num_decoder_layers=num_decoder_layers,
+#         num_heads=num_heads,
+#         dropout=dropout,
+#         feedforward_dims=feedforward_dims,
+#         pc_range=pc_range,
+#         bev_bounds=bev_bounds,
+#         row_num_embed=row_num_embed,
+#         col_num_embed=col_num_embed,
+#         **kwargs,
+#     )
+
+
 def build_map_head(
-    bev_feat_dim: int = 256,
-    embed_dims: int = 256,
-    num_vec: int = 100,
-    num_pts_per_vec: int = 20,
-    num_pts_per_gt_vec: int = 20,
-    num_classes: int = 3,
-    num_decoder_layers: int = 6,
-    num_heads: int = 8,
-    dropout: float = 0.1,
-    feedforward_dims: int = 1024,
-    pc_range: Optional[List[float]] = None,
-    bev_bounds=None,
-    row_num_embed: int = 80,
-    col_num_embed: int = 40,
-    **kwargs,
-) -> MapHead:
-    """通用 MapHead 构建函数。"""
-    return MapHead(
-        bev_feat_dim=bev_feat_dim,
-        embed_dims=embed_dims,
-        num_vec=num_vec,
-        num_pts_per_vec=num_pts_per_vec,
-        num_pts_per_gt_vec=num_pts_per_gt_vec,
-        num_classes=num_classes,
-        num_decoder_layers=num_decoder_layers,
-        num_heads=num_heads,
-        dropout=dropout,
-        feedforward_dims=feedforward_dims,
-        pc_range=pc_range,
-        bev_bounds=bev_bounds,
-        row_num_embed=row_num_embed,
-        col_num_embed=col_num_embed,
-        **kwargs,
-    )
-
-
-def build_map_head_from_maptr_config(
     bev_feat_dim: int = 256,
     embed_dims: int = 256,
     num_vec: int = 50,

@@ -13,7 +13,7 @@ from  torch import  nn
 # from loss_seg import SegLoss
 
 class ModelSeg2D(nn.Module):
-    def __init__(self,out_channels,seg_class_num=3,pos_weight=20.):
+    def __init__(self,out_channels,seg_class_num=3):
         super().__init__()
         self.up_sample = nn.Sequential(
             nn.ConvTranspose2d(out_channels, out_channels, 2, 2),

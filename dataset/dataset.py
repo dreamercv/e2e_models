@@ -210,7 +210,11 @@ def img_transform(img,
     b = A.matmul(-b) + b
     post_rot = A.matmul(post_rot)
     post_tran = A.matmul(post_tran) + b
-    return img, post_rot, post_tran
+    post_rot3 = torch.eye(2)
+    post_tran3 = torch.zeros(2)
+    post_tran3[:2] = post_tran
+    post_rot3[:2, :2] = post_rot
+    return img, post_rot3, post_tran3
 
 class Dataset(torch.utils.data.Dataset):
     def __init__(self,config,mode="dynamic"):
@@ -302,7 +306,7 @@ class Dataset(torch.utils.data.Dataset):
                 distort = np.array(parameter["dist_coeffs"])#畸变
                 intrin = np.array(parameter["camera_matrix"]) #内参
                 rot = lidar2camera[:3,:3]
-                tran =  lidar2camera[:3,3]
+                tran =  lidar2camera[:3,3][None]
                 # 获取图像信息
                 image_name = os.path.basename(image_paths[cn])
                 image_path = os.path.join(
@@ -332,7 +336,7 @@ class Dataset(torch.utils.data.Dataset):
                     post_rots_i.append(post_rot)
                     post_trans_i.append(post_tran)
                     intrins_i.append(torch.Tensor(intrin))
-                    distorts_i.append(torch.Tensor(distort))
+                    distorts_i.append(torch.Tensor(distort)[None])
                     rots_i.append(torch.Tensor(rot))
                     trans_i.append(torch.Tensor(tran))
             intrins.append(torch.stack(intrins_i))
