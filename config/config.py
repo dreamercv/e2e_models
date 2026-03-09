@@ -23,10 +23,10 @@ configs = {
     },
 
     "clip_paths":{
-        "dynamic":["/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/det.txt"],
-        "static":["/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/map.txt"],
-        "dynamic_static":["/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/dynamic_static.txt"],
-        "e2e":["/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/e2e.txt"],
+        "dynamic":["/workspace/afb5szh-01/models/e2e_model/e2e_dataset_10Hz_dyo.txt"],
+        "static":["/workspace/afb5szh-01/models/e2e_model/e2e_dataset_10Hz_lane.txt"],
+        "dynamic_static":[],
+        "e2e":[],
     },
     "camera_infos":{
         "FrontCam02":{
@@ -44,9 +44,9 @@ configs = {
 
     'final_dim': (128, 384),
 
-    "mode":"dynamic",
+    "mode":"static", # 默认加载动态数据
     "is_train":True,
-    "batch_size":1,
+    "batch_size":3,
     "num_workers":1,
 
     "train_clips":2, # -1 所有，[]指定几个，xxx.txt写进txt中指定的，>0前N个
@@ -59,28 +59,27 @@ configs = {
     "task_flag":{
         "det2D":False,
         "det3D":True,
+        "obj_dynamic_traj":True,
 
         "map2D":False,
         "map3D":True,
+        "e2e_static_traj":True,
 
-        "obj_dynamic_traj":False,
-        "e2e_static_traj":False,
-        "e2e_dynamic_traj":False,
+        "e2e_dynamic_traj":True,
     },
     "task_class_names":{
-        "dynamic":["det3D","obj_dynamic_traj","det2D","e2e_dynamic_traj"], 
-        "static":["map3D","map2D","e2e_static_traj","e2e_dynamic_traj"],
+        "dynamic":["det2D","det3D","obj_dynamic_traj"], 
+        "static":["map3D","map2D","e2e_static_traj"],
+        "e2e":[
+            "e2e_dynamic_traj"
+            ],
         "dynamic_static":[
-            "det3D","obj_dynamic_traj","det2D",
+            "det2D","det3D","obj_dynamic_traj",
             "map3D","map2D","e2e_static_traj",
             "e2e_dynamic_traj"
-            ],
-        "e2e":[
-            "e2e_static_traj",
-            "e2e_dynamic_traj"
-            ],
+        ],
     },
-    "task_indexs":{ # 在每次getitem时，随机取值
+    "task_indexs":{ # 在每次getitem时，随机取值 ,其实这里不需要随随机是为了增加间隔，不同的车速就相当于增加了间隔,
         # 在dyo的label上取值
         "det2D":[0,20], # 起始帧和结束帧                #输入N帧输出N帧
         "det3D":  [0,20], # 起始帧和结束帧              #输入N帧输出N帧
@@ -88,13 +87,13 @@ configs = {
         # 在lane的label上取值
         "map2D":[0,20], # 起始帧和结束帧                #输入N帧输出N帧
         "map3D":  [0,20], # 起始帧和结束帧              #输入N帧输出N帧
+        "e2e_dynamic_traj": [0,20], # 起始帧和结束帧    #输入N帧，预测最后一帧的轨迹
 
         # 在自车位姿上取值
-        "e2e_dynamic_traj": [0,20], # 起始帧和结束帧    #输入N帧，预测最后一帧的轨迹
         "e2e_static_traj":  [0,20], # 起始帧和结束帧    #输入N帧，预测最后一帧的轨迹
     },
+    "task_index_random":False,# 是否使用随机的index，即在历史20帧内随机选择seq_len帧
     "seq_len":5, 
-    "seq_len_random":True,
 
     # 预测任务的参数
     "his_lens":{ # 历史长度 ,对于预测任务来说，需要输入历史真值才能预测未来真值，所以上述task_indexs需要减去历史长度
@@ -123,6 +122,26 @@ configs = {
         "SideRearCam02"   #右后
     ],
     # 3D 检测类别：与 convert_det 输出的 object_infos[].sub_category 对应，用于映射到类别下标
-    "det_class_names": ["car", "truck", "bus", "pedestrian", "bicycle", "motorcycle", "traffic_cone", "barrier"],
-}
+    "det_class_names": [
+        "pedestrian",           #人
+        "car", "truck", "bus",  #车
+        "bicycle", "motorcycle" #骑行者
+    ],
+    "det_gt_names":["x","y","z","w","l","h","yaw","vx","vy","vz"],
 
+    "gt_names" : { # 真值对应的名称，必须与dataset曾一一对应
+        "dynamic" : [
+            "gt_labels_det2D","gt_bboxes_det2D",
+            "gt_labels_det3D","gt_bboxes_det3D","gt_labels_det3D_mask","gt_bboxes_det3D_mask",
+            "dynamic_trackids","dynamic_trajs","dynamic_traj_masks"
+        ],
+        "static" : [
+            "gt_labels_map2D","gt_bboxes_map2D",
+            "gt_labels_map3D","gt_bboxes_map3D","gt_pts_map3D",
+            "gt_e2e_static_traj"
+        ],
+        "e2e" : ["gt_e2e_dynamic_traj"]
+    },
+    "input_names" : ["x","rots","trans","intrins","distorts","post_rots","post_trans","theta_mats"]
+
+}

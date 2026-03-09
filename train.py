@@ -96,12 +96,35 @@ def main():
                     iters[i] = iter(dl)
                     batch = next(iters[i])
                 batches.append((type_name, batch))
+            inputs_tensor = {} #bs, 2, 5, 8, 3, 128, 384
+            gts_values = {}
+            gt_names = configs["gt_names"]
+            
+            input_names = configs["input_names"]  #["x","rots","trans","intrins","distorts","post_rots","post_trans","theta_mats"]
             for type_name, batch in batches:
-                print(type_name)
+                for input_name in input_names:
+                    if input_name not in inputs_tensor.keys():
+                        inputs_tensor[input_name] = batch[input_name]
+                    else:
+                        inputs_tensor[input_name] = torch.stack([inputs_tensor[input_name],batch[input_name]],1)
+                names = gt_names[type_name]
+                gts_value = {}
+                for name in names:
+                    if name not in batch.keys():continue
+                    gts_value[name] = batch[name]
+                gts_values[type_name] = gts_value
+            print()
+            # "x",              3, 2, 5, 8, 3, 128, 384
+            # "rots",           3, 2, 5, 8, 3, 3
+            # "trans",          3, 2, 5, 8, 3
+            # "intrins",        3, 2, 5, 8, 3, 3
+            # "distorts",       3, 2, 5, 8, 8
+            # "post_rots",      3, 2, 5, 8, 2, 2
+            # "post_trans",     3, 2, 5, 8, 2
+            # "theta_mats"      3, 2, 5, 2, 3
+# 
+
+
 
 
 main()
-
-
-
-
