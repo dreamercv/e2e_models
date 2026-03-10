@@ -1,7 +1,16 @@
 import os
 
 configs = {
+
+    "device":"cuda",# cuda cpu
+
+
+    "is_train": True,
+    "batch_size": 1,
+    "num_workers": 1,
     "epoch": 100,
+    "seq_len": 2,
+
 
     "log_dir": "/home/fb/project/models/Sparse4D-main/projects/e2e_models/logs",
     "log_save_interval": 100,
@@ -21,8 +30,8 @@ configs = {
     },
 
     "clip_paths": {
-        "dynamic": ["/workspace/afb5szh-01/models/e2e_model/e2e_dataset_10Hz_dyo.txt"],
-        "static": ["/workspace/afb5szh-01/models/e2e_model/e2e_dataset_10Hz_lane.txt"],
+        "dynamic": ["/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/det.txt"],
+        "static": ["/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/map.txt"],
         "dynamic_static": [],
         "e2e": [],
     },
@@ -43,9 +52,7 @@ configs = {
     'final_dim': (128, 384),
 
     "mode": "static",  # 默认加载动态数据
-    "is_train": True,
-    "batch_size": 1,
-    "num_workers": 1,
+    
 
     "train_clips": 2,  # -1 所有，[]指定几个，xxx.txt写进txt中指定的，>0前N个
 
@@ -89,7 +96,7 @@ configs = {
         "e2e_static_traj": [0, 20],  # 起始帧和结束帧    #输入N帧，预测最后一帧的轨迹
     },
     "task_index_random": False,  # 是否使用随机的index，即在历史20帧内随机选择seq_len帧
-    "seq_len": 2,
+    
 
     # 预测任务的参数
     "his_lens": {  # 历史长度 ,对于预测任务来说，需要输入历史真值才能预测未来真值，所以上述task_indexs需要减去历史长度
@@ -104,7 +111,7 @@ configs = {
         "obj_dynamic_traj": 10,  # 真值插值成10Hz,即5秒内真值为50个点
         "e2e_dynamic_traj": 10,  # 真值插值成10Hz,即5秒内真值为50个点
     },
-    "num_cams":1, # 环视相机个数
+    "num_cams":8, # 环视相机个数
     "camera_names": [
         "FrontCam02",  # 前
         "RearCam01",  # 后方
@@ -137,13 +144,13 @@ configs = {
     "input_names": ["x", "rots", "trans", "intrins", "distorts", "post_rots", "post_trans", "theta_mats"],
 
     # 模型相关
-    "img_outchannels": 256,
+    "img_outchannels": 32,
     # 2d
     "det_2d_num": 10,
     "map_2d_num": 3,
     # det3D
     "det_3d_head": {
-        "num_anchor": 900,
+        "num_anchor": 20,
         "embed_dims": 256,
         "num_decoder": 6,
         "num_single_frame_decoder": 5,
@@ -173,39 +180,73 @@ configs = {
         "embed_dim": 256
     },
     "map_3d_head": {
+
         "bev_feat_dim": 256,
         "embed_dims": 256,
-        "num_vec": 100,
+        "num_vec":  50,
         "num_pts_per_vec": 20,
-        "num_pts_per_gt_vec": 20,
-        "num_classes": 3,
-        "num_decoder_layers": 6,
-        "num_heads": 8,
+        "num_pts_per_gt_vec":  20,
+        "num_classes":  3,
+        "num_decoder_layers":  2,
+        "num_heads": 4,
         "dropout": 0.1,
-        "feedforward_dims": 1024,
-        "pc_range": None,
-        "bev_bounds": None,
-        "with_box_refine": True,
-        "use_instance_pts": True,
+        "feedforward_dims":  512,
+        "grid_conf":None,
+        "bev_bounds":None,
+
+        "with_box_refine":True,
+        "use_instance_pts" : True,
         "dir_interval": 1,
-        "cls_weight": 1.0,
+        "cls_weight":1.0,
         "reg_weight": 1.0,
-        "pts_weight": 1.0,
+        "pts_weight":1.0,
         "loss_pts_src_weight": 1.0,
         "loss_pts_dst_weight": 1.0,
         "loss_dir_weight": 0.005,
         "aux_loss_weight": 0.5,
-        "row_num_embed": 80,
-        "col_num_embed": 40,
-        "use_maptr_decoder": False,
-        "maptr_decoder_num_layers": 2,
-        "maptr_num_heads": 4,
+
+        "use_maptr_decoder": True,
+
+
         "maptr_im2col_step": 192,
-        "maptr_feedforward_channels": 512,
-        "maptr_num_levels": 1,
-        "maptr_num_points": 4,
-        "post_center_range": None,
-        "bbox_coder_max_num": 50,
+        "maptr_num_levels":1,
+        "maptr_num_points":4,
+        "bbox_coder_max_num" :50,
+
+
+        # "bev_feat_dim": 256,
+        # "embed_dims": 256,
+        # "num_vec": 100,
+        # "num_pts_per_vec": 20,
+        # "num_pts_per_gt_vec": 20,
+        # "num_classes": 3,
+        # "num_decoder_layers": 6,
+        # "num_heads": 8,
+        # "dropout": 0.1,
+        # "feedforward_dims": 1024,
+        # "pc_range": None,
+        # "bev_bounds": None,
+        # "with_box_refine": True,
+        # "use_instance_pts": True,
+        # "dir_interval": 1,
+        # "cls_weight": 1.0,
+        # "reg_weight": 1.0,
+        # "pts_weight": 1.0,
+        # "loss_pts_src_weight": 1.0,
+        # "loss_pts_dst_weight": 1.0,
+        # "loss_dir_weight": 0.005,
+        # "aux_loss_weight": 0.5,
+        # "row_num_embed": 80,
+        # "col_num_embed": 40,
+        # "use_maptr_decoder": False,
+        # "maptr_decoder_num_layers": 2,
+        # "maptr_num_heads": 4,
+        # "maptr_im2col_step": 192,
+        # "maptr_feedforward_channels": 512,
+        # "maptr_num_levels": 1,
+        # "maptr_num_points": 4,
+        # "post_center_range": None,
+        # "bbox_coder_max_num": 50,
     }
 
 }

@@ -121,9 +121,9 @@ if __name__ == '__main__':
     input = build_dummy_inputs(2,configs["batch_size"],configs["seq_len"],configs["num_cams"])
     x, rots, trans, intrins, distorts, post_rot, pos_tran, theta_mats, T_ego_his2curs = input
 
-    num_anchor = 900
-    num_det_classes = 10
-    num_map_classes = 3
+    num_anchor = configs["det_3d_head"]["num_anchor"]
+    num_det_classes = configs["det_3d_head"]["num_classes"]
+    num_map_classes = configs["map_3d_head"]["num_classes"]
     metas = build_dummy_metas(
         batch_size=configs["batch_size"],
         num_temporal_frames=configs["seq_len"],

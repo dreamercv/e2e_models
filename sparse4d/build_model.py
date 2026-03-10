@@ -70,6 +70,7 @@ def build_det3D_head(
         output_fc=not decouple_attn,
         in_loops=1,
         out_loops=4 if decouple_attn else 2,
+        out_dim = embed_dims,
     )
     gnn_dim = embed_dims * 2 if decouple_attn else embed_dims
     graph_model = MHAWrapper(gnn_dim, num_heads, dropout=dropout, batch_first=True)

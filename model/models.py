@@ -53,18 +53,21 @@ class Model(nn.Module):
         self.track_head = TrackHead(**config["track_head"])
 
         config["map_3d_head"]["bev_feat_dim"] = img_outchannels
-        self.map3d_head = build_map_head(bev_feat_dim=256,
-                                         embed_dims=256,
-                                         num_vec=50,
-                                         num_pts_per_vec=20,
-                                         num_pts_per_gt_vec=20,
-                                         num_classes=3,
-                                         grid_conf = self.grid_conf,
-                                         decoder_num_layers=2,
-                                         decoder_num_heads=4,
-                                         decoder_im2col_step=192,
-                                         decoder_feedforward_channels=512,
-                                         bbox_coder_max_num=50, )
+        config["map_3d_head"]["grid_conf"] = self.grid_conf 
+        # self.map3d_head = build_map_head(bev_feat_dim=config["map_3d_head"]["bev_feat_dim"],
+        #                                  embed_dims=config["map_3d_head"]["embed_dims"],
+        #                                  num_vec=config["map_3d_head"]["num_vec"],
+        #                                  num_pts_per_vec=config["map_3d_head"]["num_pts_per_vec"],
+        #                                  num_pts_per_gt_vec=config["map_3d_head"]["num_pts_per_gt_vec"],
+        #                                  num_classes=config["map_3d_head"]["num_pts_per_vec"],
+        #                                  grid_conf = self.grid_conf,
+        #                                  decoder_num_layers=2,
+        #                                  decoder_num_heads=4,
+        #                                  decoder_im2col_step=192,
+        #                                  decoder_feedforward_channels=512,
+        #                                  bbox_coder_max_num=50, )
+
+        self.map3d_head = build_map_head(**config["map_3d_head"] )
 
         self.config = config
 

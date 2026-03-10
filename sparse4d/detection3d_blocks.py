@@ -31,6 +31,7 @@ class SparseBox3DEncoder(nn.Module):
         output_fc=True,
         in_loops=1,
         out_loops=2,
+        out_dim=256,
     ):
         super().__init__()
         assert mode in ["add", "cat"]
@@ -49,6 +50,7 @@ class SparseBox3DEncoder(nn.Module):
         if vel_dims > 0:
             self.vel_fc = emb_layer(self.vel_dims, embed_dims[3])
         self.output_fc = emb_layer(embed_dims[-1], embed_dims[-1]) if output_fc else None
+        self.output_layer = emb_layer(sum(embed_dims), out_dim)
 
     def forward(self, box_3d: torch.Tensor):
         pos_feat = self.pos_fc(box_3d[..., [X, Y, Z]])
@@ -63,7 +65,7 @@ class SparseBox3DEncoder(nn.Module):
             out = out + vel_feat if self.mode == "add" else torch.cat([out, vel_feat], dim=-1)
         if self.output_fc is not None:
             out = self.output_fc(out)
-        return out
+        return self.output_layer(out)
 
 
 class Scale(nn.Module):

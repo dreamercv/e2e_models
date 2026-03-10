@@ -28,6 +28,8 @@ import torch.backends.cudnn as cudnn
 from config.config import configs
 from dataset.dataset import build_dataloader
 
+from model.models import Model
+
 cudnn.deterministic = True
 cudnn.benchmark = True
 torch.backends.cudnn.benchmark = True
@@ -46,6 +48,8 @@ def main():
         device=torch.device("cuda", args.local_rank)
         torch.distributed.init_process_group(backend="nccl", init_method='env://')
 
+    model = Model(configs).to(configs["device"])
+
     # # BN层多卡数据共享均值方差
     # num_gpus = torch.cuda.device_count()
     
@@ -61,14 +65,6 @@ def main():
 
     # 配置参数
     epochs = configs["epoch"]
-    #在训练过程中，
-    #训练的模式只能是：
-    #1、dynamic # 只训练动态数据，只标注了动态目标 只有一个dataloader
-    #2、static # 只训练静态数据，只标注了静态地图 只有一个dataloader
-    #3、e2e # 训练所有的数据，但是只监督端到端轨迹，动态和静态都有标注或者都没有标注都可以 只有一个dataloader
-    #4、dynamic+static # 训练动态和静态数据 有两个dataloader 在训练期间需要将两个dataloader进行拼接
-    #5、dynamic_static # 训练动静态都有标注的数据，同源数据 只有一个dataloader
-
     load_types = configs["load_types"]
     types_names = sorted(list(load_types.keys()))
     #

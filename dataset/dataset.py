@@ -323,12 +323,14 @@ class Dataset(torch.utils.data.Dataset):
                 rot = lidar2camera[:3,:3]
                 tran =  lidar2camera[:3,3][None]
                 # 获取图像信息
+            
                 image_name = os.path.basename(image_paths[cn])
                 image_path = os.path.join(
                     os.path.dirname(label_path).replace("label",cn),
                     image_name
                 )
-                # image_path = label_path.replace("label",cn).replace(".json",".jpg")
+                if not os.path.exists(image_path):
+                    image_path = label_path.replace("label",cn).replace(".json",".jpg")
                 #如果图像不存在的话，给置成全0黑图，参数就全部初始化一下----这里默认所有视角的图片都存在
                 # 数据增强的参数
                 resize_lims,bot_pct_lims,rot_lim,flip = self.cnis[cn]["resize_lim"],self.cnis[cn]["bot_pct_lim"],self.config["rot_lim"],self.config["flip"]
