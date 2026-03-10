@@ -268,14 +268,14 @@ class Sparse4DHead(nn.Module):
         else:
             out = {"classification": classification, "prediction": prediction, "quality": quality}
 
-        final_feature = instance_feature.reshape(-1, 7, *instance_feature.shape[1:])
-        final_anchor = anchor.reshape(-1, 7, *anchor.shape[1:])
+        # final_feature = instance_feature.reshape(-1, 7, *instance_feature.shape[1:])
+        # final_anchor = anchor.reshape(-1, 7, *anchor.shape[1:])
 
         if not self.training and self.decoder is not None and hasattr(self.decoder, "score_threshold"):
             out["instance_id"] = self.instance_bank.get_instance_id(
                 cls, anchor, self.decoder.score_threshold
             )
-        return out,final_feature,final_anchor
+        return out,instance_feature,anchor
 
     def _reduce_mean(self, x: torch.Tensor) -> torch.Tensor:
         return x.sum() / max(x.numel(), 1)

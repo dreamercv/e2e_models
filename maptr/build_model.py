@@ -36,10 +36,12 @@ def build_map_head(
     xmin, xmax = grid_conf["xbound"][0], grid_conf["xbound"][1]
     ymin, ymax = grid_conf["ybound"][0], grid_conf["ybound"][1]
     bbox_coder_post_center_range = [xmin, ymin, xmin, ymin, xmax, ymax, xmax, ymax]
-    bev_h, bev_w = (grid_conf["xbound"][1] - grid_conf["xbound"][0] / grid_conf["xbound"][2],
-                    grid_conf["ybound"][1] - grid_conf["ybound"][0] / grid_conf["ybound"][2])
-    """按 maptr_nano_r18_110e.py 中 pts_bbox_head 的 decoder/bbox_coder/positional_encoding 配置构建 MapHead（use_maptr_decoder=True）。"""
-    return MapHead(
+    bev_h  = int((grid_conf["xbound"][1] - grid_conf["xbound"][0]) // grid_conf["xbound"][2])
+    bev_w  = int((grid_conf["ybound"][1] - grid_conf["ybound"][0]) // grid_conf["ybound"][2])
+    """
+    按 maptr_nano_r18_110e.py 中 pts_bbox_head 的 decoder/bbox_coder/positional_encoding 配置构建 MapHead（use_maptr_decoder=True）。
+    """
+    head =  MapHead(
         bev_feat_dim=bev_feat_dim,
         embed_dims=embed_dims,
         num_vec=num_vec,
@@ -65,6 +67,10 @@ def build_map_head(
         bbox_coder_max_num=bbox_coder_max_num,
         **kwargs,
     )
+
+    return head
+
+    
 
 
 if __name__ == '__main__':

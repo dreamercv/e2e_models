@@ -44,7 +44,7 @@ configs = {
 
     "mode": "static",  # 默认加载动态数据
     "is_train": True,
-    "batch_size": 3,
+    "batch_size": 1,
     "num_workers": 1,
 
     "train_clips": 2,  # -1 所有，[]指定几个，xxx.txt写进txt中指定的，>0前N个
@@ -89,7 +89,7 @@ configs = {
         "e2e_static_traj": [0, 20],  # 起始帧和结束帧    #输入N帧，预测最后一帧的轨迹
     },
     "task_index_random": False,  # 是否使用随机的index，即在历史20帧内随机选择seq_len帧
-    "seq_len": 5,
+    "seq_len": 2,
 
     # 预测任务的参数
     "his_lens": {  # 历史长度 ,对于预测任务来说，需要输入历史真值才能预测未来真值，所以上述task_indexs需要减去历史长度
@@ -104,7 +104,7 @@ configs = {
         "obj_dynamic_traj": 10,  # 真值插值成10Hz,即5秒内真值为50个点
         "e2e_dynamic_traj": 10,  # 真值插值成10Hz,即5秒内真值为50个点
     },
-
+    "num_cams":1, # 环视相机个数
     "camera_names": [
         "FrontCam02",  # 前
         "RearCam01",  # 后方
@@ -160,7 +160,7 @@ configs = {
         "max_dn_gt": 32,
         "add_neg_dn": True,
         "reg_weights": None,
-        "use_decoder": False,
+        "use_decoder": True,
         "decoder_num_output": 300,
         "decoder_score_threshold": None,
     },

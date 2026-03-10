@@ -6,8 +6,8 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from .detection3d_blocks import SparseBox3DKeyPointsGenerator
-from .box3d import X, Y, Z, W, L, H, SIN_YAW, COS_YAW
+from sparse4d.detection3d_blocks import SparseBox3DKeyPointsGenerator
+from sparse4d.box3d import X, Y, Z, W, L, H, SIN_YAW, COS_YAW
 
 __all__ = ["BEVFeatureAggregation"]
 
@@ -97,3 +97,4 @@ class BEVFeatureAggregation(nn.Module):
         elif self.residual_mode == "cat":
             output = torch.cat([output, instance_feature], dim=-1)
         return output
+        

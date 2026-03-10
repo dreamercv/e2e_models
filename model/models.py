@@ -42,7 +42,8 @@ class Model(nn.Module):
         self.bev_backbone = BEVBackbone(channels=img_outchannels,
                                         grid_conf=self.grid_conf,
                                         input_size=self.input_size,
-                                        num_temporal=self.seq_len)
+                                        num_temporal=self.seq_len,
+                                        num_cams = config["num_cams"] )
 
         config["det_3d_head"]["embed_dims"] = img_outchannels
         config["det_3d_head"]["bev_bounds"] = (self.grid_conf["xbound"], self.grid_conf["ybound"])
@@ -58,6 +59,7 @@ class Model(nn.Module):
                                          num_pts_per_vec=20,
                                          num_pts_per_gt_vec=20,
                                          num_classes=3,
+                                         grid_conf = self.grid_conf,
                                          decoder_num_layers=2,
                                          decoder_num_heads=4,
                                          decoder_im2col_step=192,
@@ -78,25 +80,83 @@ class Model(nn.Module):
     def forward_bev_backbone(self,x, rots, trans, intrins, distorts, post_rot, pos_tran, theta_mats):
         bev_feat = self.bev_backbone(x, rots, trans, intrins, distorts, post_rot, pos_tran, theta_mats)
         return bev_feat
+    
+    def forward_dynamic_branch(self,bev_feat,T_ego_his2curs,metas,decoder=True,comp_loss = True):
+        out,seq_features,seq_anchors = self.det3d_head(bev_feat,metas)
+        if comp_loss:
+            det_loss = self.det3d_head.loss(out,metas)
+        else:
+            det_loss = None
 
-    def forward(self, x, rots, trans, intrins, distorts, post_rot, pos_tran, theta_mats, T_ego_his2curs=None):
+        if decoder:
+            result = self.det3d_head.decoder.decode(
+                out["classification"],
+                out["prediction"],
+                quality=out.get("quality"),
+                instance_id=out.get("instance_id"),
+            )
+        else:
+            result = None
+
+
+        return out,det_loss,result
+
+
+    def forward_static_branch(self,bev_feat,metas):
+        Bt, C, H, W = bev_feat.shape
+        T = self.seq_len
+        B = Bt // T
+        bev_for_map = bev_feat.view(B, T, C, H, W)[:, -1] # 只预测最后一帧的地图
+        map_pred = self.map3d_head(bev_for_map, metas)
+        map_out = {
+            "map_cls_scores": map_pred["map_cls_scores"],
+            "map_bbox_preds": map_pred["map_bbox_preds"],
+            "map_pts_preds": map_pred["map_pts_preds"],
+        }
+        gt_map_bboxes = metas.get("gt_map_bboxes")
+        gt_map_labels = metas.get("gt_map_labels")
+        gt_map_pts = metas.get("gt_map_pts")
+        if gt_map_bboxes is not None and gt_map_labels is not None and gt_map_pts is not None:
+            map_losses = self.map3d_head.loss(map_pred, gt_map_bboxes, gt_map_labels, gt_map_pts)
+            map_out["loss_map"] = map_losses
+        map_out["map_polylines"] = self.map3d_head.decode(map_pred, score_threshold=0.5)
+        return map_out
+
+
+    def forward(self, x, rots, trans, intrins, distorts, post_rot, pos_tran, theta_mats, T_ego_his2curs=None,metas=None):
         b, m, t, n, c, h, w = x.shape
-        x = rearrange(x, 'b,m,t,n,c,h,w -> (b,m,t,n),c,h,w')
-        rots = rearrange(rots, 'b,m,t,n,h,w -> (b,m),t,n,h,w')
-        trans = rearrange(trans, 'b,m,t,n,h,w -> (b,m),t,n,h,w')
-        intrins = rearrange(intrins, 'b,m,t,n,h,w -> (b,m),t,n,h,w')
-        distorts = rearrange(distorts, 'b,m,t,n,h,w -> (b,m),t,n,h,w')
-        post_rot = rearrange(post_rot, 'b,m,t,n,h,w -> (b,m),t,n,h,w')
-        pos_tran = rearrange(pos_tran, 'b,m,t,n,h,w -> (b,m),t,n,h,w')
-        theta_mats = rearrange(theta_mats, 'b,m,t,h,w -> b,m,t,h,w')
-        T_ego_his2curs = torch.eye(4).view(1, 1, 1, 4, 4).expand(b, m, t, 4, 4)
+        x = rearrange(x, 'b m t n c h w -> (b m t n) c h w')
+        rots = rearrange(rots, 'b m t n h w -> (b m) t n h w')
+        trans = rearrange(trans, 'b m t n h w -> (b m) t n h w')
+        intrins = rearrange(intrins, 'b m t n h w -> (b m) t n h w')
+        distorts = rearrange(distorts, 'b m t n h w -> (b m) t n h w')
+        post_rot = rearrange(post_rot, 'b m t n h w -> (b m) t n h w')
+        pos_tran = rearrange(pos_tran, 'b m t n h w -> (b m) t n h w')
+        theta_mats = rearrange(theta_mats, 'b m t h w -> (b m) t h w')
+        T_ego_his2curs = torch.eye(4).view(1, 1, 4, 4).expand(b,  t, 4, 4)
 
         x = self.forward_img_backbone(x)
 
-        det2d_out = self.det_head(x)
+        det2d_out = self.forward_det2d(x)
         map2d_out = self.forward_map2d(x)
 
         bev_feat = self.forward_bev_backbone(x, rots, trans, intrins, distorts, post_rot, pos_tran, theta_mats)
+        print(bev_feat)
+
+        bev_feat = bev_feat.reshape(b, m, t,*bev_feat.shape[1:])
+        dynamic_bev_feture = bev_feat[:,0].flatten(0,1)
+        static_bev_feture = bev_feat[:,1].flatten(0,1)
+
+
+
+        print(bev_feat)
+
+        det_out,det_loss,det_result = self.forward_dynamic_branch(dynamic_bev_feture,T_ego_his2curs, metas)
+        print(det_out)
+
+        map_out = self.forward_static_branch(static_bev_feture, metas)
+
+
 
 
 

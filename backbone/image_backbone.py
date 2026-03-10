@@ -118,8 +118,6 @@ class ImageBackBone(nn.Module):
         )
 
     def forward(self,x):
-        B, S, N, C, H, W = x.shape
-        x = x.view(B * S * N, C, H, W)
         backbone = self.backbone(x)
         return  backbone
 

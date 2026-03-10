@@ -71,10 +71,14 @@ class Splat(nn.Module):
         depths = points[..., 2:]
         points = torch.cat((points[..., :2] / depths, torch.ones_like(depths)), -1)
 
-        points1 = points[:, 0:1]
-        intrins1 = intrins[:, 0:1].view(B, 1, 1, 3, 3)
-        distorts1 = distorts[:, 0:1].view(B, 1, 1, 8)
-        points[:, 0:1] = self.projectPoints_fisheye(points1, distorts1, intrins1)
+        intrins = intrins.view(B, N, 1, 3, 3)
+        distorts = distorts.view(B, N, 1, 8)
+        points = self.projectPoints_fisheye(points, distorts, intrins)
+
+        # points1 = points[:, 0:1]
+        # intrins1 = intrins[:, 0:1].view(B, 1, 1, 3, 3)
+        # distorts1 = distorts[:, 0:1].view(B, 1, 1, 8)
+        # points[:, 0:1] = self.projectPoints_fisheye(points1, distorts1, intrins1)
 
         points = post_rots.view(B, N, 1, 3, 3).matmul(points.unsqueeze(-1)).squeeze(-1)
         points = points + post_trans.view(B, N, 1, 3)
@@ -145,26 +149,38 @@ class Splat(nn.Module):
 
 
 class BEVBackbone(nn.Module):
-    def __init__(self, channels=256,grid_conf=None, input_size=(128, 384),num_temporal=7):
+    def __init__(self, channels=256,grid_conf=None, input_size=(128, 384),num_temporal=7,num_cams = 6):
         super(BEVBackbone, self).__init__()
         self.num_temporal = num_temporal
         self.grid_conf = grid_conf
         self.input_size = input_size
         self.splat = Splat(grid_conf, input_size)
+        self.points = self.splat.create_voxels()
+        self.height = self.points.shape[0]
+        self.num_cams = num_cams
         # self.bev_backbone = nn.Sequential(
         #     nn.Conv2d(3, 128, kernel_size=3, stride=1, padding=1),
         #     nn.MaxPool2d(2, 2),
         #     nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
         #     nn.MaxPool2d(2, 2)
         # )
-        self.layer = nn.Sequential(
-            nn.Conv2d(channels * 6, channels*3, kernel_size=3, stride=1, padding=1),
+        self.fusion_height = nn.Sequential(
+            nn.Conv2d(channels * self.height, channels*3, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(channels*3),
             nn.ReLU(inplace=True),
             nn.Conv2d(channels*3, channels, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(channels),
             nn.ReLU(inplace=True)
         )
+        self.multiview_fusion = nn.Sequential(
+            nn.Conv2d(channels * self.num_cams, channels*3, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(channels*3),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels*3, channels, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True)
+        )
+
         self.algin_fusion = nn.Sequential(
             nn.Conv2d(channels * 2, channels, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(channels),
@@ -190,28 +206,30 @@ class BEVBackbone(nn.Module):
         post_tran3 = post_tran3.flatten(0, 1)
         # x = x.view(B * S * N, C, H, W)
         # x = self.bev_backbone(x)
-        points = self.splat.create_voxels()
+        points = self.points.to(x.device)
         grid = self.splat.bev2eachroi(points, rots.to(points.dtype), trans.to(points.dtype), intrins.to(points.dtype),
                                       distorts.to(points.dtype), post_rot3.to(points.dtype),
                                       post_tran3.to(points.dtype)).to(x.dtype)
-        B, X, Y, _ = grid.shape
-        B = int(B / 6)
-        indexs = [[6 * i + j for i in range(B)] for j in range(6)]
+        B, X, Y, _ = grid.shape #B = bs=3 * mode=2 * seq_len=5 *3（相机数） * 6(高度)
+        B = int(B / self.height)
+        indexs = [[self.height * i + j for i in range(B)] for j in range(self.height)]
         outs = [F.grid_sample(input=x, grid=grid[index, ...], mode="nearest", padding_mode="zeros") for index in indexs]
         # index_0 = [6 * i + 0 for i in range(B)]
         # index_1 = [6 * i + 1 for i in range(B)]
         # index_2 = [6 * i + 2 for i in range(B)]
-        # index_3 = [6 * i + 3 for i in range(B)]
+        # index_3 = [6 * i + 3 for i in range(B)]       theta_mats = 6 * 5 * 2 * 3
         # index_4 = [6 * i + 4 for i in range(B)]
-        # index_5 = [6 * i + 5 for i in range(B)]
+        # index_5 = [6 * i + 5 for i in range(B)]     b m t n c h w -> (b m t n) c h w # 3 2 5 3
         # output_0 = F.grid_sample(input=x, grid=grid[index_0, ...], mode="nearest", padding_mode="zeros")
         # output_1 = F.grid_sample(input=x, grid=grid[index_1, ...], mode="nearest", padding_mode="zeros")
         # output_2 = F.grid_sample(input=x, grid=grid[index_2, ...], mode="nearest", padding_mode="zeros")
         # output_3 = F.grid_sample(input=x, grid=grid[index_3, ...], mode="nearest", padding_mode="zeros")
         # output_4 = F.grid_sample(input=x, grid=grid[index_4, ...], mode="nearest", padding_mode="zeros")
         # output_5 = F.grid_sample(input=x, grid=grid[index_5, ...], mode="nearest", padding_mode="zeros")
-        out_put = torch.cat(outs,dim=1)  # torch.Size([25, 384, 150, 100])
-        out_put = self.layer(out_put)
+        out_put = torch.cat(outs,dim=1)  # torch.Size([25, 384, 150, 100]) # 90 256 200 80 # 90 = 3 * 2 * 5 * 3(三个相机)
+        out_put = self.fusion_height(out_put)
+        out_put = out_put.reshape(-1,self.num_cams*out_put.shape[1],*out_put.shape[-2:])
+        out_put = self.multiview_fusion(out_put)
         out_put = out_put.view(-1, S, *out_put.shape[-3:])
         algin_features = []
         for i in range(S):
@@ -290,8 +308,3 @@ def gen_theta_mat(ego_poses):
         theta_mat = (pre_mat @ (rel_pose @ post_mat))[:2, :][None]
         theta_mats.append(theta_mat)
     return np.concatenate(theta_mats, 0)
-
-
-
-
-

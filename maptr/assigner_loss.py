@@ -281,4 +281,3 @@ def direction_cosine_loss(
         w = weight[:, dir_interval:].reshape(loss.shape[0], -1)
         loss = loss * w
     return loss.sum() / max(avg_factor, 1e-6)
-

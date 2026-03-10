@@ -6,18 +6,33 @@
 @E-mail       :afb5szh@bosch.com
 @Version      :V1.0.0
 @Description  :
-    数据处理逻辑：
-    一次forward需要91帧的数据：当前帧是第40帧，即历史是0-39，未来是41-90 # 历史40帧，未来50帧，再加当前帧
-    任务包含：
-    第一阶段2D图像表针学习 
-    第二阶段BEV重建学习
-    第三阶段BEV表征学习
-        检测：             输入                36 37 38 39 40 
-        地图:              输入                36 37 38 39 40
-    第四阶段轨迹交互
-        目标车轨迹：        输入     10 20 30               40   预测 50 60 70 80 90  --从动态拿instance
-        端到端静态：        输入     10 20 30               40   预测 50 60 70 80 90  --从静态拿instance
-        端到端动态：        输入     10 20 30               40   预测 50 60 70 80 90
+            整体思路----数据不同源版本，并且分段训练：
+                1、时序图像作为输入（2*bs*5*8*3*128*384）,其中5表示时序五帧，8表示环视相机一共有8个，2表示两种数据:只标注目标相关的动态数据和只标注了车道线相关的金泰数据,3*128*384是输入图像的尺寸
+                2、输入图像经过自定义的纯2d卷积网络，下采样四倍，输出的通道数是256，卷积网络输出的大小为2*bs*5*8*256*32*96,我称这个模型是image_backbone模块
+                3、image_backbone的输出经过内外参的转换将其投影到3d的bev空间，具体方法为：在自车坐标系初始化一个200米*80米*6米(xyz)的3d空间,然后通过内外参将其转到像素坐标coor，然后根据coor的索引将image_backbone的像素特征对齐到3d空间,多视角就可以融合成一个bev空间。这个模块称之为bev_backbone,输出的大小是2*bs*5*256*200*80
+                4、时序融合模块algin_module:bev_backbone的输出是5帧，通过自车的相对位姿将特征图对齐warp/插值方式，对齐方式如下：
+                    第一帧：第一帧F1,输出维度是bs*256*200*80
+                    第二帧：第一帧对齐到第二帧，conv(cat(algin(F1),F2)) = algin_F2,输出维度是bs*256*200*80
+                    第三帧：将对齐后的第二帧对齐在第三帧，conv(cat(algin(algin_F2),F3)) = algin_F3,输出维度是bs*256*200*80
+                    第四帧：将对齐后的第三帧对齐到第四帧，conv(cat(algin(algin_F3),F4)) = algin_F4,输出维度是bs*256*200*80
+                    第五帧：将对齐后的第四帧对齐到第五帧，conv(cat(algin(algin_F4),F5)) = algin_F5,输出维度是bs*256*200*80
+                    algin_F1_5 = cat(F1,algin_F2,algin_F3,algin_F4,algin_F5)
+                    这样就的得到了时序对齐的特征algin_F1_5 ,输出维度是2*bs*5*256*200*80，与上一帧对齐，最久可以对齐历史五帧（记忆历史五帧的信息）
+                5、split_module:该模块将两种数据分开，分别为dynamic_input=bs*5*256*200*80，static_input=bs*5*256*200*80
+
+                世界模型分支
+                    6、在algin_module模块的输出后接入decoder，输入上一帧，输出当前帧的bev然后和当前帧的bev计算相似度从而达到重建bev的效果。
+
+                动态分支：
+                    7、det_head目标检测输出头:algin_module的输出dynamic_input后接入sparse4d的输出头，将在bev上获取检测的instance（bs，5*900*256）和anchor(bs*5*900*11),900指的是最大目标数量900，256是instance的特征维度，11是anchor的预测值包括：x,y,z,w,h,l,vx,vy,vz,yaw,id
+                    8、动态目标轨迹预测头(obj_traj_head)：（融合历史五帧信息出当前一帧的轨迹）将algin_module输出的第五帧帧和检测第五帧的instance，以及历史历史5帧的轨迹（bs*900*10）作为动态目标迹预测头的输入，最后预测出当前帧(第五帧)周围目标5秒的轨迹（bs*900*100）和对应的insance（bs*900*256），其中100是50*2，2是xy两个分量，50是未来50帧
+
+                静态分支
+                    9、map_head地图检测头:algin_module输出对齐后的bev特征static_input后接入maptr的输出头，将在bev上获取map的instance（bs*5*200*256）和anchor(bs*5*200*3),200指的是最大地图instance为200个，3是(x,y和类别)
+                    10、自车未来行驶的拓扑轨迹头-ego_static_head:将maphead的instance和algin_module的最后一帧特征拿出来，输入到ego_static_head中，输出以自车为起点到bev边缘的行驶轨迹(bs*1*20*2)以及对应的instance(bs*1*256),20*2是从自车为起点，等步长走到bev的边缘
+                
+                端到端分支 ： 上面分支训练收敛后才能启动该阶段的训练
+                    11、端到端轨迹头e2ehead:将algin_module的bevfeature(bs*256*200*80)、det的instance(bs*900*256)和动态目标轨迹的instance(bs*900*256)、map的instance(bs*200*256)以及自车未来拓扑轨迹的instance(bs*1*256)的最后一帧取出来作，输入到轨迹头中，即希望输出的端到端轨迹中有5帧的信息融合，输出形状是bs*100。其中bevfeature是bev的场景描述，det的instance和动态目标轨迹的instance是动态场景的理解，map的instance和自车拓扑轨迹是静态场景理解。经过上述的所有场景的融合形成了最终的端到端轨迹
 
 
 

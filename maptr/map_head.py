@@ -367,7 +367,7 @@ class MapHead(nn.Module):
             all_cls.append(cls_final)
             all_bbox.append(bbox_final)
             all_pts.append(pts_final)
-        else:
+        else:# 纯decoder (self-attention)
             output = query
             inter_refs = []
             all_cls = []

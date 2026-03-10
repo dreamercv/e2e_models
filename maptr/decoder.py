@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 from typing import Optional, Tuple, List, Dict, Any
 
-from .deformable_attn import CustomMSDeformableAttention
+from maptr.deformable_attn import CustomMSDeformableAttention
 
 __all__ = [
     "inverse_sigmoid",
