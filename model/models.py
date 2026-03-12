@@ -106,19 +106,39 @@ class Model(nn.Module):
 
 
     def forward_static_branch(self,bev_feat,metas):
+        # bev_feat: (B * T, C, H, W)，静态分支希望对整个时间序列 T 帧都计算地图 loss
         Bt, C, H, W = bev_feat.shape
         T = self.seq_len
         B = Bt // T
-        bev_for_map = bev_feat.view(B, T, C, H, W)[:, -1] # 只预测最后一帧的地图
-        map_pred = self.map3d_head(bev_for_map, metas)
+        # 直接把每一帧当作一个样本送入 MapHead，batch 视作 B*T
+        map_pred = self.map3d_head(bev_feat, metas)
         map_out = {
             "map_cls_scores": map_pred["map_cls_scores"],
             "map_bbox_preds": map_pred["map_bbox_preds"],
             "map_pts_preds": map_pred["map_pts_preds"],
         }
-        gt_map_bboxes = metas.get("gt_map_bboxes")
-        gt_map_labels = metas.get("gt_map_labels")
-        gt_map_pts = metas.get("gt_map_pts")
+        # 与 dataset 输出命名保持一致：gt_labels_map3D / gt_bboxes_map3D / gt_pts_map3D
+        # data 层对单个样本输出的是长度为 T 的 list，collate 后 metas 中是形如：
+        #   gt_labels_map3D: [ [t0_labels, t1_labels, ...],  [...], ... ]  (长度 B，每个元素长度 T)
+        # 这里需要展平成长度 B*T 的一维 list，与 bev_feat 的 batch 维对齐。
+        raw_bboxes = metas.get("gt_bboxes_map3D")
+        raw_labels = metas.get("gt_labels_map3D")
+        raw_pts = metas.get("gt_pts_map3D")
+
+        def _flatten_seq_list(x):
+            if not isinstance(x, list) or len(x) == 0:
+                return x
+            if isinstance(x[0], list):
+                out = []
+                for seq in x:
+                    out.extend(seq)
+                return out
+            return x
+
+        gt_map_bboxes = _flatten_seq_list(raw_bboxes)
+        gt_map_labels = _flatten_seq_list(raw_labels)
+        gt_map_pts = _flatten_seq_list(raw_pts)
+
         if gt_map_bboxes is not None and gt_map_labels is not None and gt_map_pts is not None:
             map_losses = self.map3d_head.loss(map_pred, gt_map_bboxes, gt_map_labels, gt_map_pts)
             map_out["loss_map"] = map_losses
@@ -126,7 +146,7 @@ class Model(nn.Module):
         return map_out
 
 
-    def forward(self, x, rots, trans, intrins, distorts, post_rot, pos_tran, theta_mats, T_ego_his2curs=None,metas=None):
+    def forward(self, x, rots, trans, intrins, distorts, post_rot, pos_tran, theta_mats, T_ego_his2curs=None, metas=None):
         b, m, t, n, c, h, w = x.shape
         x = rearrange(x, 'b m t n c h w -> (b m t n) c h w')
         rots = rearrange(rots, 'b m t n h w -> (b m) t n h w')
@@ -136,7 +156,8 @@ class Model(nn.Module):
         post_rot = rearrange(post_rot, 'b m t n h w -> (b m) t n h w')
         pos_tran = rearrange(pos_tran, 'b m t n h w -> (b m) t n h w')
         theta_mats = rearrange(theta_mats, 'b m t h w -> (b m) t h w')
-        T_ego_his2curs = torch.eye(4).view(1, 1, 4, 4).expand(b,  t, 4, 4)
+        if T_ego_his2curs is None:
+            T_ego_his2curs = torch.eye(4, device=x.device).view(1, 1, 4, 4).expand(b, t, 4, 4)
 
         x = self.forward_img_backbone(x)
 
@@ -144,29 +165,35 @@ class Model(nn.Module):
         map2d_out = self.forward_map2d(x)
 
         bev_feat = self.forward_bev_backbone(x, rots, trans, intrins, distorts, post_rot, pos_tran, theta_mats)
-        print(bev_feat)
 
         bev_feat = bev_feat.reshape(b, m, t,*bev_feat.shape[1:])
         dynamic_bev_feture = bev_feat[:,0].flatten(0,1)
         static_bev_feture = bev_feat[:,1].flatten(0,1)
 
-
-
-        print(bev_feat)
-
-        det_out,det_loss,det_result = self.forward_dynamic_branch(dynamic_bev_feture,T_ego_his2curs, metas)
-        print(det_out)
-
+        det_out, det_loss, det_result = self.forward_dynamic_branch(dynamic_bev_feture, T_ego_his2curs, metas)
         map_out = self.forward_static_branch(static_bev_feture, metas)
 
+        losses = {}
+        if isinstance(det_loss, dict):
+            for k, v in det_loss.items():
+                losses[f"det3d_{k}"] = v
+        map_loss = map_out.get("loss_map", None)
+        if isinstance(map_loss, dict):
+            for k, v in map_loss.items():
+                losses[f"map3d_{k}"] = v
 
+        total_loss = None
+        if len(losses) > 0:
+            total_loss = sum(v for v in losses.values() if torch.is_tensor(v))
 
-
-
-
-
-
-
-
+        return {
+            "total_loss": total_loss,
+            "losses": losses,
+            "det2d_out": det2d_out,
+            "map2d_out": map2d_out,
+            "det3d_out": det_out,
+            "det3d_result": det_result,
+            "map3d_out": map_out,
+        }
 if __name__ == '__main__':
     pass

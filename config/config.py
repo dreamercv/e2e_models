@@ -2,7 +2,7 @@ import os
 
 configs = {
 
-    "device":"cuda",# cuda cpu
+    "device":"cpu",# cuda cpu
 
 
     "is_train": True,

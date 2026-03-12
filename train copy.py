@@ -15,6 +15,14 @@ import argparse
 
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.utils.data as data
+import torch.utils.data.distributed as dist
+import torch.nn.functional as F
+import torch.nn.init as init
+import torch.nn.utils.rnn as rnn_utils
+import torch.nn.utils.spectral_norm as spectral_norm
 import torch.backends.cudnn as cudnn
 
 from config.config import configs
@@ -59,11 +67,7 @@ def main():
     epochs = configs["epoch"]
     load_types = configs["load_types"]
     types_names = sorted(list(load_types.keys()))
-    # 优化器（可按需改成 AdamW 等）
-    lr = configs.get("lr", 1e-4)
-    weight_decay = configs.get("weight_decay", 1e-4)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-
+    #
     active = []
     for i,type_name in enumerate(types_names):
         if load_types[type_name]:
@@ -74,7 +78,6 @@ def main():
     print(f"steps_per_epoch: {steps_per_epoch}")
 
     for epoch in range(epochs):
-        model.train()
         for _, _, sp in active:
             if sp is not None and hasattr(sp, "set_epoch"):
                 sp.set_epoch(epoch)
@@ -89,7 +92,7 @@ def main():
                     iters[i] = iter(dl)
                     batch = next(iters[i])
                 batches.append((type_name, batch))
-            inputs_tensor = {} # bs, M, T, 8, 3, 128, 384
+            inputs_tensor = {} #bs, 2, 5, 8, 3, 128, 384
             gts_values = {}
             gt_names = configs["gt_names"]
             
@@ -103,52 +106,10 @@ def main():
                 names = gt_names[type_name]
                 gts_value = {}
                 for name in names:
-                    if name not in batch.keys():
-                        continue
+                    if name not in batch.keys():continue
                     gts_value[name] = batch[name]
                 gts_values[type_name] = gts_value
-            
-            # 将输入搬到 device
-            device = configs["device"]
-            for k, v in inputs_tensor.items():
-                if isinstance(v, torch.Tensor):
-                    inputs_tensor[k] = v.to(device)
-
-            # 组装 metas（把 dynamic / static 的真值合并）
-            metas = {}
-            for type_name, gts in gts_values.items():
-                for k, v in gts.items():
-                    # 将张量或张量列表搬到 device
-                    if isinstance(v, torch.Tensor):
-                        metas[k] = v.to(device)
-                    elif isinstance(v, list) and len(v) > 0 and isinstance(v[0], torch.Tensor):
-                        metas[k] = [t.to(device) for t in v]
-                    else:
-                        metas[k] = v
-
-            outputs = model(
-                inputs_tensor["x"],
-                inputs_tensor["rots"],
-                inputs_tensor["trans"],
-                inputs_tensor["intrins"],
-                inputs_tensor["distorts"],
-                inputs_tensor["post_rots"],
-                inputs_tensor["post_trans"],
-                inputs_tensor["theta_mats"],
-                metas=metas,
-            )
-
-            total_loss = outputs.get("total_loss", None)
-            if total_loss is None:
-                continue
-
-            optimizer.zero_grad()
-            total_loss.backward()
-            optimizer.step()
-
-            if batch_idx % configs.get("log_print_interval", 10) == 0:
-                print(f"Epoch [{epoch+1}/{epochs}] Step [{batch_idx+1}/{steps_per_epoch}] "
-                      f"loss: {float(total_loss.detach().cpu()):.4f}")
+            print()
             # "x",              3, 2, 5, 8, 3, 128, 384
             # "rots",           3, 2, 5, 8, 3, 3
             # "trans",          3, 2, 5, 8, 3       --> 1*3
@@ -162,5 +123,4 @@ def main():
 
 
 
-if __name__ == "__main__":
-    main()
+main()

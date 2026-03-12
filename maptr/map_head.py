@@ -437,9 +437,19 @@ class MapHead(nn.Module):
         num_layers = len(all_cls)
         device = all_cls[0].device
 
-        gt_bboxes_list = [g if g is not None else all_cls[0].new_zeros(0, 4) for g in gt_bboxes_list]
-        gt_labels_list = [g if g is not None else all_cls[0].new_zeros(0, dtype=torch.long) for g in gt_labels_list]
-        gt_pts_list = [g if g is not None else all_cls[0].new_zeros(0, 1, self.num_pts_per_gt_vec, 2) for g in gt_pts_list]
+        # 将 GT 移到与预测相同的 device，并填充缺失项
+        gt_bboxes_list = [
+            (g.to(device) if g is not None else all_cls[0].new_zeros(0, 4))
+            for g in gt_bboxes_list
+        ]
+        gt_labels_list = [
+            (g.to(device) if g is not None else all_cls[0].new_zeros(0, dtype=torch.long))
+            for g in gt_labels_list
+        ]
+        gt_pts_list = [
+            (g.to(device) if g is not None else all_cls[0].new_zeros(0, 1, self.num_pts_per_gt_vec, 2))
+            for g in gt_pts_list
+        ]
 
         for i, g in enumerate(gt_pts_list):
             if g.dim() == 3:

@@ -225,8 +225,8 @@ def img_transform(img,
     b = A.matmul(-b) + b
     post_rot = A.matmul(post_rot)
     post_tran = A.matmul(post_tran) + b
-    post_rot3 = torch.eye(2)
-    post_tran3 = torch.zeros(2)
+    post_rot3 = torch.eye(3)
+    post_tran3 = torch.zeros(3)
     post_tran3[:2] = post_tran
     post_rot3[:2, :2] = post_rot
     return img, post_rot3, post_tran3
@@ -321,7 +321,7 @@ class Dataset(torch.utils.data.Dataset):
                 distort = np.array(parameter["dist_coeffs"])#畸变
                 intrin = np.array(parameter["camera_matrix"]) #内参
                 rot = lidar2camera[:3,:3]
-                tran =  lidar2camera[:3,3][None]
+                tran =  lidar2camera[:3,3]
                 # 获取图像信息
             
                 image_name = os.path.basename(image_paths[cn])
@@ -351,11 +351,11 @@ class Dataset(torch.utils.data.Dataset):
                     
                     imgs_i.append(normalize_img(post_img))
                     post_rots_i.append(post_rot)
-                    post_trans_i.append(post_tran)
+                    post_trans_i.append(post_tran[None])
                     intrins_i.append(torch.Tensor(intrin))
                     distorts_i.append(torch.Tensor(distort)[None])
                     rots_i.append(torch.Tensor(rot))
-                    trans_i.append(torch.Tensor(tran))
+                    trans_i.append(torch.Tensor(tran)[None])
             intrins.append(torch.stack(intrins_i))
             imgs.append(torch.stack(imgs_i))
             distorts.append(torch.stack(distorts_i))
@@ -855,20 +855,21 @@ class Dataset(torch.utils.data.Dataset):
             mask[idx] = 0
             return 0.
     def diff(self,object_trajectorys,track_id,bboxes_mask,dt=0.1,idx=7):
-        traj =  object_trajectorys.get(track_id,None)
-        if traj  is None:
-            bboxes_mask[idx:idx+3] = [0,0,0]
-            return 0,0,0
-        traj_obj = traj["obj_trajectory_in_obj"]
-        masks = traj_obj[:,-1]
-        ci = masks.reshape(-1).tolist().index(0)
-        pi = masks[ci-1]
-        if pi != 1:
-            bboxes_mask[idx:idx+3] = [0,0,0]
-            return 0,0,0
-        traj_obj_sub =  traj_obj[ci-1:ci+1][:,:3]
-        diff = (traj_obj_sub[-1] - traj_obj_sub[0] ) / dt
-        return diff[0],diff[1],diff[2]
+        # traj =  object_trajectorys.get(track_id,None)
+        # if traj  is None:
+        #     bboxes_mask[idx:idx+3] = [0,0,0]
+        #     return 0,0,0
+        # traj_obj = traj["obj_trajectory_in_obj"]
+        # masks = traj_obj[:,-1]
+        # ci = masks.reshape(-1).tolist().index(0)
+        # pi = masks[ci-1]
+        # if pi != 1:
+        #     bboxes_mask[idx:idx+3] = [0,0,0]
+        #     return 0,0,0
+        # traj_obj_sub =  traj_obj[ci-1:ci+1][:,:3]
+        # diff = (traj_obj_sub[-1] - traj_obj_sub[0] ) / dt
+        # return diff[0],diff[1],diff[2]
+        return 0,0,0
 
     def dynamic_static_data(self,clip_name):
         """"

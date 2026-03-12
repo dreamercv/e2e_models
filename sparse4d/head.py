@@ -67,8 +67,9 @@ class Sparse4DHead(nn.Module):
         loss_cls=None,
         loss_reg=None,
         reg_weights: Optional[List[float]] = None,
-        gt_cls_key: str = "gt_labels_3d",
-        gt_reg_key: str = "gt_bboxes_3d",
+        # 与数据层命名保持一致
+        gt_cls_key: str = "gt_labels_det3D",
+        gt_reg_key: str = "gt_bboxes_det3D",
         cls_threshold_to_reg: float = -1,
     ):
         super().__init__()
@@ -109,6 +110,23 @@ class Sparse4DHead(nn.Module):
             else:
                 raise ValueError(f"Unknown op: {op}")
         self.layers = nn.ModuleList(layers)
+
+    @staticmethod
+    def _flatten_gt_list(gt_list):
+        """
+        将 data 层输出的形如 [ [t0帧GT, t1帧GT, ...],  [...], ... ] 的二级 list
+        展平为 Sparse4D 期望的一维 list（长度 = B*T）。
+        若本身已是一维 list，则直接返回。
+        """
+        if not isinstance(gt_list, list) or len(gt_list) == 0:
+            return gt_list
+        first = gt_list[0]
+        if isinstance(first, list):
+            flat = []
+            for seq in gt_list:
+                flat.extend(seq)
+            return flat
+        return gt_list
 
     def init_weights(self):
         for i, op in enumerate(self.operation_order):
@@ -168,12 +186,23 @@ class Sparse4DHead(nn.Module):
         dn_metas = None
         num_free_instance = instance_feature.shape[1]
         if self.training and self.sampler is not None and hasattr(self.sampler, "get_dn_anchors"):
-            gt_cls = metas.get("gt_labels_3d")
-            gt_reg = metas.get("gt_bboxes_3d")
+            gt_cls = metas.get(self.gt_cls_key)
+            gt_reg = metas.get(self.gt_reg_key)
+            gt_cls = self._flatten_gt_list(gt_cls)
+            gt_reg = self._flatten_gt_list(gt_reg)
             if gt_cls is not None and gt_reg is not None:
                 dn_metas = self.sampler.get_dn_anchors(gt_cls, gt_reg, None)
         if dn_metas is not None:
             (dn_anchor, dn_reg_target, dn_cls_target, dn_attn_mask, valid_mask, dn_id_target) = dn_metas
+            # 确保 DN 相关张量与 anchor / feature 在同一设备上（cuda / cpu 一致）
+            device = anchor.device
+            dn_anchor = dn_anchor.to(device)
+            dn_reg_target = dn_reg_target.to(device)
+            dn_cls_target = dn_cls_target.to(device)
+            dn_attn_mask = dn_attn_mask.to(device)
+            valid_mask = valid_mask.to(device)
+            if dn_id_target is not None:
+                dn_id_target = dn_id_target.to(device)
             num_dn_anchor = dn_anchor.shape[1]
             # DN 由 get_dn_anchors(gt_cls, gt_reg) 生成，gt 为 list 长度为 B，故 dn_anchor 为 (B, num_dn, 11)；
             # 而 feature_maps 为 (B*T, C, H, W)，batch_size=B*T。需将 DN 沿 batch 扩成 (B*T, ...) 再与 anchor 拼接。
@@ -322,6 +351,9 @@ class Sparse4DHead(nn.Module):
         output = {}
         gt_cls = data.get(self.gt_cls_key)
         gt_reg = data.get(self.gt_reg_key)
+        # data 层可能给的是 [batch][time] 的二级 list，这里先展平成长度 B*T 的一维 list
+        gt_cls = self._flatten_gt_list(gt_cls)
+        gt_reg = self._flatten_gt_list(gt_reg)
         # 预测为 (B*T, num_anchor, ...) 时，GT 通常为 list 长度 B，需按 T 扩展以与 sampler.sample 一致
         bs_pred = cls_scores[0].shape[0]
         if gt_cls is not None and gt_reg is not None and len(gt_cls) != bs_pred and bs_pred % len(gt_cls) == 0:
@@ -333,6 +365,11 @@ class Sparse4DHead(nn.Module):
             cls_target, reg_target, reg_weights = self.sampler.sample(
                 cls, reg, gt_cls, gt_reg
             )
+            # 确保 label / reg target 与预测在同一 device 上
+            device = cls.device
+            cls_target = cls_target.to(device)
+            reg_target = reg_target.to(device)
+            reg_weights = reg_weights.to(device)
             reg_target = reg_target[..., : len(self.reg_weights)]
             mask = torch.logical_not(torch.all(reg_target == 0, dim=-1))
             num_pos = max(self._reduce_mean(torch.sum(mask).to(dtype=reg.dtype)), 1.0)

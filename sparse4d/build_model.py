@@ -137,8 +137,9 @@ def build_det3D_head(
         loss_cls=loss_cls,
         loss_reg=loss_reg,
         reg_weights=reg_weights,
-        gt_cls_key="gt_labels_3d",
-        gt_reg_key="gt_bboxes_3d",
+        # 与 dataset 真值命名保持一致
+        gt_cls_key="gt_labels_det3D",
+        gt_reg_key="gt_bboxes_det3D",
         cls_threshold_to_reg=0.05,
     )
     head.init_weights()
