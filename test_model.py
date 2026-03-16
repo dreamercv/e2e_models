@@ -20,7 +20,7 @@ from sparse4d.dn_sampler import DenoisingSampler
 from sparse4d.losses import FocalLoss, SparseBox3DLoss
 from sparse4d.track_head import TrackHead, track_affinity_loss, decode_track
 
-from maptr import build_map_head_from_maptr_config
+from maptr import build_map_head
 
 
 def build_sparse4d_bev_head(
@@ -333,7 +333,7 @@ def build_full_model(
         xmax, ymax, xmax, ymax,
     ]
     bev_h, bev_w = 80, 40
-    map_head = build_map_head_from_maptr_config(
+    map_head = build_map_head(
         bev_feat_dim=256,
         embed_dims=256,
         num_vec=50,

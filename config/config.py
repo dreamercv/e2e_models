@@ -2,14 +2,14 @@ import os
 
 configs = {
 
-    "device":"cpu",# cuda cpu
+    "device":"cuda",# cuda cpu
 
 
     "is_train": True,
     "batch_size": 1,
     "num_workers": 1,
     "epoch": 100,
-    "seq_len": 2,
+    "seq_len": 1,
 
 
     "log_dir": "/home/fb/project/models/Sparse4D-main/projects/e2e_models/logs",
@@ -144,7 +144,7 @@ configs = {
     "input_names": ["x", "rots", "trans", "intrins", "distorts", "post_rots", "post_trans", "theta_mats"],
 
     # 模型相关
-    "img_outchannels": 32,
+    "img_outchannels": 8,
     # 2d
     "det_2d_num": 10,
     "map_2d_num": 3,
@@ -154,7 +154,7 @@ configs = {
         "embed_dims": 256,
         "num_decoder": 6,
         "num_single_frame_decoder": 5,
-        "num_classes": 10,
+        "num_classes": 6,
         "bev_bounds": None,
         "anchor_init": None,
         "decouple_attn": True,

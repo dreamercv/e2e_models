@@ -381,21 +381,28 @@ class Sparse4DHead(nn.Module):
             cls_target_flat = cls_target.flatten(end_dim=1)
             cls_loss = self.loss_cls(cls_flat, cls_target_flat, avg_factor=num_pos)
             mask_flat = mask.reshape(-1)
-            reg_weights_flat = (reg_weights * reg.new_tensor(self.reg_weights)).flatten(end_dim=1)[mask_flat]
+            reg_weights_flat = reg_weights.flatten(end_dim=1)[mask_flat]
             reg_target_flat = reg_target.flatten(end_dim=1)[mask_flat]
             reg_flat = reg.flatten(end_dim=1)[mask_flat]
-            reg_target_flat = torch.where(reg_target_flat.isnan(), reg.new_tensor(0.0), reg_target_flat)
-            cls_target_masked = cls_target_flat[mask_flat]
-            qt_masked = qt.flatten(end_dim=1)[mask_flat] if qt is not None else None
-            reg_loss_dict = self.loss_reg(
-                reg_flat,
-                reg_target_flat,
-                weight=reg_weights_flat,
-                avg_factor=num_pos,
-                suffix=f"_{decoder_idx}",
-                quality=qt_masked,
-                cls_target=cls_target_masked,
-            )
+
+            # 若当前 decoder 没有正样本，避免 reg_target_flat 为空导致 NaN
+            if reg_target_flat.numel() == 0:
+                reg_loss_dict = {f"loss_box_{decoder_idx}": reg.new_tensor(0.0)}
+            else:
+                reg_target_flat = torch.where(
+                    reg_target_flat.isnan(), reg.new_tensor(0.0), reg_target_flat
+                )
+                cls_target_masked = cls_target_flat[mask_flat]
+                qt_masked = qt.flatten(end_dim=1)[mask_flat] if qt is not None else None
+                reg_loss_dict = self.loss_reg(
+                    reg_flat,
+                    reg_target_flat,
+                    weight=reg_weights_flat,
+                    avg_factor=num_pos,
+                    suffix=f"_{decoder_idx}",
+                    quality=qt_masked,
+                    cls_target=cls_target_masked,
+                )
             output[f"loss_cls_{decoder_idx}"] = cls_loss
             output.update(reg_loss_dict)
 

@@ -170,8 +170,8 @@ class Model(nn.Module):
         dynamic_bev_feture = bev_feat[:,0].flatten(0,1)
         static_bev_feture = bev_feat[:,1].flatten(0,1)
 
-        det_out, det_loss, det_result = self.forward_dynamic_branch(dynamic_bev_feture, T_ego_his2curs, metas)
-        map_out = self.forward_static_branch(static_bev_feture, metas)
+        det_out, det_loss, det_result = self.forward_dynamic_branch(dynamic_bev_feture, T_ego_his2curs, metas["dynamic"])
+        map_out = self.forward_static_branch(static_bev_feture, metas["static"])
 
         losses = {}
         if isinstance(det_loss, dict):
