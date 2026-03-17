@@ -84,12 +84,10 @@ class Model(nn.Module):
         bev_feat = self.bev_backbone(x, rots, trans, intrins, distorts, post_rot, pos_tran, theta_mats)
         return bev_feat
     
-    def forward_dynamic_branch(self,bev_feat,T_ego_his2curs,metas,decoder=True,comp_loss = True):
+    def forward_dynamic_branch(self,bev_feat,T_ego_his2curs,metas,decoder=False):
         out,seq_features,seq_anchors = self.det3d_head(bev_feat,metas)
-        if comp_loss:
-            det_loss = self.det3d_head.loss(out,metas)
-        else:
-            det_loss = None
+        det_loss = self.det3d_head.loss(out,metas)
+            
 
         if decoder:
             result = self.det3d_head.decoder.decode(
@@ -105,7 +103,7 @@ class Model(nn.Module):
         return out,det_loss,result
 
 
-    def forward_static_branch(self,bev_feat,metas):
+    def forward_static_branch(self,bev_feat,metas,decoder=False):
         # bev_feat: (B * T, C, H, W)，静态分支希望对整个时间序列 T 帧都计算地图 loss
         Bt, C, H, W = bev_feat.shape
         T = self.seq_len
@@ -142,11 +140,15 @@ class Model(nn.Module):
         if gt_map_bboxes is not None and gt_map_labels is not None and gt_map_pts is not None:
             map_losses = self.map3d_head.loss(map_pred, gt_map_bboxes, gt_map_labels, gt_map_pts)
             map_out["loss_map"] = map_losses
-        map_out["map_polylines"] = self.map3d_head.decode(map_pred, score_threshold=0.5)
+        if decoder:
+            map_polylines = self.map3d_head.decode(map_pred, score_threshold=0.5)
+        else:
+            map_polylines = None
+        map_out["map_polylines"] = map_polylines
         return map_out
 
 
-    def forward(self, x, rots, trans, intrins, distorts, post_rot, pos_tran, theta_mats, T_ego_his2curs=None, metas=None):
+    def forward(self, x, rots, trans, intrins, distorts, post_rot, pos_tran, theta_mats, T_ego_his2curs=None, metas=None,decoder=False,task_names=[]):
         b, m, t, n, c, h, w = x.shape
         x = rearrange(x, 'b m t n c h w -> (b m t n) c h w')
         rots = rearrange(rots, 'b m t n h w -> (b m) t n h w')
@@ -167,24 +169,28 @@ class Model(nn.Module):
         bev_feat = self.forward_bev_backbone(x, rots, trans, intrins, distorts, post_rot, pos_tran, theta_mats)
 
         bev_feat = bev_feat.reshape(b, m, t,*bev_feat.shape[1:])
-        dynamic_bev_feture = bev_feat[:,0].flatten(0,1)
-        static_bev_feture = bev_feat[:,1].flatten(0,1)
-
-        det_out, det_loss, det_result = self.forward_dynamic_branch(dynamic_bev_feture, T_ego_his2curs, metas["dynamic"])
-        map_out = self.forward_static_branch(static_bev_feture, metas["static"])
 
         losses = {}
-        if isinstance(det_loss, dict):
-            for k, v in det_loss.items():
-                losses[f"det3d_{k}"] = v
-        map_loss = map_out.get("loss_map", None)
-        if isinstance(map_loss, dict):
-            for k, v in map_loss.items():
-                losses[f"map3d_{k}"] = v
+        det_out,det_result = None,None
+        map_out = None
+        for i, task_name in enumerate(task_names) :
+            sub_bev_feture = bev_feat[:,i].flatten(0,1)
+            if task_name == "dynamic" or task_name == "dynamic_static":
+                det_out, det_loss, det_result = self.forward_dynamic_branch(sub_bev_feture, T_ego_his2curs, metas["dynamic"],decoder=decoder)
+                if isinstance(det_loss, dict):
+                    for k, v in det_loss.items():
+                        losses[f"det3d_{k}"] = v
+            if task_name == "static" or task_name == "dynamic_static":
+                map_out = self.forward_static_branch(sub_bev_feture, metas["static"],decoder=decoder)
+                map_loss = map_out.get("loss_map", None)
+                if isinstance(map_loss, dict):
+                    for k, v in map_loss.items():
+                        losses[f"map3d_{k}"] = v
 
         total_loss = None
         if len(losses) > 0:
             total_loss = sum(v for v in losses.values() if torch.is_tensor(v))
+
 
         return {
             "total_loss": total_loss,

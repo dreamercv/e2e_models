@@ -13,6 +13,7 @@ import sys
 
 import argparse
 
+
 import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
@@ -30,6 +31,8 @@ torch.backends.cudnn.enabled = True
 torch.backends.cuda.matmul.allow_tf32=True
 torch.backends.cudnn.allow_tf32=True
 torch.multiprocessing.set_sharing_strategy('file_system')
+
+from tensorboardX import SummaryWriter
 
 
 from collections.abc import Mapping, Sequence
@@ -54,6 +57,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--local_rank", default = -1, type=int)
     args = parser.parse_args()
+
+    script_path = os.path.abspath(__file__)
+    
 
     if args.local_rank != -1:
         torch.cuda.set_device(args.local_rank)
@@ -86,13 +92,24 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     active = []
+    useful_type_names = []
     for i,type_name in enumerate(types_names):
         if load_types[type_name]:
             dataloader,sampler = build_dataloader(configs,mode=type_name)
             active.append((type_name, dataloader, sampler))
+            useful_type_names.append(type_name)
         
     steps_per_epoch = max(len(dl) for _, dl, _ in active)
     print(f"steps_per_epoch: {steps_per_epoch}")
+
+    iteration = -1
+    log_print_interval = configs.get("log_print_interval", 10)
+    log_save_interval = configs.get("log_save_interval", 10)
+    log_dir = os.path.join(os.path.dirname(script_path),configs["log_dir"])
+    os.makedirs(log_dir,exist_ok=True)
+    config_path = os.path.join(os.path.dirname(script_path),"config/config.py")
+    os.system(f"cp {config_path} {log_dir}")
+    writer = SummaryWriter(logdir=log_dir)
 
     for epoch in range(epochs):
         model.train()
@@ -118,9 +135,9 @@ def main():
             for type_name, batch in batches:
                 for input_name in input_names:
                     if input_name not in inputs_tensor.keys():
-                        inputs_tensor[input_name] = batch[input_name]
+                        inputs_tensor[input_name] = batch[input_name][:,None]
                     else:
-                        inputs_tensor[input_name] = torch.stack([inputs_tensor[input_name],batch[input_name]],1)
+                        inputs_tensor[input_name] = torch.cat([inputs_tensor[input_name],batch[input_name][:,None]],1)
                 names = gt_names[type_name]
                 gts_value = {}
                 for name in names:
@@ -137,16 +154,10 @@ def main():
 
             # 组装 metas（把 dynamic / static 的真值合并）
             metas = recursive_to_device(gts_values,device)
-            # for type_name, gts in gts_values.items():
-            #     for k, v in gts.items():
-            #         # 将张量或张量列表搬到 device
-            #         if isinstance(v, torch.Tensor):
-            #             metas[k] = v.to(device)
-            #         elif isinstance(v, list) and len(v) > 0 and isinstance(v[0], torch.Tensor):
-            #             metas[k] = [t.to(device) for t in v]
-            #         else:
-            #             metas[k] = v
 
+
+            
+            iteration += 1
             outputs = model(
                 inputs_tensor["x"],
                 inputs_tensor["rots"],
@@ -157,6 +168,8 @@ def main():
                 inputs_tensor["post_trans"],
                 inputs_tensor["theta_mats"],
                 metas=metas,
+                decoder= True if iteration % log_save_interval == 0 else False,
+                task_names=useful_type_names
             )
 
             total_loss = outputs.get("total_loss", None)
@@ -167,9 +180,82 @@ def main():
             total_loss.backward()
             optimizer.step()
 
-            if batch_idx % configs.get("log_print_interval", 10) == 0:
+            if iteration % log_save_interval == 0:
+                # 可视化真值
+                seq_len = configs["seq_len"]
+                batchidx  = configs["batch_size"]-1
+                cur_idx = seq_len-1
+                camera_names = configs["camera_names"]
+                if "dynamic" in metas.keys():
+                    meta = metas["dynamic"]
+                    label_path = meta["label_path"][batchidx][cur_idx]# 最后一个batch的最后一帧(当前在)
+                    gt_labels_det3D = meta["gt_labels_det3D"][batchidx][cur_idx].cpu().numpy()
+                    gt_bboxes_det3D = meta["gt_bboxes_det3D"][batchidx][cur_idx].cpu().numpy()
+                    gt_labels_det3D_mask = meta["gt_labels_det3D_mask"][batchidx][cur_idx].cpu().numpy()
+                    
+                    from utils.vis_gt import vis_dynamic_gt,vis_dynamic_pred
+                    gt_dynamic_canvas,gt_dynamic_images = vis_dynamic_gt(camera_names,label_path, gt_labels_det3D, gt_bboxes_det3D, gt_labels_det3D_mask, None)
+                    
+                    # 预测值
+                    det3d_result = outputs["det3d_result"][-1]
+                    boxes_3d = det3d_result["boxes_3d"].detach().cpu().numpy()
+                    scores_3d = det3d_result["scores_3d"].detach().cpu().numpy()
+                    labels_3d = det3d_result["labels_3d"].detach().cpu().numpy()
+                    cls_scores = det3d_result["cls_scores"].detach().cpu().numpy()
+
+                    pt_dynamic_canvas,pt_dynamic_images = vis_dynamic_pred(
+                                                                camera_names=camera_names,  # 来自 config/config.py
+                                                                label_path=label_path,
+                                                                boxes_3d=boxes_3d,
+                                                                scores_3d=scores_3d,
+                                                                labels_3d=labels_3d,
+                                                                score_thresh=0.3,  # 可调
+                                                            )
+
+
+
+                if "static" in metas.keys():
+                    meta = metas["static"]
+                    label_path = meta["label_path"][batchidx][cur_idx]
+                    gt_labels_map3D = meta["gt_labels_map3D"][batchidx][cur_idx].cpu().numpy()
+                    gt_pts_map3D = meta["gt_pts_map3D"][batchidx][cur_idx].cpu().numpy()
+
+                    from utils.vis_gt import vis_static_gt
+                    gt_static_canvas,gt_static_images = vis_static_gt(camera_names,label_path,gt_labels_map3D,gt_pts_map3D)
+
+
+                    # 2) 画预测
+                    # map_polylines 是 decode 出的结果，通常是 list 长度 B*T
+                    map_polylines = outputs["map3d_out"]["map_polylines"]
+                    poly = map_polylines[batchidx * seq_len + cur_idx]
+                    pred_labels = poly["labels"].cpu().numpy()
+                    if poly["pts"].dim() == 3:
+                            pred_pts = poly["pts"].cpu().numpy()
+                    else:
+                        # (N, num_orders, num_pts, 2)，取 order=0
+                        pred_pts = poly["pts"][:, 0].cpu().numpy()
+
+                    pt_static_canvas,pt_static_images = vis_static_gt(
+                                                            camera_names=camera_names,
+                                                            label_path=label_path,
+                                                            labels=pred_labels,
+                                                            pts=pred_pts,
+                                                        )
+
+
+
+            if iteration % log_print_interval == 0:
                 print(f"Epoch [{epoch+1}/{epochs}] Step [{batch_idx+1}/{steps_per_epoch}] "
                       f"loss: {float(total_loss.detach().cpu()):.4f}")
+                writer.add_scalar('all_loss/loss', total_loss, iteration)
+                losses = outputs.get("losses", None)
+                if losses is not None:
+                    for k,v in losses.items():
+                        if k.startswith("det3d_"):
+                            writer.add_scalar(k.replace("det3d_","det3d/"), v, iteration)
+                        elif k.startswith("map3d_"):
+                            writer.add_scalar(k.replace("map3d_","map3d/"), v, iteration)
+
             # "x",              3, 2, 5, 8, 3, 128, 384
             # "rots",           3, 2, 5, 8, 3, 3
             # "trans",          3, 2, 5, 8, 3       --> 1*3
@@ -185,3 +271,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # from mmdet.models.losses import GaussianFocalLoss, L1Loss, CrossEntropyLoss

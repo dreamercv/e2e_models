@@ -156,6 +156,8 @@ class BEVBackbone(nn.Module):
         self.input_size = input_size
         self.splat = Splat(grid_conf, input_size)
         self.points = self.splat.create_voxels()
+        ground_points = self.points[2]
+        self.bev_emb = self.positional_encoding(ground_points[...,:2],4).permute(2,1,0)
         self.height = self.points.shape[0]
         self.num_cams = num_cams
         # self.bev_backbone = nn.Sequential(
@@ -165,7 +167,7 @@ class BEVBackbone(nn.Module):
         #     nn.MaxPool2d(2, 2)
         # )
         self.fusion_height = nn.Sequential(
-            nn.Conv2d(channels * self.height, channels*3, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(channels * self.height+self.bev_emb.shape[0], channels*3, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(channels*3),
             nn.ReLU(inplace=True),
             nn.Conv2d(channels*3, channels, kernel_size=3, stride=1, padding=1),
@@ -204,9 +206,10 @@ class BEVBackbone(nn.Module):
         distorts = distorts.flatten(0, 1)
         post_rot3 = post_rot3.flatten(0, 1)
         post_tran3 = post_tran3.flatten(0, 1)
-        # x = x.view(B * S * N, C, H, W)
+        # points1 = torch.tensor(points1).view(seq_len * 3, 32, 96, 3).unsqueeze(1).unsqueeze(-1)
         # x = self.bev_backbone(x)
-        points = self.points.to(x.device)
+        points = self.points.to(x.device) 
+        bev_emb = self.bev_emb.to(x.device)
         grid = self.splat.bev2eachroi(points, rots.to(points.dtype), trans.to(points.dtype), intrins.to(points.dtype),
                                       distorts.to(points.dtype), post_rot3.to(points.dtype),
                                       post_tran3.to(points.dtype)).to(x.dtype)
@@ -226,7 +229,8 @@ class BEVBackbone(nn.Module):
         # output_3 = F.grid_sample(input=x, grid=grid[index_3, ...], mode="nearest", padding_mode="zeros")
         # output_4 = F.grid_sample(input=x, grid=grid[index_4, ...], mode="nearest", padding_mode="zeros")
         # output_5 = F.grid_sample(input=x, grid=grid[index_5, ...], mode="nearest", padding_mode="zeros")
-        out_put = torch.cat(outs,dim=1)  # torch.Size([25, 384, 150, 100]) # 90 256 200 80 # 90 = 3 * 2 * 5 * 3(三个相机)
+        out_put = torch.cat(outs,dim=1)  # B, C, H, W
+        out_put = torch.cat([out_put, bev_emb[None].expand(out_put.shape[0], -1, -1, -1)], dim=1) # torch.Size([25, 384, 150, 100]) # 90 256 200 80 # 90 = 3 * 2 * 5 * 3(三个相机)
         out_put = self.fusion_height(out_put)
         out_put = out_put.reshape(-1,self.num_cams*out_put.shape[1],*out_put.shape[-2:])
         out_put = self.multiview_fusion(out_put)
@@ -246,6 +250,57 @@ class BEVBackbone(nn.Module):
         grids = F.affine_grid(theta, torch.Size((B, C, H, W)), align_corners=True)
         cropped_features = F.grid_sample(features, grids, align_corners=True)
         return cropped_features
+
+    def positional_encoding(self, input, L):  # [B,...,N]
+        shape = input.shape
+        freq = 2 ** torch.arange(L, dtype=torch.float32, device=input.device) * np.pi  # [L]
+        spectrum = input[..., None] * freq  # [B,...,N,L]
+        sin, cos = spectrum.sin(), spectrum.cos()  # [B,...,N,L]
+        input_enc = torch.stack([sin, cos], dim=-2)  # [B,...,N,2,L]
+        input_enc = input_enc.view(*shape[:-1], -1)  # [B,...,2NL]
+        return input_enc
+
+
+    def get_cam_pos_embedding(self, intrins, post_rots, post_trans, distorts, L):
+        with torch.no_grad():
+            ogfH, ogfW = self.data_aug_conf['final_dim']
+            fH, fW = ogfH // self.downsample, ogfW // self.downsample
+            xs = torch.linspace(0, ogfW - 1, fW, dtype=torch.float, device=intrins.device).view(1, 1, fW).expand(1, fH,
+                                                                                                                 fW)
+            ys = torch.linspace(0, ogfH - 1, fH, dtype=torch.float, device=intrins.device).view(1, fH, 1).expand(1, fH,
+                                                                                                                 fW)
+            ds = torch.ones_like(xs)
+            rays = torch.stack((xs, ys, ds), -1)
+
+            # for distort_img using torch by ZY@[2023-04-19]
+            if distorts.shape[0] != 0:
+                img_size = (fW, fH)
+                alpha = 1
+                ori_K = intrins[0, 0, :, :].cpu().numpy()
+                distort = distorts[0, 0, :].cpu().numpy()
+                dis_img = torch.squeeze(rays).cpu().numpy()
+
+                NewCameraMatrix, _ = cv2.getOptimalNewCameraMatrix(ori_K, distort, img_size, alpha, img_size, 0)
+                map1, map2 = cv2.initUndistortRectifyMap(ori_K, distort, None, NewCameraMatrix, img_size, cv2.CV_32FC1)
+                rays = cv2.remap(dis_img, map1, map2, cv2.INTER_LINEAR)
+                rays = torch.tensor(rays, device=intrins.device)
+                NewCameraMatrix = torch.tensor(NewCameraMatrix, device=intrins.device).expand(intrins.shape)
+                rays = rays.unsqueeze(0)
+
+            B, N, _ = post_trans.shape
+            # undo post-transformation
+            # B x N x D x H x W x 3
+            points = rays - post_trans.view(B, N, 1, 1, 1, 3)
+            points = torch.inverse(post_rots).view(B, N, 1, 1, 1, 3, 3).matmul(points.unsqueeze(-1))
+
+            if distorts.shape[0] != 0:
+                points = torch.inverse(NewCameraMatrix).view(B, N, 1, 1, 1, 3, 3).matmul(points).squeeze(-1)
+            else:
+                points = torch.inverse(intrins).view(B, N, 1, 1, 1, 3, 3).matmul(points).squeeze(-1)
+
+            cam_pos_embedding = self.positional_encoding(points[..., :2], L).view(B * N, fH, fW, -1).permute(0, 3, 1, 2)
+            # 最好再把原始的x,y也保留并concat起来
+            return cam_pos_embedding
 
 
 def quaternion_to_rotation_matrix(x: float, y: float, z: float, w: float) -> np.ndarray:

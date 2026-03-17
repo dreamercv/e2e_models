@@ -245,7 +245,10 @@ class Dataset(torch.utils.data.Dataset):
         self.cns = config["camera_names"]#使用几个相机
         self.cnis = config["camera_infos"]#每个相机增强参数
 
-        self.fH, self.fW  = config["final_dim"] # 网络输入的大小
+        self.final_dim = config["final_dim"] 
+        self.fH, self.fW  = self.final_dim # 网络输入的大小
+        self.ds = config["dowmsample"]
+        self.rays = self.gen_rays()
 
         self.total_len =config["total_len"]
         self.current_frame_index = config["current_frame_index"]
@@ -275,6 +278,15 @@ class Dataset(torch.utils.data.Dataset):
         self.det_class_names = config["det_class_names"]
         self.det_gt_names = config["det_gt_names"]
 
+    def gen_rays(self):
+        ogfH, ogfW = self.fH, self.fW
+        fH, fW = ogfH // self.ds, ogfW // self.ds
+        xs = torch.linspace(0, ogfW - 1, fW, dtype=torch.float).view(1, 1, fW).expand(1, fH, fW)
+        ys = torch.linspace(0, ogfH - 1, fH, dtype=torch.float).view(1, fH, 1).expand(1, fH, fW)
+        ds = torch.ones_like(xs)
+        rays = torch.stack((xs, ys, ds), -1)
+        return rays
+
     def gen_aug_params(self,H,W,resize_lim,bot_pct_lim,rot_lim):
         fH, fW = self.fH, self.fW
         if self.is_train:
@@ -302,7 +314,151 @@ class Dataset(torch.utils.data.Dataset):
         else:
             rotate = 0.
         return resize,resize_dims,crop,rotate
-        
+
+    
+    # def get_cam_pos_embedding(self, post_trans, post_rots, L, aug_params, public_infos):
+    #     ogfH, ogfW = self.final_dim
+    #     fH, fW = ogfH // self.ds, ogfW // self.ds
+    #     rays = self.rays
+
+    #     N, _ = post_trans.shape
+    #     points = rays - post_trans.view(N, 1, 1, 1, 3)  # (25, 32, 128, 3)
+    #     points = torch.inverse(post_rots).view(N, 1, 1, 1, 3, 3).matmul(points.unsqueeze(-1))
+    #     points = points.squeeze().view(N // 6, 6, 32, 96, 3).numpy()
+
+    #     seq_len = N // 6
+    #     cam_pos = {}
+    #     for key in public_infos.keys():
+    #         public_info = public_infos[key]
+    #         NewCameraMatrix = public_info["NewCameraMatrix"]
+    #         lidar2cam_param = public_info["lidar2cam_param"]
+    #         intrin = np.array(lidar2cam_param['cameraMatrix'])
+    #         distort = np.array(lidar2cam_param['distortion_coeffs'])
+    #         CAM = key_list[key]
+
+    #         if CAM == "front":  # 前
+    #             pointsx = points[:, 0:3, :, :, 0].reshape(-1)
+    #             pointsy = points[:, 0:3, :, :, 1].reshape(-1)
+    #             V = np.c_[pointsx, pointsy]
+    #             points_new = cv2.undistortPoints(V, intrin, distort, None, NewCameraMatrix).reshape(-1, 2)
+    #             ds = np.ones((points_new.shape[0], 1)).astype(np.float32)
+    #             points1 = np.c_[points_new, ds].astype(np.float32)
+    #             points1 = torch.tensor(points1).view(seq_len * 3, 32, 96, 3).unsqueeze(1).unsqueeze(-1)
+    #             NewCameraMatrix = torch.tensor(NewCameraMatrix).expand(seq_len * 3, 3, 3)
+    #             points1 = torch.inverse(NewCameraMatrix).view(seq_len * 3, 1, 1, 1, 3, 3).matmul(points1).squeeze(
+    #                 -1)  # torch.Size([10, 1, 32, 128, 3])
+    #             cam_pos[CAM] = self.positional_encoding(points1[..., :2], L).view(seq_len, 3, fH, fW, -1).permute(0, 1,
+    #                                                                                                               4, 2,
+    #                                                                                                               3)
+    #         elif CAM == "back":  # 后
+    #             pointsx = points[:, 3, :, :, 0].reshape(-1)
+    #             pointsy = points[:, 3, :, :, 1].reshape(-1)
+    #             V = np.c_[pointsx, pointsy]
+    #             points_new = cv2.undistortPoints(V, intrin, distort, None, NewCameraMatrix).reshape(-1, 2)
+    #             ds = np.ones((points_new.shape[0], 1)).astype(np.float32)
+    #             points1 = np.c_[points_new, ds].astype(np.float32)
+    #             points1 = torch.tensor(points1).view(seq_len, 32, 96, 3).unsqueeze(1).unsqueeze(-1)
+
+    #             NewCameraMatrix = torch.tensor(NewCameraMatrix).expand(seq_len, 3, 3)
+    #             points1 = torch.inverse(NewCameraMatrix).view(seq_len, 1, 1, 1, 3, 3).matmul(points1).squeeze(-1)
+    #             cam_pos[CAM] = self.positional_encoding(points1[..., :2], L).view(seq_len, 1, fH, fW, -1).permute(0, 1,
+    #                                                                                                               4, 2,
+    #                                                                                                               3)
+    #         elif CAM == "left":  # 左
+    #             whole_img_size = (1920, 1536)
+    #             D = np.array([distort[0], distort[1], distort[4], distort[5]]).astype(np.float32)
+    #             NewCameraMatrix = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(intrin, D, whole_img_size,
+    #                                                                                      None, balance=1)
+    #             pointsx = points[:, 4, :, :, 0].reshape(-1)
+    #             pointsy = points[:, 4, :, :, 1].reshape(-1)
+    #             V = np.c_[pointsx, pointsy]
+    #             V = V[:, np.newaxis, :]
+    #             points_new = cv2.fisheye.undistortPoints(V, intrin, D, P=NewCameraMatrix).reshape(-1, 2)
+    #             ds = np.ones((points_new.shape[0], 1)).astype(np.float32)
+    #             points1 = np.c_[points_new, ds].astype(np.float32)
+    #             points1 = torch.tensor(points1).view(seq_len, 32, 96, 3).unsqueeze(1).unsqueeze(-1)
+
+    #             NewCameraMatrix = torch.tensor(NewCameraMatrix).expand(seq_len, 3, 3)
+    #             points1 = torch.inverse(NewCameraMatrix).view(seq_len, 1, 1, 1, 3, 3).matmul(points1).squeeze(-1)
+    #             cam_pos[CAM] = self.positional_encoding(points1[..., :2], L).view(seq_len, 1, fH, fW, -1).permute(0, 1,
+    #                                                                                                               4, 2,
+    #                                                                                                               3)
+    #         elif CAM == "right":  # 右
+    #             whole_img_size = (1920, 1536)
+    #             D = np.array([distort[0], distort[1], distort[4], distort[5]]).astype(np.float32)
+    #             NewCameraMatrix = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(intrin, D, whole_img_size,
+    #                                                                                      None, balance=1)
+    #             pointsx = points[:, 5, :, :, 0].reshape(-1)
+    #             pointsy = points[:, 5, :, :, 1].reshape(-1)
+    #             V = np.c_[pointsx, pointsy]
+    #             V = V[:, np.newaxis, :]
+    #             points_new = cv2.fisheye.undistortPoints(V, intrin, D, P=NewCameraMatrix).reshape(-1, 2)
+    #             ds = np.ones((points_new.shape[0], 1)).astype(np.float32)
+    #             points1 = np.c_[points_new, ds].astype(np.float32)
+    #             points1 = torch.tensor(points1).view(seq_len, 32, 96, 3).unsqueeze(1).unsqueeze(-1)
+
+    #             NewCameraMatrix = torch.tensor(NewCameraMatrix).expand(seq_len, 3, 3)
+    #             points1 = torch.inverse(NewCameraMatrix).view(seq_len, 1, 1, 1, 3, 3).matmul(points1).squeeze(-1)
+    #             cam_pos[CAM] = self.positional_encoding(points1[..., :2], L).view(seq_len, 1, fH, fW, -1).permute(0, 1,
+    #                                                                                                               4, 2,
+    #                                                                                                               3)
+    #         # 最好再把原始的x,y也保留并concat起来
+    #     cam_pos_embedding = torch.cat([cam_pos['front'], cam_pos['back'], cam_pos['left'], cam_pos['right']],
+    #                                   dim=1).view(seq_len * 6, 16, 32, 96)
+    #     return cam_pos_embedding
+    
+    # def gen_camera_pos_encoding(self, post_img, post_rot, post_tran, intrin, distort, L=4):
+    #     """
+    #     根据增强后的相机参数生成每张图的相机位置编码（camera position embedding）。
+
+    #     参数:
+    #         post_img: (N, 3, H, W) 增强后的图像，只用 N/H/W
+    #         post_rot: (N, 3, 3) 相机到 ego 的旋转矩阵 R
+    #         post_tran: (N, 3)   相机在 ego 坐标下的位置 t（目前不显式用到）
+    #         intrin: (N, 3, 3)   增强后的相机内参
+    #         distort: (N, 8)     畸变参数（当前实现未显式使用）
+    #         L:                  位置编码的频率参数，与你现有 self.positional_encoding 一致
+
+    #     返回:
+    #         cam_pos_embed: (N, C, fH, fW)，C 由 self.positional_encoding 决定，
+    #         fH,fW = final_dim // ds
+    #     """
+    #     import torch
+
+    #     device = post_img.device
+    #     N, _, H, W = post_img.shape
+    #     ogfH, ogfW = self.final_dim        # 例如 (128, 384)
+    #     fH, fW = ogfH // self.ds, ogfW // self.ds   # 例如 (32, 96)
+
+    #     # 特征图网格 (fH, fW)，用增强后图像的分辨率做缩放
+    #     ys = torch.linspace(0.5, H - 0.5, fH, device=device)
+    #     xs = torch.linspace(0.5, W - 0.5, fW, device=device)
+    #     grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")   # (fH, fW)
+
+    #     ones = torch.ones_like(grid_x)
+    #     pix = torch.stack([grid_x, grid_y, ones], dim=-1)        # (fH, fW, 3)
+    #     pix = pix.view(1, fH, fW, 3).repeat(N, 1, 1, 1)          # (N, fH, fW, 3)
+    #     pix_h = pix.view(N, -1, 3).unsqueeze(-1)                 # (N, fH*fW, 3, 1)
+
+    #     # 像素 -> 相机归一化坐标（深度设为 1）
+    #     intrin_inv = torch.inverse(intrin)                       # (N, 3, 3)
+    #     cam_dirs = intrin_inv.view(N, 1, 3, 3).matmul(pix_h).squeeze(-1)  # (N, fH*fW, 3)
+    #     cam_dirs = cam_dirs / (cam_dirs.norm(dim=-1, keepdim=True) + 1e-6)
+
+    #     # 相机系 -> ego 系（方向向量）
+    #     ego_dirs = post_rot.view(N, 1, 3, 3).matmul(
+    #         cam_dirs.unsqueeze(-1)
+    #     ).squeeze(-1)                                            # (N, fH*fW, 3)
+
+    #     # 取前两维 (dx, dy) 作为位置编码输入
+    #     dirs_xy = ego_dirs[..., :2].view(N, fH, fW, 2)           # (N, fH, fW, 2)
+
+    #     # 调用已有的 positional_encoding，保持与 get_cam_pos_embedding 风格一致
+    #     cam_pos_embed = self.positional_encoding(dirs_xy, L)     # (N, fH, fW, C)
+    #     cam_pos_embed = cam_pos_embed.permute(0, 3, 1, 2).contiguous()  # (N, C, fH, fW)
+
+    #     return cam_pos_embed
+
 
     def get_image_data(self,recs):
         "输出增强后的图片(裁剪/旋转)，以及增强的参数，相关的内外惨"
@@ -348,6 +504,9 @@ class Dataset(torch.utils.data.Dataset):
                 for aug_param in cnis[cn]:
                     resize, resize_dims, crop, rotate,flip = aug_param
                     post_img, post_rot, post_tran = img_transform(img,resize, resize_dims, crop,flip=flip, rotate=rotate)
+
+                    # # 生成相机的位置编码
+                    # self.gen_camera_pos_encoding(post_img,post_rot,post_tran,intrin,distort)
                     
                     imgs_i.append(normalize_img(post_img))
                     post_rots_i.append(post_rot)
@@ -481,8 +640,8 @@ class Dataset(torch.utils.data.Dataset):
                 data = json.load(f)
 
             ego_pose = data["ego_pose"]
-            T_ego2wld = TransformationmatrixEgo(ego_pose["orientation"], ego_pose["position"])
-            T_wld2ego = np.linalg.inv(T_ego2wld)
+            # T_ego2wld = TransformationmatrixEgo(ego_pose["orientation"], ego_pose["position"])
+            # T_wld2ego = np.linalg.inv(T_ego2wld)
 
             groups = data.get("groups", {})
 
@@ -547,22 +706,30 @@ class Dataset(torch.utils.data.Dataset):
                     pts3d = obj.get("points", [])
                     if len(pts3d) < 2:
                         continue
-
+                    # FrontCam01, FrontCam02, RearCam01, SideFrontCam01, SideFrontCam02, SideRearCam01, SideRearCam02, SurCam01, SurCam02, SurCam03, SurCam04
+                    cam_idxs = [1,2,3,4,5,6]
                     coords = []
                     for p in pts3d:
-                        pw = np.array([p["x"], p["y"], p["z"], 1.0], dtype=np.float64)
-                        pe = (T_wld2ego @ pw)[:3]  # ego 坐标
-                        coords.append([pe[0], pe[1]])  # 只保留 x,y
+                        v = p["properties"].get("v",None)
+                        if v is None or  not isinstance(v, list):continue
+                        if "1" not in [v[i] for i in cam_idxs]:continue
+                        # pw = np.array([p["x"], p["y"], p["z"], 1.0], dtype=np.float64)
+                        # pe = (T_wld2ego @ pw)[:3]  # ego 坐标
+                        x,y = p["x"], p["y"]
+                        if x >=x_max or x < x_min or y>y_max or y <y_min:continue
+                        coords.append([x,y])  # 只保留 x,y
+                    if len(coords) < 2:
+                        continue
                     coords = np.asarray(coords, dtype=np.float32)  # (N, 2)
 
                     # 与 pc_range 的粗裁剪：若整条线都在范围外，则忽略
-                    xs, ys = coords[:, 0], coords[:, 1]
-                    if xs.max() < x_min or xs.min() > x_max or ys.max() < y_min or ys.min() > y_max:
-                        continue
+                    # xs, ys = coords[:, 0], coords[:, 1]
+                    # if xs.max() < x_min or xs.min() > x_max or ys.max() < y_min or ys.min() > y_max:
+                    #     continue
 
-                    # 将点裁剪到 pc_range 内，避免 bbox 超界
-                    coords[:, 0] = np.clip(coords[:, 0], x_min, x_max)
-                    coords[:, 1] = np.clip(coords[:, 1], y_min, y_max)
+                    # # 将点裁剪到 pc_range 内，避免 bbox 超界
+                    # coords[:, 0] = np.clip(coords[:, 0], x_min, x_max)
+                    # coords[:, 1] = np.clip(coords[:, 1], y_min, y_max)
 
                     # 重采样为固定 num_pts
                     coords_rs = resample_polyline(coords, num_pts)  # (num_pts, 2)
@@ -837,10 +1004,10 @@ class Dataset(torch.utils.data.Dataset):
                 rel_pose[2,2]=1
                 rel_pose[0,0],rel_pose[0,1],rel_pose[0,2] = cos,-sin,dx
                 rel_pose[1,0],rel_pose[1,1],rel_pose[1,2] = sin,cos,dy
-                pre_mat = np.array([[0., 1./sy, 0.], # 车头往上
-                                    [1./sx, 0., 1/5],
+                pre_mat = np.array([[0., 1./sy, 0.], # 车头往下
+                                    [1./sx, 0., -1/5],
                                     [0., 0., 1.]])
-                post_mat = np.array([[0., sx, -sx/5],
+                post_mat = np.array([[0., sx, sx/5],
                                     [sy, 0., 0.],
                                     [0., 0., 1.]])
                 theta_mat = (pre_mat@(rel_pose@post_mat))[:2,:]
@@ -922,6 +1089,9 @@ class Dataset(torch.utils.data.Dataset):
         indexs= self.get_input_indexs(mode)  # 16 17 18 19 20
         #数据增强部分
         recs = [rec[i] for i in indexs]
+        label_paths = {
+            "label_path":recs
+        }
         imgs, rots, trans, intrins, distorts, post_rots, post_trans = self.get_image_data(recs)
         images_parma = {
             "x": imgs,                  # 14 8 3 128 384 # 最后在batch上拼接 # bs * T * 8 * 3 * 128 * 384
@@ -972,6 +1142,7 @@ class Dataset(torch.utils.data.Dataset):
         out.update(images_parma)
         out.update(algin_matrixs)
         out.update(anno_infos)
+        out.update(label_paths)
 
         return out
 
@@ -1045,9 +1216,10 @@ class Dataset(torch.utils.data.Dataset):
 from torch.utils.data.distributed import DistributedSampler 
 from torch.utils.data.sampler import SequentialSampler
 from torch.utils.data import DataLoader
+import torch
+import numpy as np
 def custom_collate(batch):
-    import torch
-    import numpy as np
+
 
     elem = batch[0]
     out = {}
@@ -1117,4 +1289,3 @@ def build_dataloader(config, mode="dynamic"):
     )
 
     return dataloader,sampler
- 

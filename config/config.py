@@ -2,19 +2,19 @@ import os
 
 configs = {
 
-    "device":"cuda",# cuda cpu
+    "device":"cpu",# cuda cpu
 
 
     "is_train": True,
     "batch_size": 1,
     "num_workers": 1,
     "epoch": 100,
-    "seq_len": 1,
+    "seq_len": 5,
 
 
-    "log_dir": "/home/fb/project/models/Sparse4D-main/projects/e2e_models/logs",
-    "log_save_interval": 100,
-    "log_print_interval": 10,
+    "log_dir": "../logs/only_dynamic",
+    "log_save_interval": 1000000,
+    "log_print_interval": 1,
 
     "load_types": {  # 具体加载哪几种数据，加载不同的数据，会对应着不同的任务
         "dynamic": True,
@@ -32,6 +32,10 @@ configs = {
     "clip_paths": {
         "dynamic": ["/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/det.txt"],
         "static": ["/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/map.txt"],
+
+        # "dynamic": ["/workspace/afb5szh-01/models/e2e_model/e2e_dataset_10Hz_dyo.txt"],
+        # "static": ["/workspace/afb5szh-01/models/e2e_model/e2e_dataset_10Hz_lane.txt"],
+
         "dynamic_static": [],
         "e2e": [],
     },
@@ -50,6 +54,7 @@ configs = {
     "flip": False,
 
     'final_dim': (128, 384),
+    "dowmsample": 4,
 
     "mode": "static",  # 默认加载动态数据
     
@@ -132,28 +137,30 @@ configs = {
         "dynamic": [
             "gt_labels_det2D", "gt_bboxes_det2D",
             "gt_labels_det3D", "gt_bboxes_det3D", "gt_labels_det3D_mask", "gt_bboxes_det3D_mask",
-            "dynamic_trackids", "dynamic_trajs", "dynamic_traj_masks"
+            "dynamic_trackids", "dynamic_trajs", "dynamic_traj_masks",
+            "label_path"
         ],
         "static": [
             "gt_labels_map2D", "gt_bboxes_map2D",
             "gt_labels_map3D", "gt_bboxes_map3D", "gt_pts_map3D",
-            "gt_e2e_static_traj"
+            "gt_e2e_static_traj",
+            "label_path"
         ],
-        "e2e": ["gt_e2e_dynamic_traj"]
+        "e2e": ["gt_e2e_dynamic_traj","label_path"]
     },
     "input_names": ["x", "rots", "trans", "intrins", "distorts", "post_rots", "post_trans", "theta_mats"],
 
     # 模型相关
     "img_outchannels": 8,
     # 2d
-    "det_2d_num": 10,
+    "det_2d_num": 6,
     "map_2d_num": 3,
     # det3D
     "det_3d_head": {
         "num_anchor": 20,
         "embed_dims": 256,
-        "num_decoder": 6,
-        "num_single_frame_decoder": 5,
+        "num_decoder": 2,
+        "num_single_frame_decoder": 1,
         "num_classes": 6,
         "bev_bounds": None,
         "anchor_init": None,
