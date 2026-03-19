@@ -211,6 +211,10 @@ def main():
                                                                 labels_3d=labels_3d,
                                                                 score_thresh=0.3,  # 可调
                                                             )
+                    for k,v in gt_dynamic_images.items():
+                        writer.add_image(f'dynamic/gt/{k}', v, global_step=iteration, dataformats='HWC')
+                    for k,v in pt_dynamic_images.items():  
+                        writer.add_image(f'dynamic/pt/{k}', v, global_step=iteration, dataformats='HWC')
 
 
 
@@ -241,6 +245,11 @@ def main():
                                                             labels=pred_labels,
                                                             pts=pred_pts,
                                                         )
+
+                    for k,v in gt_static_images.items():
+                        writer.add_image(f'static/gt/{k}', v, global_step=iteration, dataformats='HWC')
+                    for k,v in pt_static_images.items():
+                        writer.add_image(f'static/pt/{k}', v, global_step=iteration, dataformats='HWC')
 
 
 

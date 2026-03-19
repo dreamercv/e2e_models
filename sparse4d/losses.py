@@ -80,13 +80,14 @@ class FocalLoss(nn.Module):
         loss = bce_loss * alpha_factor * modulating_factor
         loss = loss.sum(dim=-1)  # (N',)
 
-        if self.reduction == "mean":
-            loss = loss.mean()
-        else:
-            loss = loss.sum()
-
         if avg_factor is not None:
-            loss = loss / max(float(avg_factor), 1.0)
+            loss = loss.sum() / max(float(avg_factor), 1.0)
+        else:
+            if self.reduction == "mean":
+                loss = loss.mean()
+            else:
+                loss = loss.sum()
+
 
         return loss
 
@@ -109,13 +110,13 @@ class L1Loss(nn.Module):
         if weight is not None:
             loss = loss * weight
 
-        if self.reduction == "sum":
-            loss = loss.sum()
-        else:
-            loss = loss.mean()
-
         if avg_factor is not None:
-            loss = loss / max(float(avg_factor), 1.0)
+            loss = loss.sum() / max(float(avg_factor), 1.0)
+        else:
+            if self.reduction == "sum":
+                loss = loss.sum()
+            else:
+                loss = loss.mean()
 
         return loss
 
@@ -144,13 +145,14 @@ class CrossEntropyLoss(nn.Module):
         if weight is not None:
             loss = loss * weight
 
-        if self.reduction == "sum":
-            loss = loss.sum()
-        else:
-            loss = loss.mean()
 
         if avg_factor is not None:
-            loss = loss / max(float(avg_factor), 1.0)
+            loss = loss.sum() / max(float(avg_factor), 1.0)
+        else:
+            if self.reduction == "sum":
+                loss = loss.sum()
+            else:
+                loss = loss.mean()
 
         return loss
 
@@ -189,16 +191,16 @@ class GaussianFocalLoss(nn.Module):
         if weight is not None:
             loss = loss * weight
 
-        if self.reduction == "sum":
-            loss = loss.sum()
-        else:
-            loss = loss.mean()
 
         if avg_factor is not None:
-            loss = loss / max(float(avg_factor), 1.0)
+            loss = loss.sum() / max(float(avg_factor), 1.0)
+        else:
+            if self.reduction == "sum":
+                loss = loss.sum()
+            else:
+                loss = loss.mean()
 
         return loss
-
 
 class SparseBox3DLoss(nn.Module):
     """

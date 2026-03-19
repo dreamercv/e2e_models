@@ -307,7 +307,8 @@ class Sparse4DHead(nn.Module):
         return out,instance_feature,anchor
 
     def _reduce_mean(self, x: torch.Tensor) -> torch.Tensor:
-        return x.sum() / max(x.numel(), 1)
+        return x.sum()
+        # return x.sum() / max(x.numel(), 1)
 
     def prepare_for_dn_loss(self, model_outs, prefix=""):
         dn_valid_mask = model_outs[f"{prefix}dn_valid_mask"].flatten(end_dim=1)
@@ -317,7 +318,8 @@ class Sparse4DHead(nn.Module):
         ]
         dn_pos_mask = dn_cls_target >= 0
         dn_reg_target = dn_reg_target[dn_pos_mask]
-        reg_weights = dn_reg_target.new_tensor(self.reg_weights)[None].tile(dn_reg_target.shape[0], 1)
+        # reg_weights = dn_reg_target.new_tensor(self.reg_weights)[None].tile(dn_reg_target.shape[0], 1)
+        reg_weights = dn_reg_target.new_ones(dn_reg_target.shape[0], len(self.reg_weights))
         num_dn_pos = max(
             self._reduce_mean(dn_valid_mask.to(dtype=dn_reg_target.dtype)).item(),
             1.0,
