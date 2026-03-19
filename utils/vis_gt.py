@@ -516,8 +516,8 @@ def vis_dynamic_pred(camera_names, label_path, boxes_3d, scores_3d, labels_3d,
     labels_3d = np.asarray(labels_3d)
 
     keep = scores_3d >= score_thresh
-    if keep.sum() == 0:
-        return None,None
+    # if keep.sum() == 0:
+    #     return None,None
 
     boxes_keep = boxes_3d[keep]
     labels_keep = labels_3d[keep]

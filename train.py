@@ -232,12 +232,12 @@ def main():
                     # map_polylines 是 decode 出的结果，通常是 list 长度 B*T
                     map_polylines = outputs["map3d_out"]["map_polylines"]
                     poly = map_polylines[batchidx * seq_len + cur_idx]
-                    pred_labels = poly["labels"].cpu().numpy()
+                    pred_labels = poly["labels"].detach().cpu().numpy()
                     if poly["pts"].dim() == 3:
-                            pred_pts = poly["pts"].cpu().numpy()
+                            pred_pts = poly["pts"].detach().cpu().numpy()
                     else:
                         # (N, num_orders, num_pts, 2)，取 order=0
-                        pred_pts = poly["pts"][:, 0].cpu().numpy()
+                        pred_pts = poly["pts"][:, 0].detach().cpu().numpy()
 
                     pt_static_canvas,pt_static_images = vis_static_gt(
                                                             camera_names=camera_names,

@@ -18,7 +18,7 @@ configs = {
 
     "load_types": {  # 具体加载哪几种数据，加载不同的数据，会对应着不同的任务
         "dynamic": True,
-        "static": True,
+        "static": False,
         "dynamic_static": False,
         "e2e": False,
     },
