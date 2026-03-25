@@ -724,4 +724,3 @@ def build_map_head(
         bbox_coder_max_num=bbox_coder_max_num,
         **kwargs,
     )
-

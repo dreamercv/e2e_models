@@ -99,7 +99,7 @@ class SparseBox3DDecoder:
             box = self.decode_box(box)
             out_i = {
                 "boxes_3d": box.cpu(),
-                "scores_3d": scores.cpu(),
+                "scores_3d": scores.cpu(), # 分类的得分很小
                 "labels_3d": category_ids.cpu(),
             }
             if quality is not None:

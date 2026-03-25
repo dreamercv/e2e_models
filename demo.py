@@ -4,7 +4,7 @@ from pathlib import Path
 def generate_tree_with_contents(startpath, ignore_dirs=None, output_file=None):
     startpath = Path(startpath).resolve()
     if ignore_dirs is None:
-        ignore_dirs = {".vscode",".idea",'.git', '__pycache__', 'node_modules', 'venv', 'dist', 'build',"reference_code","clip_dataset","nuscenes_mini"}
+        ignore_dirs = {".vscode",".idea",'.git', '__pycache__', 'node_modules', 'venv', 'dist', 'build',"reference_code","clip_dataset","nuscenes_mini","e2e_dataset_10Hz"}
 
     # 收集所有 .py 文件路径
     py_files = []
@@ -24,7 +24,7 @@ def generate_tree_with_contents(startpath, ignore_dirs=None, output_file=None):
             elif item.suffix == '.py':
                 py_files.append(item)  # 记录 .py 文件
 
-    # 打印树形结构
+# 打印树形结构
     print(startpath.name + '/')
     _walk_tree(startpath)
 

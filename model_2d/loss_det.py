@@ -106,4 +106,3 @@ class CenterNetLoss(nn.Module):
             'offset_loss': loss_offset,
             'size_loss': loss_size
         }
-

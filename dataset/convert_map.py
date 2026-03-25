@@ -314,4 +314,3 @@ if __name__ == '__main__':
             os.system(f"cp {det_npy_path} {map_npy_path}")
             
         
-

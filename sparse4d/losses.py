@@ -276,6 +276,9 @@ class SparseBox3DLoss(nn.Module):
 
         reg_w = box.new_tensor(self.reg_weights[:ndim])
         w = w * reg_w  # (B, N, D)
+        sub_num = reg_w = box.new_tensor(self.reg_weights[:ndim])
+        sub_num[sub_num!=0] = 1
+        avg_factor *= sub_num.to(torch.int).sum()
 
         box_loss = self.loss_box(
             box,
@@ -323,4 +326,3 @@ class SparseBox3DLoss(nn.Module):
                 output[f"loss_yns{suffix}"] = yns_loss
 
         return output
-

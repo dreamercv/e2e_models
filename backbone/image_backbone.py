@@ -18,16 +18,20 @@ from torchvision.models import resnet18, resnet34
 class ImageBackboneResNetFPN(nn.Module):
     """ResNet + FPN，将 C1~C4 上采样到 32x96 并融合."""
 
-    def __init__(self, backbone: str = "resnet18", out_channels: int = 256, pretrained: bool = True):
+    def __init__(self, backbone: str = "resnet18", out_channels: int = 256, pretrained: bool = True,pretrain_path:str=None,device="cuda"):
         super().__init__()
         if backbone == "resnet18":
-            resnet = resnet18(pretrained=pretrained)
+            resnet = resnet18(pretrained=False)
             c1_channels, c2_channels, c3_channels, c4_channels = 64, 128, 256, 512
         elif backbone == "resnet34":
-            resnet = resnet34(pretrained=pretrained)
+            resnet = resnet34(pretrained=False)
             c1_channels, c2_channels, c3_channels, c4_channels = 64, 128, 256, 512
         else:
             raise ValueError(f"Unsupported backbone: {backbone}")
+            
+        if pretrained and os.path.exists(pretrain_path):
+            checkpoint = torch.load(pretrain_path, map_location=device)
+            resnet.load_state_dict(checkpoint, strict=True)
 
         # ResNet stem + stages
         self.conv1 = resnet.conv1
@@ -101,8 +105,8 @@ class ImageBackboneResNetFPN(nn.Module):
         x: (B, S, N, 3, 128, 384)
         返回: (B*S*N, out_channels, 32, 96)，和原 ImageBackBone 输出尺寸一致。
         """
-        B, S, N, C, H, W = x.shape
-        x = x.view(B * S * N, C, H, W)
+        # B, S, N, C, H, W = x.shape
+        # x = x.view(B * S * N, C, H, W)
         feat = self.forward_single(x)
         return feat  # (B*S*N, out_channels, 32, 96)
 

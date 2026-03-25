@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 from torch.utils.collect_env import run_and_return_first_line
 
-from backbone.image_backbone import ImageBackBone
+from backbone.image_backbone import ImageBackBone,ImageBackboneResNetFPN
 from model_2d.det2d_model import ModelDet2D
 from model_2d.seg2d_model import ModelSeg2D
 from backbone.bev_backbone import BEVBackbone
@@ -36,7 +36,14 @@ class Model(nn.Module):
         self.input_size = config["final_dim"]
         self.seq_len = config["seq_len"]
 
-        self.image_backbone = ImageBackBone(img_outchannels)
+        # self.image_backbone = ImageBackboneResNetFPN(
+        #     backbone=config.get("backbone","resnet18"),
+        #     out_channels=img_outchannels,
+        #     pretrain_path=config.get("backbone_path",None),
+        #     pretrained=False if config.get("pretrain",None) is not None else True,
+        #     device = config.get("device","cuda")
+        # )
+        self.image_backbone = ImageBackBone(out_channels=img_outchannels)
         self.det2d_head = ModelDet2D(out_channels=img_outchannels, det_class_num=config["det_2d_num"])
         self.map2d_head = ModelSeg2D(out_channels=img_outchannels, seg_class_num=config["map_2d_num"])
         self.bev_backbone = BEVBackbone(channels=img_outchannels,
@@ -150,6 +157,14 @@ class Model(nn.Module):
 
     def forward(self, x, rots, trans, intrins, distorts, post_rot, pos_tran, theta_mats, T_ego_his2curs=None, metas=None,decoder=False,task_names=[]):
         b, m, t, n, c, h, w = x.shape
+
+        # from dataset.dataset import denormalize_img
+        # import cv2
+        # import numpy as np
+        # a = denormalize_img(x[0,0,0,0])
+        # opencv_image = cv2.cvtColor(np.array(a), cv2.COLOR_RGB2BGR)
+
+
         x = rearrange(x, 'b m t n c h w -> (b m t n) c h w')
         rots = rearrange(rots, 'b m t n h w -> (b m) t n h w')
         trans = rearrange(trans, 'b m t n h w -> (b m) t n h w')

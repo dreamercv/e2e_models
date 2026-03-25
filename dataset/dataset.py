@@ -191,12 +191,37 @@ def get_rot(h):
         [-np.sin(h), np.cos(h)],
     ])
 
+class NormalizeInverse(torchvision.transforms.Normalize):
+    #  https://discuss.pytorch.org/t/simple-way-to-inverse-transform-normalization/4821/8
+    def __init__(self, mean, std):
+        mean = torch.as_tensor(mean)
+        std = torch.as_tensor(std)
+        std_inv = 1 / (std + 1e-7)
+        mean_inv = -mean * std_inv
+        super().__init__(mean=mean_inv, std=std_inv)
+
+    def __call__(self, tensor):
+        return super().__call__(tensor.clone())
+
+
+denormalize_img = torchvision.transforms.Compose((
+            NormalizeInverse(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+            torchvision.transforms.ToPILImage(),
+        ))
+
 normalize_img = torchvision.transforms.Compose((
                 torchvision.transforms.ToTensor(),
-                torchvision.transforms.GaussianBlur(kernel_size=(1,5), sigma=(0.1, 1)),  # 随机选择的高斯模糊模糊图像
-                torchvision.transforms.ColorJitter(brightness=(0.8,2), contrast=(0.8,2), saturation=(0.2,2), hue=(-0.2,0.2)),
+                # torchvision.transforms.GaussianBlur(kernel_size=(1,5), sigma=(0.1, 1)),  # 随机选择的高斯模糊模糊图像
+                # torchvision.transforms.ColorJitter(brightness=(0.8,2), contrast=(0.8,2), saturation=(0.2,2), hue=(-0.2,0.2)),
                 torchvision.transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
         ))
+
+# normalize_img = torchvision.transforms.Compose((
+#                 torchvision.transforms.ToTensor(),
+#                 torchvision.transforms.GaussianBlur(kernel_size=(1,5), sigma=(0.1, 1)),  # 随机选择的高斯模糊模糊图像
+#                 torchvision.transforms.ColorJitter(brightness=(0.8,2), contrast=(0.8,2), saturation=(0.2,2), hue=(-0.2,0.2)),
+#                 torchvision.transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+#         ))
 
 def img_transform(img,
                   resize, resize_dims, crop,
@@ -538,12 +563,16 @@ class Dataset(torch.utils.data.Dataset):
         }
 
     def is_occupy_sample(self,in_cameras):
-        is_no_occ = 0
-        for cam,anno2d in in_cameras.items():
-            if anno2d["occupy"].isdigit() and int(anno2d["occupy"]) < 2:
-                is_no_occ = 1
-            if is_no_occ==1:
-                break
+        occs = []
+        for  cam,anno2d in in_cameras.items():
+            if anno2d.get("occupy",None) is not None and  anno2d["occupy"].isdigit():
+                occs.append(anno2d["occupy"])
+        if "1" in occs or "2" in occs or "0" in occs:
+            is_no_occ = 1 # 正样本
+        elif "3" in occs:
+            is_no_occ = -1 # 全样本
+        else:
+            is_no_occ = 0 # 负样本
         return is_no_occ
 
         
@@ -558,6 +587,10 @@ class Dataset(torch.utils.data.Dataset):
             gt_bboxes_per_frame: list of length T，每元素 (N_t, 10)，解码格式 [x,y,z,w,l,h,yaw,vx,vy,vz]
             yaw 为弧度；无速度填 0。
         """
+        # pc_range（BEV 范围）
+        x_min, x_max = self.grid_conf["xbound"][0], self.grid_conf["xbound"][1]
+        y_min, y_max = self.grid_conf["ybound"][0], self.grid_conf["ybound"][1]
+
         gt_labels_per_frame = []
         gt_bboxes_per_frame = []
         gt_labels_per_frame_mask = []
@@ -588,10 +621,17 @@ class Dataset(torch.utils.data.Dataset):
                 if sub not in class_names:continue
                 #label_mask 全样本逻辑：比如遮挡多少比例不能作为正样本
                 label_mask = self.is_occupy_sample(obj.get("in_cameras",{}))
+                if label_mask == 0:   # 负样本，跳过
+                    continue
+                if label_mask == -1:  # 遮挡等级3，完全忽略
+                    continue
 
                 cls_id = class_names.index(sub)
+                # if label_mask == -1:
+                #     cls_id = -1 # 忽略标签
                 x = self.gt_value("x",pos,bboxes_mask,0)# float(pos.get("x", 0))
                 y = self.gt_value("y",pos,bboxes_mask,1)#float(pos.get("y", 0))
+                if x >= x_max or x <= x_min or y >= y_max or y <= y_min:continue # 过滤超出bev边界的
                 z = self.gt_value("z",pos,bboxes_mask,2)#float(pos.get("z", 0))
                 w = self.gt_value("width",dim,bboxes_mask,3)#float(dim.get("width", 0))
                 length = self.gt_value("length",dim,bboxes_mask,4)#float(dim.get("length", 0))
@@ -1036,6 +1076,7 @@ class Dataset(torch.utils.data.Dataset):
         # traj_obj_sub =  traj_obj[ci-1:ci+1][:,:3]
         # diff = (traj_obj_sub[-1] - traj_obj_sub[0] ) / dt
         # return diff[0],diff[1],diff[2]
+        bboxes_mask[idx:idx+3] = [0,0,0]
         return 0,0,0
 
     def dynamic_static_data(self,clip_name):

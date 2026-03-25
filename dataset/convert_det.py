@@ -459,5 +459,3 @@ if __name__ == '__main__':
     #     bev = draw_bev(bev=bev,trajs=ego_traj,color=(0,0,255))
     #     cv2.imwrite("bev.jpg",bev)
     #     print()
-
-

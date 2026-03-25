@@ -63,6 +63,7 @@ class Sparse4DHead(nn.Module):
         num_single_frame_decoder: int = 5,
         decouple_attn: bool = True,
         sampler=None,
+        denoise=None,
         decoder=None,
         loss_cls=None,
         loss_reg=None,
@@ -70,18 +71,23 @@ class Sparse4DHead(nn.Module):
         # 与数据层命名保持一致
         gt_cls_key: str = "gt_labels_det3D",
         gt_reg_key: str = "gt_bboxes_det3D",
+        gt_cls_key_mask : str ="gt_labels_det3D_mask",
+        gt_reg_key_mask: str ="gt_bboxes_det3D_mask",
         cls_threshold_to_reg: float = -1,
     ):
         super().__init__()
         self.instance_bank = instance_bank
         self.anchor_encoder = anchor_encoder
         self.sampler = sampler
+        self.denoise = denoise
         self.decoder = decoder
         self.loss_cls = loss_cls
         self.loss_reg = loss_reg
         self.reg_weights = reg_weights if reg_weights is not None else [1.0] * 11
         self.gt_cls_key = gt_cls_key
         self.gt_reg_key = gt_reg_key
+        self.gt_cls_key_mask = gt_cls_key_mask
+        self.gt_reg_key_mask = gt_reg_key_mask
         self.cls_threshold_to_reg = cls_threshold_to_reg
         self.num_single_frame_decoder = num_single_frame_decoder
         self.decouple_attn = decouple_attn
@@ -169,9 +175,9 @@ class Sparse4DHead(nn.Module):
         if metas is None:
             metas = {}
 
-        dn_metas = getattr(self.sampler, "dn_metas", None)
-        if dn_metas is not None and self.sampler.dn_metas["dn_anchor"].shape[0] != batch_size:
-            self.sampler.dn_metas = None
+        dn_metas = getattr(self.denoise, "dn_metas", None)
+        if dn_metas is not None and self.denoise.dn_metas["dn_anchor"].shape[0] != batch_size:
+            self.denoise.dn_metas = None
             dn_metas = None
 
         (
@@ -184,16 +190,19 @@ class Sparse4DHead(nn.Module):
 
         attn_mask = None
         dn_metas = None
-        num_free_instance = instance_feature.shape[1]
-        if self.training and self.sampler is not None and hasattr(self.sampler, "get_dn_anchors"):
+        num_free_instance = instance_feature.shape[1] # = num_anchor
+        if self.training and self.denoise is not None and hasattr(self.denoise, "get_dn_anchors"):
             gt_cls = metas.get(self.gt_cls_key)
             gt_reg = metas.get(self.gt_reg_key)
+            gt_reg_mask = metas.get(self.gt_reg_key_mask, None)
             gt_cls = self._flatten_gt_list(gt_cls)
             gt_reg = self._flatten_gt_list(gt_reg)
+            if gt_reg_mask is not None:
+                gt_reg_mask = self._flatten_gt_list(gt_reg_mask)
             if gt_cls is not None and gt_reg is not None:
-                dn_metas = self.sampler.get_dn_anchors(gt_cls, gt_reg, None)
+                dn_metas = self.denoise.get_dn_anchors(gt_cls, gt_reg, reg_masks=gt_reg_mask, gt_instance_id=None)
         if dn_metas is not None:
-            (dn_anchor, dn_reg_target, dn_cls_target, dn_attn_mask, valid_mask, dn_id_target) = dn_metas
+            (dn_anchor, dn_reg_target, dn_cls_target,dn_reg_mask, dn_attn_mask, valid_mask, dn_id_target) = dn_metas
             # 确保 DN 相关张量与 anchor / feature 在同一设备上（cuda / cpu 一致）
             device = anchor.device
             dn_anchor = dn_anchor.to(device)
@@ -203,7 +212,7 @@ class Sparse4DHead(nn.Module):
             valid_mask = valid_mask.to(device)
             if dn_id_target is not None:
                 dn_id_target = dn_id_target.to(device)
-            num_dn_anchor = dn_anchor.shape[1]
+            num_dn_anchor = dn_anchor.shape[1] # bs*t , 160 , 11
             # DN 由 get_dn_anchors(gt_cls, gt_reg) 生成，gt 为 list 长度为 B，故 dn_anchor 为 (B, num_dn, 11)；
             # 而 feature_maps 为 (B*T, C, H, W)，batch_size=B*T。需将 DN 沿 batch 扩成 (B*T, ...) 再与 anchor 拼接。
             dn_bs = dn_anchor.shape[0]
@@ -313,17 +322,18 @@ class Sparse4DHead(nn.Module):
     def prepare_for_dn_loss(self, model_outs, prefix=""):
         dn_valid_mask = model_outs[f"{prefix}dn_valid_mask"].flatten(end_dim=1)
         dn_cls_target = model_outs[f"{prefix}dn_cls_target"].flatten(end_dim=1)[dn_valid_mask]
-        dn_reg_target = model_outs[f"{prefix}dn_reg_target"].flatten(end_dim=1)[dn_valid_mask][
-            ..., : len(self.reg_weights)
-        ]
+        dn_reg_target = model_outs[f"{prefix}dn_reg_target"].flatten(end_dim=1)[dn_valid_mask][ ..., : len(self.reg_weights)]
+        dn_reg_mask = model_outs[f"{prefix}dn_reg_mask"].flatten(end_dim=1)[dn_valid_mask][..., :len(self.reg_weights)]
         dn_pos_mask = dn_cls_target >= 0
         dn_reg_target = dn_reg_target[dn_pos_mask]
+        dn_reg_mask = dn_reg_mask[dn_pos_mask]
         # reg_weights = dn_reg_target.new_tensor(self.reg_weights)[None].tile(dn_reg_target.shape[0], 1)
         reg_weights = dn_reg_target.new_ones(dn_reg_target.shape[0], len(self.reg_weights))
-        num_dn_pos = max(
-            self._reduce_mean(dn_valid_mask.to(dtype=dn_reg_target.dtype)).item(),
-            1.0,
-        )
+        # num_dn_pos = max(
+        #     self._reduce_mean(dn_valid_mask.to(dtype=dn_reg_target.dtype)).item(),
+        #     1.0,
+        # )
+        num_dn_pos = max(dn_valid_mask.sum(),1.0,)
         dn_quality_pos = None
         if f"{prefix}dn_quality" in model_outs:
             q_list = model_outs[f"{prefix}dn_quality"]
@@ -339,6 +349,7 @@ class Sparse4DHead(nn.Module):
             dn_cls_target,
             dn_reg_target,
             dn_pos_mask,
+            dn_reg_mask,
             reg_weights,
             num_dn_pos,
             dn_quality_pos,
@@ -353,9 +364,12 @@ class Sparse4DHead(nn.Module):
         output = {}
         gt_cls = data.get(self.gt_cls_key)
         gt_reg = data.get(self.gt_reg_key)
+        gt_reg_mask = data.get(self.gt_reg_key_mask, None)
         # data 层可能给的是 [batch][time] 的二级 list，这里先展平成长度 B*T 的一维 list
         gt_cls = self._flatten_gt_list(gt_cls)
         gt_reg = self._flatten_gt_list(gt_reg)
+        if gt_reg_mask is not None:
+            gt_reg_mask = self._flatten_gt_list(gt_reg_mask)
         # 预测为 (B*T, num_anchor, ...) 时，GT 通常为 list 长度 B，需按 T 扩展以与 sampler.sample 一致
         bs_pred = cls_scores[0].shape[0]
         if gt_cls is not None and gt_reg is not None and len(gt_cls) != bs_pred and bs_pred % len(gt_cls) == 0:
@@ -365,7 +379,7 @@ class Sparse4DHead(nn.Module):
         for decoder_idx, (cls, reg, qt) in enumerate(zip(cls_scores, reg_preds, quality)):
             reg = reg[..., : len(self.reg_weights)]
             cls_target, reg_target, reg_weights = self.sampler.sample(
-                cls, reg, gt_cls, gt_reg
+                cls, reg, gt_cls, gt_reg,reg_masks=gt_reg_mask
             )
             # 确保 label / reg target 与预测在同一 device 上
             device = cls.device
@@ -374,11 +388,12 @@ class Sparse4DHead(nn.Module):
             reg_weights = reg_weights.to(device)
             reg_target = reg_target[..., : len(self.reg_weights)]
             mask = torch.logical_not(torch.all(reg_target == 0, dim=-1))
-            num_pos = max(self._reduce_mean(torch.sum(mask).to(dtype=reg.dtype)), 1.0)
+            # num_pos = max(self._reduce_mean(torch.sum(mask).to(dtype=reg.dtype)), 1.0)
             if self.cls_threshold_to_reg > 0:
                 mask = torch.logical_and(
                     mask, cls.max(dim=-1).values.sigmoid() > self.cls_threshold_to_reg
                 )
+            num_pos = torch.sum(mask)
             cls_flat = cls.flatten(end_dim=1)
             cls_target_flat = cls_target.flatten(end_dim=1)
             cls_loss = self.loss_cls(cls_flat, cls_target_flat, avg_factor=num_pos)
@@ -416,6 +431,7 @@ class Sparse4DHead(nn.Module):
             dn_cls_target,
             dn_reg_target,
             dn_pos_mask,
+            dn_reg_mask,
             reg_weights,
             num_dn_pos,
             dn_quality_pos,
@@ -436,7 +452,7 @@ class Sparse4DHead(nn.Module):
                 reg.flatten(end_dim=1)[dn_valid_mask][dn_pos_mask],
                 dn_reg_target,
                 avg_factor=num_dn_pos,
-                weight=reg_weights,
+                weight=reg_weights* dn_reg_mask,
                 suffix=f"_dn_{decoder_idx}",
                 quality=qt_dn,
             )

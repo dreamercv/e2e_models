@@ -256,4 +256,3 @@ def visualize_detections(image, detections, class_names=None, score_thresh=0.3, 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
     
     return vis_image
-

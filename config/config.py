@@ -3,18 +3,26 @@ import os
 configs = {
 
     "device":"cpu",# cuda cpu
+    "lr":1e-3,
+    "max_grad_norm": 5,
+    "weight_decay":1e-4,
+
+    "pretrain":None,
+    "backbone":"resnet18",
+    "backbone_path":"../resnet18-f37072fd.pth",
 
 
     "is_train": True,
-    "batch_size": 1,
+    "batch_size": 2,
     "num_workers": 1,
     "epoch": 100,
     "seq_len": 5,
 
 
-    "log_dir": "../logs/only_dynamic",
-    "log_save_interval": 1000000,
+    "log_dir": "../logs/only_dynamic_0325_nodn_resnet18_demo",
+    "log_save_interval": 100,
     "log_print_interval": 1,
+    "ckpt_save_interval":100,
 
     "load_types": {  # 具体加载哪几种数据，加载不同的数据，会对应着不同的任务
         "dynamic": True,
@@ -33,7 +41,10 @@ configs = {
         "dynamic": ["/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/det.txt"],
         "static": ["/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/map.txt"],
 
-        # "dynamic": ["/workspace/afb5szh-01/models/e2e_model/e2e_dataset_10Hz_dyo.txt"],
+        # "dynamic": [
+        #     "/workspace/afb5szh-01/models/e2e_model/e2e_dataset_10Hz_dyo.txt",
+        #     "/workspace/afb5szh-01/models/e2e_model/e2e_dataset_10Hz_dyo_all.txt"
+        #     ],
         # "static": ["/workspace/afb5szh-01/models/e2e_model/e2e_dataset_10Hz_lane.txt"],
 
         "dynamic_static": [],
@@ -163,15 +174,15 @@ configs = {
         "num_single_frame_decoder": 1,
         "num_classes": 6,
         "bev_bounds": None,
-        "anchor_init": None,
+        "anchor_init": "../300clips_kmeans512_range_200.npy",
         "decouple_attn": True,
         "num_heads": 8,
         "dropout": 0.1,
         "feedforward_dims": 1024,
-        "use_dn": True,
-        "num_dn_groups": 10,
+        "use_dn": False,
+        "num_dn_groups": 5,
         "dn_noise_scale": 0.5,
-        "max_dn_gt": 32,
+        "max_dn_gt": 8,
         "add_neg_dn": True,
         "reg_weights": None,
         "use_decoder": True,

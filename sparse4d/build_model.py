@@ -99,18 +99,25 @@ def build_det3D_head(
     )
     operation_order = operation_order[2:]
 
-    sampler = None
+    denoise = None
     loss_cls = None
     loss_reg = None
     if use_dn:
-        sampler = DenoisingSampler(
+        denoise = DenoisingSampler(
             num_dn_groups=num_dn_groups,
             dn_noise_scale=dn_noise_scale,
             max_dn_gt=max_dn_gt,
             add_neg_dn=add_neg_dn,
             reg_weights=reg_weights,
         )
-    loss_cls = FocalLoss(alpha=0.25, gamma=2.0, ignore_index=num_classes)
+    sampler = DenoisingSampler(
+            num_dn_groups=num_dn_groups,
+            dn_noise_scale=dn_noise_scale,
+            max_dn_gt=max_dn_gt,
+            add_neg_dn=add_neg_dn,
+            reg_weights=reg_weights,
+        )
+    loss_cls = FocalLoss(alpha=0.25, gamma=2.0, ignore_index=-1)
     loss_reg = SparseBox3DLoss(reg_weights=reg_weights, loss_centerness=True, loss_yawness=True)
 
     decoder = None
@@ -132,6 +139,7 @@ def build_det3D_head(
         operation_order=operation_order,
         num_single_frame_decoder=num_single_frame_decoder,
         decouple_attn=decouple_attn,
+        denoise=denoise,
         sampler=sampler,
         decoder=decoder,
         loss_cls=loss_cls,
@@ -140,6 +148,8 @@ def build_det3D_head(
         # 与 dataset 真值命名保持一致
         gt_cls_key="gt_labels_det3D",
         gt_reg_key="gt_bboxes_det3D",
+        gt_cls_key_mask="gt_labels_det3D_mask",
+        gt_reg_key_mask="gt_bboxes_det3D_mask",
         cls_threshold_to_reg=0.05,
     )
     head.init_weights()
@@ -148,4 +158,3 @@ def build_det3D_head(
 
 if __name__ == '__main__':
     pass
-

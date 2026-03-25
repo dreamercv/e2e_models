@@ -10,7 +10,7 @@
 '''
 import os
 import sys
-
+import json
 import argparse
 
 
@@ -18,6 +18,7 @@ import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 from torch import nn
+from torch.optim import lr_scheduler
 
 from config.config import configs
 from dataset.dataset import build_dataloader
@@ -72,24 +73,38 @@ def main():
     # BN层多卡数据共享均值方差
     num_gpus = torch.cuda.device_count()
     
-    # print("num_gpus:",num_gpus)
-    if num_gpus > 1:
-        # model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
-        model.to(device)
-        model = nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True)
-    else:
-        model.to(device)
+    # # print("num_gpus:",num_gpus)
+    # if num_gpus > 1:
+    #     # model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
+    #     model.to(device)
+    #     model = nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True)
+    # else:
+    #     model.to(device)
 
-
+    path_checkpoint = configs.get("pretrain",None)
+    strict=False
+    if path_checkpoint is not None:
+        checkpoint = torch.load(path_checkpoint, map_location=device)  # 加载断
+        if "state_dict" not in checkpoint.keys():
+            model.load_state_dict(checkpoint, strict=False)
+        else:
+            try:
+                model.load_state_dict(checkpoint["state_dict"], strict=True)
+                strict = True
+            except:
+                model.load_state_dict(checkpoint["state_dict"], strict=False)
 
     # 配置参数
     epochs = configs["epoch"]
     load_types = configs["load_types"]
     types_names = sorted(list(load_types.keys()))
     # 优化器（可按需改成 AdamW 等）
-    lr = configs.get("lr", 1e-4)
+    lr = configs.get("lr", 1e-3)
     weight_decay = configs.get("weight_decay", 1e-4)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    max_grad_norm = configs.get("max_grad_norm", 5)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay,betas=(0.9,0.95))
+    
+
 
     active = []
     useful_type_names = []
@@ -102,23 +117,41 @@ def main():
     steps_per_epoch = max(len(dl) for _, dl, _ in active)
     print(f"steps_per_epoch: {steps_per_epoch}")
 
+    scheduler = lr_scheduler.CosineAnnealingLR(optimizer,T_max=steps_per_epoch*epochs,eta_min=0)
+
     iteration = -1
+    if  strict:      
+        optimizer.load_state_dict(checkpoint['optimizer'])  # 加载优化器参数
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(device)
+        scheduler.load_state_dict(checkpoint['lr_schedule'])  # 加载优化器参数
+        iteration = checkpoint['iteration'] + 1
+
+    
     log_print_interval = configs.get("log_print_interval", 10)
-    log_save_interval = configs.get("log_save_interval", 10)
+    log_save_interval = configs.get("log_save_interval", 100)
+    ckpt_save_interval = configs.get("ckpt_save_interval", 100)
     log_dir = os.path.join(os.path.dirname(script_path),configs["log_dir"])
     os.makedirs(log_dir,exist_ok=True)
     config_path = os.path.join(os.path.dirname(script_path),"config/config.py")
     os.system(f"cp {config_path} {log_dir}")
     writer = SummaryWriter(logdir=log_dir)
-
+    print(" ----------------------- config as : ----------------------- ")
+    print(json.dumps(configs,indent=4))
+    print(" ----------------------- start training : ----------------------- ")
+    model.train()
     for epoch in range(epochs):
-        model.train()
+        np.random.seed()
         for _, _, sp in active:
             if sp is not None and hasattr(sp, "set_epoch"):
                 sp.set_epoch(epoch)
         iters = [iter(dl) for _, dl, _ in active]
         
         for batch_idx in range(steps_per_epoch):
+            torch.cuda.empty_cache()
+
             batches = [] 
             for i, (type_name, dl, _) in enumerate(active):
                 try:
@@ -176,9 +209,33 @@ def main():
             if total_loss is None:
                 continue
 
-            optimizer.zero_grad()
+            # optimizer.zero_grad()
+            # total_loss.backward()
+            # optimizer.step()
+
             total_loss.backward()
+                
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+
+
+            if iteration % log_print_interval == 0:
+                print(f"Iteration [{iteration}] Epoch [{epoch+1}/{epochs}] Step [{batch_idx+1}/{steps_per_epoch}] "
+                      f"loss: {float(total_loss.detach().cpu()):.4f}")
+                writer.add_scalar('all_loss/loss', total_loss, iteration)
+                losses = outputs.get("losses", None)
+                if losses is not None:
+                    for k,v in losses.items():
+                        if k.startswith("det3d_"):
+                            if "dn" in k:
+                                writer.add_scalar(k.replace("det3d_","det3d/dn/"), v, iteration)
+                            else:
+                                writer.add_scalar(k.replace("det3d_","det3d/ori/"), v, iteration)
+                        elif k.startswith("map3d_"):
+                            writer.add_scalar(k.replace("map3d_","map3d/"), v, iteration)
+
 
             if iteration % log_save_interval == 0:
                 # 可视化真值
@@ -252,27 +309,21 @@ def main():
                         writer.add_image(f'static/pt/{k}', v, global_step=iteration, dataformats='HWC')
 
 
+            if iteration % ckpt_save_interval == 0:
+                model.eval()
+                torch.save(model.state_dict(), os.path.join(log_dir,f"iter{iteration}.pth"))
+                model.train()
 
-            if iteration % log_print_interval == 0:
-                print(f"Epoch [{epoch+1}/{epochs}] Step [{batch_idx+1}/{steps_per_epoch}] "
-                      f"loss: {float(total_loss.detach().cpu()):.4f}")
-                writer.add_scalar('all_loss/loss', total_loss, iteration)
-                losses = outputs.get("losses", None)
-                if losses is not None:
-                    for k,v in losses.items():
-                        if k.startswith("det3d_"):
-                            writer.add_scalar(k.replace("det3d_","det3d/"), v, iteration)
-                        elif k.startswith("map3d_"):
-                            writer.add_scalar(k.replace("map3d_","map3d/"), v, iteration)
-
-            # "x",              3, 2, 5, 8, 3, 128, 384
-            # "rots",           3, 2, 5, 8, 3, 3
-            # "trans",          3, 2, 5, 8, 3       --> 1*3
-            # "intrins",        3, 2, 5, 8, 3, 3
-            # "distorts",       3, 2, 5, 8, 8       --> 1*8
-            # "post_rots",      3, 2, 5, 8, 2, 2    --> 3*3
-            # "post_trans",     3, 2, 5, 8, 2       --> 1*3
-            # "theta_mats"      -    2, 3
+        model.eval()
+        checkpoint = {
+            "state_dict": model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            "epoch": epoch,
+            "iteration": iteration,
+            'lr_schedule': scheduler.state_dict()
+        }
+        torch.save(checkpoint, os.path.join(log_dir,f"iter{iteration}_epoch{epoch}.pth"))
+        model.train()
 # 
 
 
@@ -280,4 +331,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+    nn.MultiheadAttention
     # from mmdet.models.losses import GaussianFocalLoss, L1Loss, CrossEntropyLoss

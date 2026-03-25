@@ -623,4 +623,3 @@ def vis_static_gt(camera_names,label_path,labels,pts):
     # # cv2.imwrite("img.jpg",bev_img)
     # cv2.imwrite("canvas.jpg",canvas)
     return canvas,images
-

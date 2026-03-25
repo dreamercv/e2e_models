@@ -326,5 +326,3 @@ def build_sparse4d_bev_model(
             return det2d_out,seg2d_out,det_out, track_out, map_out
 
     return Sparse4DBEVModel(image_backbone,bev_backbone, det2d_head,seg2d_head,det_head, track_head, map_head, num_temporal_frames)
-
-
