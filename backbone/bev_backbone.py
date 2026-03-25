@@ -85,7 +85,7 @@ class Splat(nn.Module):
         points = points.view(B, N, Z, Y, X, 3).permute(0, 1, 2, 4, 3, 5)[..., :2]
 
         # # 可视化验证
-        # image_all_000 = feature.cpu().numpy()[0].transpose(1,2,0)
+        # image_all_000 = np.zeros((128,384,3))
         # alll = []
         # for i in range(6):
         #     pts  = points[0,0,i].reshape(-1, 2).cpu().numpy()

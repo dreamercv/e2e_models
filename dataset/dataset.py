@@ -1160,8 +1160,8 @@ class Dataset(torch.utils.data.Dataset):
                 anno_infos.update(self.get_anno_det2D(recs))
             if self.task_flags["det3D"]:
                 anno_infos.update(self.get_anno_det3D(recs,dt=dt))
-            if self.task_flags["obj_dynamic_traj"]:
-                anno_infos.update(self.get_anno_obj_dynamic_traj(recs,dt=dt))
+            # if self.task_flags["obj_dynamic_traj"]:
+            #     anno_infos.update(self.get_anno_obj_dynamic_traj(recs,dt=dt))
 
         if mode == "static" or mode == "dynamic_static":
             if self.task_flags["map2D"]:
