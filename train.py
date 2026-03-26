@@ -332,4 +332,4 @@ def main():
 if __name__ == "__main__":
     main()
     nn.MultiheadAttention
-    # from mmdet.models.losses import GaussianFocalLoss, L1Loss, CrossEntropyLoss
+    from mmdet.models.losses import GaussianFocalLoss, L1Loss, CrossEntropyLoss

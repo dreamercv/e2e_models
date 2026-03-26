@@ -15,7 +15,7 @@ from sparse4d.detection3d_blocks import (
     SparseBox3DKeyPointsGenerator,
 )
 from sparse4d.bev_aggregation import BEVFeatureAggregation
-from sparse4d.head import Sparse4DHead, MHAWrapper, SimpleFFN
+from sparse4d.head import Sparse4DHead, MHAWrapper, FFN
 # from model import build_sparse4d_bev_head, build_sparse4d_bev_model, build_track_head
 from sparse4d.track_head import TrackHead, track_affinity_loss, decode_track, align_anchors_to_frame
 
@@ -36,6 +36,6 @@ __all__ = [
     "SparseBox3DRefinementModule",
     "SparseBox3DKeyPointsGenerator",
     "MHAWrapper",
-    "SimpleFFN",
+    "FFN",
     "topk",
 ]

@@ -29,18 +29,19 @@ class MHAWrapper(nn.Module):
         return out
 
 
-class SimpleFFN(nn.Module):
+class FFN(nn.Module):
     """两层 Linear + ReLU + residual，与 AsymmetricFFN 简化版一致。"""
 
     def __init__(self, embed_dims=256, feedforward_dims=1024, dropout=0.0):
         super().__init__()
+        self.pre_norm = nn.LayerNorm(embed_dims)
         self.linear1 = nn.Linear(embed_dims, feedforward_dims)
         self.linear2 = nn.Linear(feedforward_dims, embed_dims)
         self.act = nn.ReLU(inplace=True)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        out = self.linear2(self.dropout(self.act(self.linear1(x))))
+        out = self.linear2(self.dropout(self.act(self.linear1(self.pre_norm(x)))))
         return x + self.dropout(out)
 
 
@@ -358,9 +359,9 @@ class Sparse4DHead(nn.Module):
     def loss(self, model_outs, data, feature_maps=None):
         if self.loss_cls is None or self.loss_reg is None or self.sampler is None:
             return {}
-        cls_scores = model_outs["classification"]
-        reg_preds = model_outs["prediction"]
-        quality = model_outs["quality"]
+        cls_scores = model_outs["classification"] # 2 * 10 * 100 * 6
+        reg_preds = model_outs["prediction"] #2*10*100*11
+        quality = model_outs["quality"]#2*10*100*2
         output = {}
         gt_cls = data.get(self.gt_cls_key)
         gt_reg = data.get(self.gt_reg_key)
@@ -369,7 +370,7 @@ class Sparse4DHead(nn.Module):
         gt_cls = self._flatten_gt_list(gt_cls)
         gt_reg = self._flatten_gt_list(gt_reg)
         if gt_reg_mask is not None:
-            gt_reg_mask = self._flatten_gt_list(gt_reg_mask)
+            gt_reg_mask = self._flatten_gt_list(gt_reg_mask) # b*t n 10
         # 预测为 (B*T, num_anchor, ...) 时，GT 通常为 list 长度 B，需按 T 扩展以与 sampler.sample 一致
         bs_pred = cls_scores[0].shape[0]
         if gt_cls is not None and gt_reg is not None and len(gt_cls) != bs_pred and bs_pred % len(gt_cls) == 0:

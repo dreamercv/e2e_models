@@ -2,7 +2,7 @@ import os
 
 configs = {
 
-    "device":"cpu",# cuda cpu
+    "device":"cuda",# cuda cpu
     "lr":1e-3,
     "max_grad_norm": 5,
     "weight_decay":1e-4,
@@ -19,7 +19,7 @@ configs = {
     "seq_len": 5,
 
 
-    "log_dir": "../logs/only_dynamic_0325_nodn_resnet18_demo",
+    "log_dir": "../logs/only_dynamic_0326_nodn_resnet18",
     "log_save_interval": 100,
     "log_print_interval": 1,
     "ckpt_save_interval":100,
@@ -38,14 +38,13 @@ configs = {
     },
 
     "clip_paths": {
-        "dynamic": ["/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/det.txt"],
-        "static": ["/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/map.txt"],
+        # "dynamic": ["/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/det.txt"],
+        # "static": ["/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/map.txt"],
 
-        # "dynamic": [
-        #     "/workspace/afb5szh-01/models/e2e_model/e2e_dataset_10Hz_dyo.txt",
-        #     "/workspace/afb5szh-01/models/e2e_model/e2e_dataset_10Hz_dyo_all.txt"
-        #     ],
-        # "static": ["/workspace/afb5szh-01/models/e2e_model/e2e_dataset_10Hz_lane.txt"],
+        "dynamic": [
+            "/workspace/afb5szh-01/models/e2e_model/e2e_dataset_10Hz_dyo_all.txt"
+            ],
+        "static": ["/workspace/afb5szh-01/models/e2e_model/e2e_dataset_10Hz_lane.txt"],
 
         "dynamic_static": [],
         "e2e": [],
@@ -70,7 +69,7 @@ configs = {
     "mode": "static",  # 默认加载动态数据
     
 
-    "train_clips": 2,  # -1 所有，[]指定几个，xxx.txt写进txt中指定的，>0前N个
+    "train_clips": 5,  # -1 所有，[]指定几个，xxx.txt写进txt中指定的，>0前N个
 
     "total_len": 20 + 1 + 50,  # 一共71帧，当前帧是第21帧，往前20帧，往后50帧 ，最后一帧索引对应着70 ，未来50帧为了获取真值
     "current_frame_index": 20,  # 0 1 2 3 4 5 ... [20] 21 22 23 ... 70
@@ -162,31 +161,30 @@ configs = {
     "input_names": ["x", "rots", "trans", "intrins", "distorts", "post_rots", "post_trans", "theta_mats"],
 
     # 模型相关
-    "img_outchannels": 8,
+    "img_outchannels": 256,
     # 2d
     "det_2d_num": 6,
     "map_2d_num": 3,
     # det3D
     "det_3d_head": {
-        "num_anchor": 20,
+        "num_anchor": 100,
         "embed_dims": 256,
-        "num_decoder": 2,
-        "num_single_frame_decoder": 1,
+        "num_decoder": 6,
+        "num_single_frame_decoder": 5,
         "num_classes": 6,
         "bev_bounds": None,
         "anchor_init": "../300clips_kmeans512_range_200.npy",
         "decouple_attn": True,
         "num_heads": 8,
         "dropout": 0.1,
-        "feedforward_dims": 1024,
         "use_dn": False,
         "num_dn_groups": 5,
         "dn_noise_scale": 0.5,
         "max_dn_gt": 8,
         "add_neg_dn": True,
-        "reg_weights": None,
+        "reg_weights": [1.0] * 3 + [1.0] * 3 + [1.0] * 2 + [0.]*3,
         "use_decoder": True,
-        "decoder_num_output": 300,
+        "decoder_num_output": 50,
         "decoder_score_threshold": None,
     },
     # tracking

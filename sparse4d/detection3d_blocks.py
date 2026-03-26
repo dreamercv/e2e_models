@@ -143,12 +143,12 @@ class SparseBox3DRefinementModule(nn.Module):
                 time_interval = instance_feature.new_tensor(time_interval)
             translation = output[..., VX:].transpose(0, -1)
             velocity = (translation / time_interval).transpose(0, -1)
-            output = output.clone()
+            # output = output.clone()
             output[..., VX:] = velocity + anchor[..., VX:]
 
         cls = self.cls_layers(instance_feature) if return_cls and self.with_cls_branch else None
         quality = self.quality_layers(feature) if return_cls and self.with_quality_estimation else None
-        return output, cls, quality
+        return output, cls, quality  # torch.Size([10, 100, 11]) torch.Size([10, 100, 6]) torch.Size([10, 100, 2])
 
 
 class SparseBox3DKeyPointsGenerator(nn.Module):

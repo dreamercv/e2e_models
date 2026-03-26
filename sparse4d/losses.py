@@ -276,9 +276,9 @@ class SparseBox3DLoss(nn.Module):
 
         reg_w = box.new_tensor(self.reg_weights[:ndim])
         w = w * reg_w  # (B, N, D)
-        sub_num = reg_w = box.new_tensor(self.reg_weights[:ndim])
-        sub_num[sub_num!=0] = 1
-        avg_factor *= sub_num.to(torch.int).sum()
+        # sub_num = reg_w = box.new_tensor(self.reg_weights[:ndim])
+        # sub_num[sub_num!=0] = 1
+        # avg_factor *= sub_num.to(torch.int).sum()
 
         box_loss = self.loss_box(
             box,
@@ -291,7 +291,7 @@ class SparseBox3DLoss(nn.Module):
         # 可选的 centerness / yawness
         if quality is not None and (self.loss_cns is not None or self.loss_yns is not None):
             cns = quality[..., CNS]
-            yns = quality[..., YNS].sigmoid()
+            yns = quality[..., YNS]#.sigmoid()
 
             # centerness target: 距离越近越大，exp(-||Δxyz||)
             if self.loss_cns is not None:

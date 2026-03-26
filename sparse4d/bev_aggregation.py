@@ -56,12 +56,12 @@ class BEVFeatureAggregation(nn.Module):
     def _key_points_to_bev_grid(self, key_points: torch.Tensor) -> torch.Tensor:
         bs, num_anchor, num_pts, _ = key_points.shape
         xy = key_points[..., :2]
-        xmin = self.bev_bounds[0, 0].item()
-        xmax = self.bev_bounds[0, 1].item()
-        ymin = self.bev_bounds[1, 0].item()
+        xmin = self.bev_bounds[0, 0].item() 
+        xmax = self.bev_bounds[0, 1].item() 
+        ymin = self.bev_bounds[1, 0].item() 
         ymax = self.bev_bounds[1, 1].item()
-        grid_x = (xy[..., 0] - xmin) / (xmax - xmin + 1e-6) * 2.0 - 1.0
-        grid_y = (xy[..., 1] - ymin) / (ymax - ymin + 1e-6) * 2.0 - 1.0
+        grid_x = (xy[..., 0] - xmin) / (xmax - xmin + 1e-6) * 2.0 - 1.0 # 转到图像坐标归一化
+        grid_y = (xy[..., 1] - ymin) / (ymax - ymin + 1e-6) * 2.0 - 1.0 # 转到图像坐标归一化
         grid = torch.stack([grid_y, grid_x], dim=-1)
         return grid.reshape(bs, num_anchor * num_pts, 2)
 
@@ -79,7 +79,7 @@ class BEVFeatureAggregation(nn.Module):
             key_points = self.kps_generator(anchor, instance_feature)
         else:
             key_points = anchor[..., [X, Y, Z]].unsqueeze(2)
-        bev_map = feature_maps[0]
+        bev_map = feature_maps[0]# 10 256 200 80
         if bev_map.dim() != 4:
             bev_map = bev_map.flatten(end_dim=1)
         grid = self._key_points_to_bev_grid(key_points)

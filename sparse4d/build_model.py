@@ -18,7 +18,7 @@ from sparse4d.detection3d_blocks import (
     SparseBox3DKeyPointsGenerator
 )
 from sparse4d.bev_aggregation import BEVFeatureAggregation
-from sparse4d.head import Sparse4DHead, MHAWrapper, SimpleFFN
+from sparse4d.head import Sparse4DHead, MHAWrapper, FFN
 from sparse4d.dn_sampler import DenoisingSampler
 
 from sparse4d.decoder import SparseBox3DDecoder
@@ -36,7 +36,6 @@ def build_det3D_head(
         decouple_attn: bool = True,
         num_heads: int = 8,
         dropout: float = 0.1,
-        feedforward_dims: int = 1024,
         use_dn: bool = True,
         num_dn_groups: int = 10,
         dn_noise_scale: float = 0.5,
@@ -50,8 +49,6 @@ def build_det3D_head(
     """从 model.py 拷贝的 Sparse4D BEV head 构建函数，用于测试。"""
     if anchor_init is None:
         anchor_init = np.zeros((num_anchor, 11), dtype=np.float32)
-    if reg_weights is None:
-        reg_weights = [2.0] * 3 + [0.5] * 3 + [0.0] * 5
 
     instance_bank = InstanceBank(
         num_anchor=num_anchor,
@@ -75,7 +72,7 @@ def build_det3D_head(
     gnn_dim = embed_dims * 2 if decouple_attn else embed_dims
     graph_model = MHAWrapper(gnn_dim, num_heads, dropout=dropout, batch_first=True)
     norm_layer = nn.LayerNorm(embed_dims)
-    ffn = SimpleFFN(embed_dims, feedforward_dims, dropout=dropout)
+    ffn = FFN(embed_dims, embed_dims*4, dropout=dropout)
     kps = SparseBox3DKeyPointsGenerator(embed_dims=embed_dims, num_learnable_pts=0, fix_scale=((0.0, 0.0, 0.0),))
     bev_agg = BEVFeatureAggregation(
         embed_dims=embed_dims,

@@ -98,16 +98,16 @@ class DenoisingSampler(nn.Module):
             diff = torch.abs(box_pred[i, :, None] - box_target[i][None])  # (num_pred, M, D)
             static_w = instance_reg_weights[i][None]                     # (1, M, D)
             if reg_masks is not None:
-                dynamic_w = reg_masks[i][None]                           # (1, M, D)
+                dynamic_w = reg_masks[i][None]                            # (1, M, D)
             else:
                 dynamic_w = torch.ones_like(static_w)
-            weight = static_w * dynamic_w
+            weight = static_w * dynamic_w * box_pred.new_tensor(self.reg_weights)
             cost_i = torch.sum(diff * weight, dim=-1) * self.box_weight
             cost.append(cost_i)
         return cost
 
     # def _box_cost(self, box_pred, box_target, reg_weights):
-    #     """
+    #     """fv
     #     L1 cost with reg_weights. 与官方 target.py 一致。
     #     box_target: list of (N_i, D)（sample 用）或 3D tensor (bs, num_gt, D)（get_dn_anchors 用）。
     #     统一按最后一维 D = min(pred_dim, tgt_dim) 切片，避免 10/11 混用报错。
@@ -148,12 +148,12 @@ class DenoisingSampler(nn.Module):
         Returns: output_cls_target (bs, num_pred), output_box_target (bs, num_pred, 11), output_reg_weights (bs, num_pred, 11)
         """
         bs, num_pred, num_cls = cls_pred.shape
-        box_target_encoded,reg_masks  = self.encode_reg_target(box_target,reg_masks, cls_pred.device)
+        box_target_encoded,reg_masks  = self.encode_reg_target(box_target,reg_masks, cls_pred.device) # bs * torch.Size([100, 16])
         cls_cost = self._cls_cost(cls_pred, cls_target)
         reg_weights = [
             torch.logical_not(bt.isnan()).to(dtype=bt.dtype) for bt in box_target_encoded
-        ]
-        box_cost = self._box_cost(box_pred, box_target_encoded, reg_weights,reg_masks)
+        ] 
+        box_cost = self._box_cost(box_pred, box_target_encoded, reg_weights,reg_masks)# bs * torch.Size([100, 16])
 
         indices = []
         for i in range(bs):
@@ -168,13 +168,13 @@ class DenoisingSampler(nn.Module):
             else:
                 indices.append((None, None))
 
-        output_cls_target = cls_target[0].new_ones(bs, num_pred, dtype=torch.long) * num_cls
-        output_box_target = box_pred.new_zeros(box_pred.shape)
+        output_cls_target = cls_target[0].new_ones(bs, num_pred, dtype=torch.long) * -1 # torch.Size([10, 100]) -- 6
+        output_box_target = box_pred.new_zeros(box_pred.shape)# torch.Size([10, 100, 11])
         output_reg_weights = box_pred.new_zeros(box_pred.shape)
-        for i, (pred_idx, target_idx) in enumerate(indices):
+        for i, (pred_idx, target_idx) in enumerate(indices): # bs = 10
             if pred_idx is None or len(cls_target[i]) == 0:
                 continue
-            output_cls_target[i, pred_idx] = cls_target[i][target_idx]
+            output_cls_target[i, pred_idx] = cls_target[i][target_idx] # 100ge 位置除了指定的位置其他值为6
             output_box_target[i, pred_idx] = box_target_encoded[i][target_idx]
             static_weight = reg_weights[i][target_idx]
             if reg_masks is not None:
