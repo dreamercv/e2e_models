@@ -28,7 +28,7 @@ class FocalLoss(nn.Module):
     """
     多类 Focal Loss，接口对齐 mmdet:
     - pred: (N, C) logits
-    - target: (N,) long，类别 id，ignore_index 表示忽略
+    - target: (N,) long，类别 id；负值(除 ignore_index)表示背景
     - avg_factor: 用于归一化
     """
 
@@ -47,16 +47,19 @@ class FocalLoss(nn.Module):
 
     def forward(self, pred, target, avg_factor=None):
         # pred: (N, C), target: (N,)
-        valid = (target >= 0) & (target != self.ignore_index)
+        # keep background negatives (target < 0) for dense cls supervision.
+        valid = target != self.ignore_index
         if valid.sum() == 0:
             return pred.new_tensor(0.0)
 
         pred = pred[valid]  # (N', C)
         target = target[valid]  # (N',)
         num_cls = pred.shape[-1]
-        target = target.clamp(0, num_cls - 1)
-
-        target_one_hot = F.one_hot(target, num_cls).float()  # (N', C)
+        target_one_hot = pred.new_zeros(pred.shape)  # (N', C)
+        pos_mask = target >= 0
+        if pos_mask.any():
+            pos_target = target[pos_mask].clamp(0, num_cls - 1)
+            target_one_hot[pos_mask] = F.one_hot(pos_target, num_cls).float()
         pred_sigmoid = pred.sigmoid()
 
         # p_t

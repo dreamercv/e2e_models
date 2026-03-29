@@ -44,13 +44,12 @@ class DenoisingSampler(nn.Module):
         self.gamma = gamma
         self.eps = eps
 
-    def encode_reg_target(self, box_target,reg_masks, device=None):
+    def encode_reg_target(self, box_target, reg_masks, device=None):
         """将 GT 框 (x,y,z,w,l,h,yaw,vx,vy,vz) 编码为 11 维：(x,y,z,log(w),log(l),log(h),sin(yaw),cos(yaw),vx,vy,vz)。"""
         state_dims = 11
         outputs = []
         outputs_mask = []
-        for i, box in enumerate(box_target) :
-            reg_mask = reg_masks[i]
+        for i, box in enumerate(box_target):
             xyz = box[..., :3]
             whl = box[..., 3:6].clamp(min=1e-4).log()
             yaw = box[..., 6]
@@ -58,13 +57,26 @@ class DenoisingSampler(nn.Module):
             cos_yaw = torch.cos(yaw).unsqueeze(-1)
             vel = box[..., 7:10] if box.shape[-1] >= 10 else box.new_zeros(*box.shape[:-1], 3)
             out = torch.cat([xyz, whl, sin_yaw, cos_yaw, vel], dim=-1)
-            mask = torch.cat([reg_mask[..., :3], reg_mask[..., 3:6], reg_mask[..., 6:7], reg_mask[..., 6:7], reg_mask[..., 7:10]], dim=-1)
+            if reg_masks is not None:
+                reg_mask = reg_masks[i]
+                mask = torch.cat(
+                    [
+                        reg_mask[..., :3],
+                        reg_mask[..., 3:6],
+                        reg_mask[..., 6:7],
+                        reg_mask[..., 6:7],
+                        reg_mask[..., 7:10],
+                    ],
+                    dim=-1,
+                )
+            else:
+                mask = torch.ones_like(out)
             if device is not None:
                 out = out.to(device=device)
                 mask = mask.to(device=device)
             outputs.append(out)
             outputs_mask.append(mask)
-        return outputs,outputs_mask
+        return outputs, outputs_mask
 
     def _cls_cost(self, cls_pred, cls_target):
         """Focal-style cost: pos_cost - neg_cost per class."""
@@ -198,6 +210,8 @@ class DenoisingSampler(nn.Module):
         if self.max_dn_gt > 0:
             cls_target = [x[: self.max_dn_gt] for x in cls_target]
             box_target = [x[: self.max_dn_gt] for x in box_target]
+            if reg_masks is not None:
+                reg_masks = [x[: self.max_dn_gt] for x in reg_masks]
             if gt_instance_id is not None:
                 gt_instance_id = [x[: self.max_dn_gt] for x in gt_instance_id]
 
@@ -209,7 +223,18 @@ class DenoisingSampler(nn.Module):
             F.pad(x, (0, max_dn_gt - x.shape[0]), value=-1)
             for x in cls_target
         ])
-        box_target,reg_masks = self.encode_reg_target(box_target,reg_masks, cls_target.device)
+        box_target, reg_masks = self.encode_reg_target(
+            box_target, reg_masks, cls_target.device
+        )
+        if reg_masks is not None:
+            reg_masks = [
+                F.pad(
+                    m,
+                    (0, 0, 0, max(0, max_dn_gt - m.shape[0])),
+                    value=0.0,
+                )
+                for m in reg_masks
+            ]
         state_dims = 11
         box_target = [
             F.pad(x, (0, max(0, state_dims - x.shape[-1])), value=0) if x.numel() > 0 else x.new_zeros(0, state_dims)
@@ -236,6 +261,7 @@ class DenoisingSampler(nn.Module):
             ])
 
         bs, num_gt, _ = box_target.shape
+        dn_reg_batch_bs = bs
         if self.num_dn_groups > 1:
             cls_target = cls_target.repeat(self.num_dn_groups, 1) # 20*8 --> 200*8
             box_target = box_target.repeat(self.num_dn_groups, 1, 1) # 20*8*11 --> 200*8*11
@@ -256,6 +282,9 @@ class DenoisingSampler(nn.Module):
             box_target = torch.cat([box_target, box_target], dim=1)
             if gt_instance_id is not None:
                 gt_instance_id = torch.cat([gt_instance_id, gt_instance_id], dim=1)
+
+        if reg_masks is not None and self.add_neg_dn:
+            reg_masks = [torch.cat([m, m], dim=0) for m in reg_masks]
 
         # 与官方一致：dn_anchor 与 box_target 同形，直接传 3D tensor 给 _box_cost
         D = max(dn_anchor.shape[-1], box_target.shape[-1], state_dims)
@@ -292,7 +321,8 @@ class DenoisingSampler(nn.Module):
             if gt_instance_id is not None:
                 dn_id_target[i, anchor_idx] = gt_instance_id[i, gt_idx]
             if reg_masks is not None:
-                dn_reg_mask[i, anchor_idx] = reg_masks[i][gt_idx]
+                bi = i % dn_reg_batch_bs
+                dn_reg_mask[i, anchor_idx] = reg_masks[bi][gt_idx]
 
         dn_anchor = dn_anchor.reshape(
             self.num_dn_groups, bs, num_gt, state_dims

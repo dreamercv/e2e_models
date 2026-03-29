@@ -37,6 +37,13 @@ from tensorboardX import SummaryWriter
 
 
 from collections.abc import Mapping, Sequence
+import logging
+import time
+
+# 创建日志目录
+# log_dir = configs["log_dir"]
+# os.makedirs(log_dir, exist_ok=True)
+
 
 def recursive_to_device(data, device):
     """
@@ -104,7 +111,20 @@ def main():
     max_grad_norm = configs.get("max_grad_norm", 5)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay,betas=(0.9,0.95))
     
+    log_dir = os.path.join(os.path.dirname(script_path),configs["log_dir"])
+    os.makedirs(log_dir,exist_ok=True)
+    # 日志文件名（带时间戳）
+    log_file = os.path.join(log_dir, f"train_{time.strftime('%Y%m%d_%H%M%S')}.log")
 
+    # 配置 logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),  # 输出到文件
+            logging.StreamHandler()         # 输出到控制台
+        ]
+    )
 
     active = []
     useful_type_names = []
@@ -115,7 +135,7 @@ def main():
             useful_type_names.append(type_name)
         
     steps_per_epoch = max(len(dl) for _, dl, _ in active)
-    print(f"steps_per_epoch: {steps_per_epoch}")
+    logging.info(f"steps_per_epoch: {steps_per_epoch}")
 
     scheduler = lr_scheduler.CosineAnnealingLR(optimizer,T_max=steps_per_epoch*epochs,eta_min=0)
 
@@ -133,14 +153,12 @@ def main():
     log_print_interval = configs.get("log_print_interval", 10)
     log_save_interval = configs.get("log_save_interval", 100)
     ckpt_save_interval = configs.get("ckpt_save_interval", 100)
-    log_dir = os.path.join(os.path.dirname(script_path),configs["log_dir"])
-    os.makedirs(log_dir,exist_ok=True)
+    
     config_path = os.path.join(os.path.dirname(script_path),"config/config.py")
     os.system(f"cp {config_path} {log_dir}")
     writer = SummaryWriter(logdir=log_dir)
-    print(" ----------------------- config as : ----------------------- ")
-    print(json.dumps(configs,indent=4))
-    print(" ----------------------- start training : ----------------------- ")
+    
+    logging.info("Config:\n"+json.dumps(configs,indent=4))
     model.train()
     for epoch in range(epochs):
         np.random.seed()
@@ -153,6 +171,7 @@ def main():
             torch.cuda.empty_cache()
 
             batches = [] 
+            type_names = []
             for i, (type_name, dl, _) in enumerate(active):
                 try:
                     batch = next(iters[i])
@@ -160,6 +179,7 @@ def main():
                     iters[i] = iter(dl)
                     batch = next(iters[i])
                 batches.append((type_name, batch))
+                type_names.append(type_name)
             inputs_tensor = {} # bs, M, T, 8, 3, 128, 384
             gts_values = {}
             gt_names = configs["gt_names"]
@@ -186,15 +206,15 @@ def main():
                     inputs_tensor[k] = v.to(device)
 
             # 组装 metas（把 dynamic / static 的真值合并）
-            metas = recursive_to_device(gts_values,device)
+            metas = recursive_to_device(gts_values,device) #metas["dynamic"]["gt_labels_det3D"] =  list(2, 5, n*d)
 
 
             
             iteration += 1
             outputs = model(
-                inputs_tensor["x"],
+                inputs_tensor["x"],     # torch.Size([2, 1, 5, 8, 3, 128, 384])
                 inputs_tensor["rots"],
-                inputs_tensor["trans"],
+                inputs_tensor["trans"], # torch.Size([2, 1, 5, 8, 1, 3])
                 inputs_tensor["intrins"],
                 inputs_tensor["distorts"],
                 inputs_tensor["post_rots"],
@@ -204,6 +224,9 @@ def main():
                 decoder= True if iteration % log_save_interval == 0 else False,
                 task_names=useful_type_names
             )
+
+            
+
 
             total_loss = outputs.get("total_loss", None)
             if total_loss is None:
@@ -220,10 +243,15 @@ def main():
             scheduler.step()
             optimizer.zero_grad()
 
+            
+
 
             if iteration % log_print_interval == 0:
-                print(f"Iteration [{iteration}] Epoch [{epoch+1}/{epochs}] Step [{batch_idx+1}/{steps_per_epoch}] "
+                writer.add_scalar('epoch', epoch, iteration)
+
+                logging.info(f"Iteration [{iteration}] Epoch [{epoch+1}/{epochs}] Step [{batch_idx+1}/{steps_per_epoch}] "
                       f"loss: {float(total_loss.detach().cpu()):.4f}")
+                message = "/t"
                 writer.add_scalar('all_loss/loss', total_loss, iteration)
                 losses = outputs.get("losses", None)
                 if losses is not None:
@@ -235,13 +263,29 @@ def main():
                                 writer.add_scalar(k.replace("det3d_","det3d/ori/"), v, iteration)
                         elif k.startswith("map3d_"):
                             writer.add_scalar(k.replace("map3d_","map3d/"), v, iteration)
+                        message += f"{k}:{float(v.detach().cpu()):.4f}; "
+                logging.info(message)
 
 
             if iteration % log_save_interval == 0:
                 # 可视化真值
                 seq_len = configs["seq_len"]
                 batchidx  = configs["batch_size"]-1
+
                 cur_idx = seq_len-1
+
+                from dataset.dataset import denormalize_img
+                import cv2
+                imgs = inputs_tensor["x"][batchidx,:,cur_idx]
+                for j, type_name in enumerate(type_names):
+                    for i, img in enumerate(imgs[j]) :
+                        img_np =  denormalize_img(img)
+                        img_cv = cv2.cvtColor(np.array(img_np), cv2.COLOR_RGB2BGR)
+                        cv2.imwrite(f"{j}_{i}.jpg", img_cv)
+                        writer.add_image(f'{type_name}/input_img/{i}', img_cv, global_step=iteration, dataformats='HWC')
+
+
+
                 camera_names = configs["camera_names"]
                 if "dynamic" in metas.keys():
                     meta = metas["dynamic"]

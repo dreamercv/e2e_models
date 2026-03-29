@@ -18,6 +18,7 @@ from scipy.spatial.transform import Rotation as R
 import colorsys
 import torch.nn.functional as F
 import torch
+from einops import rearrange
 
 from torch import nn
 
@@ -30,10 +31,11 @@ def gen_dx_bx(xbound, ybound, zbound):
 
 
 class Splat(nn.Module):
-    def __init__(self, grid_conf, input_size=(128, 384)):
+    def __init__(self, grid_conf, input_size=(128, 384),dowmsampe=4.):
         super(Splat, self).__init__()
         self.input_size = input_size
         self.grid_conf = grid_conf
+        self.dowmsampe = dowmsampe
 
         dx, bx, nx = gen_dx_bx(self.grid_conf['xbound'], self.grid_conf['ybound'], self.grid_conf['zbound'])
         self.dx = nn.Parameter(dx, requires_grad=False)
@@ -54,11 +56,11 @@ class Splat(nn.Module):
         voxels = torch.stack((xs, ys, zs), -1)
         return nn.Parameter(voxels, requires_grad=False)
 
-    def bev2eachroi(self, points, rots, trans, intrins, distorts, post_rots, post_trans):
+    def bev2eachroi(self, points, rots, trans, intrins, distorts, post_rots, post_trans): #torch.Size([80, 256, 32, 96])
         B, N, _, _ = rots.shape  # [bs*sq,roi,3,3]
         Z, Y, X, _ = points.shape
         P = Z * Y * X
-        points = points.view(1, 1, Z * Y * X, 3).expand(B, N, P, 3).clone()
+        points = points.view(1, 1, Z * Y * X, 3).expand(B, N, P, 3).clone() # 10 8 96000 3
 
         points = rots.view(B, N, 1, 3, 3).matmul(points.unsqueeze(-1)).squeeze(-1)
         points = points + trans.view(B, N, 1, 3)
@@ -99,7 +101,7 @@ class Splat(nn.Module):
         #     alll.append(image_all)
         # cv2.imwrite("local_map.jpg", np.concatenate(alll,0))
 
-        features_shape = torch.Tensor([self.input_size[0], self.input_size[1]]).to(points.device)
+        features_shape = torch.Tensor([self.input_size[0], self.input_size[1]] ).to(points.device) / self.dowmsampe 
         points = self.normalize_coords(coords=points, shape=features_shape)
         depths = depths.view(B, N, Z, Y, X, 1).permute(0, 1, 2, 5, 4, 3).squeeze().view(B * N, Z, X, Y)
         points = points.view(B * N * Z, X, Y, 2)
@@ -119,7 +121,7 @@ class Splat(nn.Module):
         r = torch.sqrt(torch.sum(proj_points[..., :2] ** 2, dim=-1, keepdim=True)).squeeze(-1)
         k1, k2, p1, p2, k3, k4, k5, k6 = dist_coeffs.unbind(-1)  # 
         t = torch.atan2(r, torch.ones_like(r))
-        radial = t * (1 + k1 * t ** 2 + k2 * t ** 4 + k3 * t ** 6 + k4 * t ** 8) / r  # torch.Size([5, 1, 76800])
+        radial = t * (1 + k1 * t ** 2 + k2 * t ** 4 + k3 * t ** 6 + k4 * t ** 8) / (r + 1e-6)  # torch.Size([5, 1, 76800])
 
         proj_points[..., 0] = proj_points[..., 0] * radial
         proj_points[..., 1] = proj_points[..., 1] * radial
@@ -148,16 +150,65 @@ class Splat(nn.Module):
 
 
 
+def _fisheye_radial(r, k1, k2, k3, k4, eps=1e-6):
+    """与 Splat.projectPoints_fisheye 中 radial 一致: r 为 sqrt(x_n^2+y_n^2)。"""
+    t = torch.atan2(r, torch.ones_like(r))
+    return t * (1 + k1 * t ** 2 + k2 * t ** 4 + k3 * t ** 6 + k4 * t ** 8) / (r + eps)
+
+
+def _pixels_to_cam_dirs_fisheye(uv1, intrin_inv, dist, eps=1e-6):
+    """
+    增强后像素齐次坐标 -> 相机系单位方向（前向 +Z），与 projectPoints_fisheye 互逆。
+    uv1: (..., 3), intrin_inv: (..., 3, 3), dist: (..., 8)
+    """
+    q = torch.matmul(intrin_inv, uv1.unsqueeze(-1)).squeeze(-1)
+    a, b, w = q[..., 0], q[..., 1], q[..., 2]
+    a = a / (w + eps)
+    b = b / (w + eps)
+    s = torch.sqrt(a * a + b * b + eps)
+
+    k1, k2, _, _, k3, k4, _, _ = dist.unbind(-1)
+    lo = torch.zeros_like(s)
+    hi = torch.full_like(s, 2.0)
+    for _ in range(24):
+        mid = (lo + hi) * 0.5
+        g = _fisheye_radial(mid, k1, k2, k3, k4, eps=eps)
+        f = mid * g - s
+        hi = torch.where(f > 0, mid, hi)
+        lo = torch.where(f <= 0, mid, lo)
+    r = (lo + hi) * 0.5
+    g = _fisheye_radial(r, k1, k2, k3, k4, eps=eps)
+    xn = a / (g + eps)
+    yn = b / (g + eps)
+    d = torch.stack([xn, yn, torch.ones_like(xn)], dim=-1)
+    return torch.nn.functional.normalize(d, dim=-1, eps=eps)
+
+
 class BEVBackbone(nn.Module):
-    def __init__(self, channels=256,grid_conf=None, input_size=(128, 384),num_temporal=7,num_cams = 6):
+    def __init__(
+        self,
+        channels=256,
+        grid_conf=None,
+        input_size=(128, 384),
+        num_temporal=7,
+        num_cams=6,
+        use_cam_pos_embed=True,
+        cam_pos_L=4,
+    ):
         super(BEVBackbone, self).__init__()
         self.num_temporal = num_temporal
         self.grid_conf = grid_conf
         self.input_size = input_size
+        self.use_cam_pos_embed = use_cam_pos_embed
+        self.cam_pos_L = cam_pos_L
+        self.cam_pos_ch = (4 * cam_pos_L) if use_cam_pos_embed else 0
+        self.feat_channels = channels + self.cam_pos_ch
+
         self.splat = Splat(grid_conf, input_size)
         self.points = self.splat.create_voxels()
-        ground_points = self.points[2]
-        self.bev_emb = self.positional_encoding(ground_points[...,:2],4).permute(2,1,0)
+        ground_points = self.points[2,...,:2].permute(1,0,2)
+        bev_emb = self.positional_encoding(ground_points[...,:2],4)
+        self.bev_emb = rearrange(bev_emb, 'h w c -> c h w')
         self.height = self.points.shape[0]
         self.num_cams = num_cams
         # self.bev_backbone = nn.Sequential(
@@ -167,7 +218,13 @@ class BEVBackbone(nn.Module):
         #     nn.MaxPool2d(2, 2)
         # )
         self.fusion_height = nn.Sequential(
-            nn.Conv2d(channels * self.height+self.bev_emb.shape[0], channels*3, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(
+                self.feat_channels * self.height + self.bev_emb.shape[0],
+                channels * 3,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+            ),
             nn.BatchNorm2d(channels*3),
             nn.ReLU(inplace=True),
             nn.Conv2d(channels*3, channels, kernel_size=3, stride=1, padding=1),
@@ -189,6 +246,7 @@ class BEVBackbone(nn.Module):
             nn.ReLU(inplace=True)
         )
         # nn.Conv2d(channels * 2, channels, kernel_size=3, stride=1, padding=1)
+        self.debug_grid_projection = bool(int(os.environ.get("BEV_DEBUG_GRID", "0")))
 
     def forward(self, x, rots, trans, intrins, distorts, post_rot3, post_tran3, theta_mats):
 
@@ -208,15 +266,70 @@ class BEVBackbone(nn.Module):
         post_tran3 = post_tran3.flatten(0, 1)
         # points1 = torch.tensor(points1).view(seq_len * 3, 32, 96, 3).unsqueeze(1).unsqueeze(-1)
         # x = self.bev_backbone(x)
-        points = self.points.to(x.device) 
+        if self.use_cam_pos_embed:
+            ogfH, ogfW = int(self.input_size[0]), int(self.input_size[1])
+            ds = float(self.splat.dowmsampe)
+            fH, fW = int(round(ogfH / ds)), int(round(ogfW / ds))
+            if x.shape[-2] != fH or x.shape[-1] != fW:
+                raise ValueError(
+                    f"cam_pos_embed: x spatial {x.shape[-2:]} != expected ({fH}, {fW}) "
+                    f"from input_size={self.input_size} / dowmsampe={ds}"
+                )
+            cam_emb = self.get_cam_pos_embedding(
+                intrins,
+                post_rot3,
+                post_tran3,
+                distorts,
+                rots,
+                self.cam_pos_L,
+                num_flat=x.shape[0],
+            ).to(device=x.device, dtype=x.dtype)
+            # x: (B*S*N, C, fH, fW), cam_emb: same batch layout
+            x = torch.cat([x, cam_emb], dim=1)
+
+        points = self.points.to(x.device)  # points[2,40,80] 表示z围为0（地面）ego所在的位置
         bev_emb = self.bev_emb.to(x.device)
         grid = self.splat.bev2eachroi(points, rots.to(points.dtype), trans.to(points.dtype), intrins.to(points.dtype),
                                       distorts.to(points.dtype), post_rot3.to(points.dtype),
-                                      post_tran3.to(points.dtype)).to(x.dtype)
+                                      post_tran3.to(points.dtype)).to(x.dtype) # points.view(B * N * Z, X, Y, 2) torch.Size([480, 200, 80, 2]) 2*5*8*6 
+        if self.debug_grid_projection:
+            with torch.no_grad():
+                # grid: (B*N*Z, X, Y, 2), normalized for feature map coordinates.
+                g = grid[0].detach().float().cpu().numpy()  # take first sample/cam/height
+                feat_h, feat_w = x.shape[-2], x.shape[-1]
+                img_h, img_w = self.input_size
+                # align_corners=True inverse mapping: pix = (norm + 1) * (size - 1) / 2
+                feat_xy = np.empty_like(g)
+                feat_xy[..., 0] = (g[..., 0] + 1.0) * (feat_w - 1) / 2.0
+                feat_xy[..., 1] = (g[..., 1] + 1.0) * (feat_h - 1) / 2.0
+                img_xy = np.empty_like(g)
+                img_xy[..., 0] = feat_xy[..., 0] * (img_w / max(feat_w, 1))
+                img_xy[..., 1] = feat_xy[..., 1] * (img_h / max(feat_h, 1))
+
+                canvas_feat = np.zeros((feat_h, feat_w, 3), dtype=np.uint8)
+                canvas_img = np.zeros((img_h, img_w, 3), dtype=np.uint8)
+                flat_feat = feat_xy.reshape(-1, 2)
+                flat_img = img_xy.reshape(-1, 2)
+                for u, v in flat_feat:
+                    ui, vi = int(round(u)), int(round(v))
+                    if 0 <= ui < feat_w and 0 <= vi < feat_h:
+                        canvas_feat[vi, ui] = (255, 255, 255)
+                for u, v in flat_img:
+                    ui, vi = int(round(u)), int(round(v))
+                    if 0 <= ui < img_w and 0 <= vi < img_h:
+                        canvas_img[vi, ui] = (255, 255, 255)
+                valid_ratio = float(((np.abs(g[..., 0]) <= 1.0) & (np.abs(g[..., 1]) <= 1.0)).mean())
+                cv2.imwrite("debug_grid_feat_32x96.jpg", canvas_feat)
+                cv2.imwrite("debug_grid_img_128x384.jpg", canvas_img)
+                print(
+                    f"[BEV_DEBUG_GRID] valid_ratio={valid_ratio:.4f}, "
+                    f"saved debug_grid_feat_32x96.jpg and debug_grid_img_128x384.jpg"
+                )
+
         B, X, Y, _ = grid.shape #B = bs=3 * mode=2 * seq_len=5 *3（相机数） * 6(高度)
         B = int(B / self.height)
         indexs = [[self.height * i + j for i in range(B)] for j in range(self.height)]
-        outs = [F.grid_sample(input=x, grid=grid[index, ...], mode="nearest", padding_mode="zeros") for index in indexs]
+        outs = [F.grid_sample(input=x, grid=grid[index, ...], mode="bilinear", padding_mode="zeros",align_corners=True) for index in indexs]
         # index_0 = [6 * i + 0 for i in range(B)]
         # index_1 = [6 * i + 1 for i in range(B)]
         # index_2 = [6 * i + 2 for i in range(B)]
@@ -261,46 +374,72 @@ class BEVBackbone(nn.Module):
         return input_enc
 
 
-    def get_cam_pos_embedding(self, intrins, post_rots, post_trans, distorts, L):
-        with torch.no_grad():
-            ogfH, ogfW = self.data_aug_conf['final_dim']
-            fH, fW = ogfH // self.downsample, ogfW // self.downsample
-            xs = torch.linspace(0, ogfW - 1, fW, dtype=torch.float, device=intrins.device).view(1, 1, fW).expand(1, fH,
-                                                                                                                 fW)
-            ys = torch.linspace(0, ogfH - 1, fH, dtype=torch.float, device=intrins.device).view(1, fH, 1).expand(1, fH,
-                                                                                                                 fW)
-            ds = torch.ones_like(xs)
-            rays = torch.stack((xs, ys, ds), -1)
+    @torch.no_grad()
+    def get_cam_pos_embedding(self, intrins, post_rots, post_trans, distorts, rots, L, num_flat):
+        """
+        在特征分辨率上为每个 (batch, cam) 生成相机位置编码：像素射线经反增强、鱼眼反投影后
+        得到自车系视线方向，再对方向 xy 做与 bev_emb 相同形式的 sin/cos 编码。
+        rots 为 lidar2camera 的 R，满足 p_cam = R @ p_ego + t，故 d_ego = R^T @ d_cam。
+        num_flat: 与特征 x 的第一维一致，应为 B*N（B 为时间/样本摊平后的 batch，N 为相机数）。
+        """
+        ogfH, ogfW = int(self.input_size[0]), int(self.input_size[1])
+        ds = float(self.splat.dowmsampe)
+        fH, fW = int(round(ogfH / ds)), int(round(ogfW / ds))
+        device = intrins.device
+        dtype = intrins.dtype
 
-            # for distort_img using torch by ZY@[2023-04-19]
-            if distorts.shape[0] != 0:
-                img_size = (fW, fH)
-                alpha = 1
-                ori_K = intrins[0, 0, :, :].cpu().numpy()
-                distort = distorts[0, 0, :].cpu().numpy()
-                dis_img = torch.squeeze(rays).cpu().numpy()
+        xs = torch.linspace(0, ogfW - 1, fW, dtype=dtype, device=device).view(1, 1, fW).expand(1, fH, fW)
+        ys = torch.linspace(0, ogfH - 1, fH, dtype=dtype, device=device).view(1, fH, 1).expand(1, fH, fW)
+        ones = torch.ones_like(xs)
+        rays = torch.stack((xs, ys, ones), dim=-1)  # (1,1,fH,fW,3)
 
-                NewCameraMatrix, _ = cv2.getOptimalNewCameraMatrix(ori_K, distort, img_size, alpha, img_size, 0)
-                map1, map2 = cv2.initUndistortRectifyMap(ori_K, distort, None, NewCameraMatrix, img_size, cv2.CV_32FC1)
-                rays = cv2.remap(dis_img, map1, map2, cv2.INTER_LINEAR)
-                rays = torch.tensor(rays, device=intrins.device)
-                NewCameraMatrix = torch.tensor(NewCameraMatrix, device=intrins.device).expand(intrins.shape)
-                rays = rays.unsqueeze(0)
+        N = intrins.shape[1]
+        if num_flat % N != 0:
+            raise ValueError(f"cam_pos_embed: num_flat={num_flat} not divisible by N_cam={N}")
+        B = num_flat // N
+        need_k = B * N * 3 * 3
+        if intrins.numel() != need_k:
+            raise ValueError(
+                f"cam_pos_embed: intrins numel={intrins.numel()} != B*N*3*3={need_k} "
+                f"(B={B}, N={N}, num_flat={num_flat})"
+            )
+        intrins = intrins.reshape(B, N, 3, 3)
+        post_rots = post_rots.reshape(B, N, 3, 3)
+        rots = rots.reshape(B, N, 3, 3)
 
-            B, N, _ = post_trans.shape
-            # undo post-transformation
-            # B x N x D x H x W x 3
-            points = rays - post_trans.view(B, N, 1, 1, 1, 3)
-            points = torch.inverse(post_rots).view(B, N, 1, 1, 1, 3, 3).matmul(points.unsqueeze(-1))
+        post_t = post_trans.reshape(B, N, -1)
+        if post_t.shape[-1] < 3:
+            raise ValueError(f"cam_pos_embed: post_trans last dim {post_t.shape[-1]} < 3")
+        post_t = post_t[..., :3]
+        post_t = post_t.view(B, N, 1, 1, 1, 3)
+        post_R = post_rots.reshape(B, N, 3, 3)
 
-            if distorts.shape[0] != 0:
-                points = torch.inverse(NewCameraMatrix).view(B, N, 1, 1, 1, 3, 3).matmul(points).squeeze(-1)
-            else:
-                points = torch.inverse(intrins).view(B, N, 1, 1, 1, 3, 3).matmul(points).squeeze(-1)
+        rays_bn = rays.view(1, 1, fH, fW, 3).expand(B, N, fH, fW, 3)
+        pre = rays_bn - post_t
+        inv_post = torch.inverse(post_R).view(B, N, 1, 1, 1, 3, 3)
+        pre_h = torch.matmul(inv_post, pre.unsqueeze(-1)).squeeze(-1)  # (B,N,fH,fW,3)
 
-            cam_pos_embedding = self.positional_encoding(points[..., :2], L).view(B * N, fH, fW, -1).permute(0, 3, 1, 2)
-            # 最好再把原始的x,y也保留并concat起来
-            return cam_pos_embedding
+        dist_flat = distorts.view(B, N, -1)
+        if dist_flat.shape[-1] < 8:
+            dist_flat = torch.nn.functional.pad(dist_flat, (0, 8 - dist_flat.shape[-1]))
+        else:
+            dist_flat = dist_flat[..., :8]
+
+        intrin_inv = torch.inverse(intrins.view(B, N, 3, 3))
+        pre_flat = pre_h.reshape(B * N, fH * fW, 3)
+        intrin_inv_flat = intrin_inv.reshape(B * N, 1, 3, 3).expand(B * N, fH * fW, 3, 3)
+        dist_flat_bn = dist_flat.reshape(B * N, 1, 8).expand(B * N, fH * fW, 8)
+
+        d_cam = _pixels_to_cam_dirs_fisheye(pre_flat, intrin_inv_flat, dist_flat_bn)
+        d_cam = d_cam.view(B, N, fH, fW, 3)
+
+        rots_bn = rots.view(B, N, 3, 3)
+        R_t = rots_bn.transpose(-1, -2).unsqueeze(2).unsqueeze(3).expand(B, N, fH, fW, 3, 3)
+        d_ego = torch.matmul(R_t, d_cam.unsqueeze(-1)).squeeze(-1)
+
+        enc = self.positional_encoding(d_ego[..., :2], L)
+        cam_pos_embedding = enc.view(B * N, fH, fW, -1).permute(0, 3, 1, 2).contiguous()
+        return cam_pos_embedding
 
 
 def quaternion_to_rotation_matrix(x: float, y: float, z: float, w: float) -> np.ndarray:

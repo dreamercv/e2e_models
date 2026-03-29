@@ -490,7 +490,14 @@ class Dataset(torch.utils.data.Dataset):
         "输出：images, rots, trans, intrins, distorts, post_rots, post_trans"
         imgs, rots, trans, intrins, distorts, post_rots, post_trans = [],[],[],[],[],[],[]
         cnis = {}
+        timestamps = []
         for i, label_path in enumerate(recs):
+            timestamp = os.path.basename(recs[i]).replace(".json","")
+            from datetime import datetime
+            # if timestamp.isdigit():
+            dt = datetime.strptime(timestamp, '%Y%m%d%H%M%S.%f')
+            unix_ts = dt.timestamp()  # 返回 float 类型的 Unix 时间戳
+            timestamps.append(unix_ts)
             imgs_i, rots_i, trans_i, intrins_i, distorts_i, post_rots_i, post_trans_i = [],[],[],[],[],[],[]
             json_data = json.load(open(label_path,"r"))
             image_paths = json_data["paths"]
@@ -547,8 +554,12 @@ class Dataset(torch.utils.data.Dataset):
             trans.append(torch.stack(trans_i))
             post_rots.append(torch.stack(post_rots_i))
             post_trans.append(torch.stack(post_trans_i))
+        
+        timestamps = np.array(timestamps)
+        intervals = timestamps[1:] - timestamps[:-1]
+        
         return torch.stack(imgs), torch.stack(rots), torch.stack(trans), \
-                torch.stack(intrins), torch.stack(distorts), torch.stack(post_rots), torch.stack(post_trans)
+                torch.stack(intrins), torch.stack(distorts), torch.stack(post_rots), torch.stack(post_trans),torch.tensor(intervals)
 
     def get_anno_det2D(self,recs):
         return {
@@ -1133,7 +1144,7 @@ class Dataset(torch.utils.data.Dataset):
         label_paths = {
             "label_path":recs
         }
-        imgs, rots, trans, intrins, distorts, post_rots, post_trans = self.get_image_data(recs)
+        imgs, rots, trans, intrins, distorts, post_rots, post_trans,intervals = self.get_image_data(recs)
         images_parma = {
             "x": imgs,                  # 14 8 3 128 384 # 最后在batch上拼接 # bs * T * 8 * 3 * 128 * 384
             "rots": rots,               # 14 8 3 3        
@@ -1141,7 +1152,8 @@ class Dataset(torch.utils.data.Dataset):
             "intrins": intrins,         # 14 8 3 3 3
             "distorts": distorts,       # 14 8 3 1 8
             "post_rots": post_rots,     # 14 8 3 2 2
-            "post_trans": post_trans
+            "post_trans": post_trans,
+            "intervals": intervals
         }
 
         #时序对其部分

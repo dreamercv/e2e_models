@@ -122,6 +122,7 @@ class SparseBox3DRefinementModule(nn.Module):
 
     def init_weight(self):
         if self.with_cls_branch:
+            # Use a low positive prior to stabilize early training.
             bias_init = bias_init_with_prob(0.01)
             nn.init.constant_(self.cls_layers[-1].bias, bias_init)
 

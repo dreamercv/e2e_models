@@ -209,6 +209,7 @@ class Sparse4DHead(nn.Module):
             dn_anchor = dn_anchor.to(device)
             dn_reg_target = dn_reg_target.to(device)
             dn_cls_target = dn_cls_target.to(device)
+            dn_reg_mask = dn_reg_mask.to(device)
             dn_attn_mask = dn_attn_mask.to(device)
             valid_mask = valid_mask.to(device)
             if dn_id_target is not None:
@@ -222,6 +223,7 @@ class Sparse4DHead(nn.Module):
                 dn_anchor = dn_anchor.repeat_interleave(T, dim=0)
                 dn_reg_target = dn_reg_target.repeat_interleave(T, dim=0)
                 dn_cls_target = dn_cls_target.repeat_interleave(T, dim=0)
+                dn_reg_mask = dn_reg_mask.repeat_interleave(T, dim=0)
                 valid_mask = valid_mask.repeat_interleave(T, dim=0)
                 if dn_id_target is not None:
                     dn_id_target = dn_id_target.repeat_interleave(T, dim=0)
@@ -302,6 +304,7 @@ class Sparse4DHead(nn.Module):
                 "dn_quality": dn_quality,
                 "dn_reg_target": dn_reg_target,
                 "dn_cls_target": dn_cls_target,
+                "dn_reg_mask": dn_reg_mask,
                 "dn_valid_mask": valid_mask,
             }
         else:
@@ -397,7 +400,7 @@ class Sparse4DHead(nn.Module):
             num_pos = torch.sum(mask)
             cls_flat = cls.flatten(end_dim=1)
             cls_target_flat = cls_target.flatten(end_dim=1)
-            cls_loss = self.loss_cls(cls_flat, cls_target_flat, avg_factor=num_pos)
+            cls_loss = self.loss_cls(cls_flat, cls_target_flat, avg_factor=num_pos) #---------------
             mask_flat = mask.reshape(-1)
             reg_weights_flat = reg_weights.flatten(end_dim=1)[mask_flat]
             reg_target_flat = reg_target.flatten(end_dim=1)[mask_flat]

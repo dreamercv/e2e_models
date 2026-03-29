@@ -45,6 +45,9 @@ def build_det3D_head(
         use_decoder: bool = False,
         decoder_num_output: int = 300,
         decoder_score_threshold: float = None,
+        instance_grad=True,
+        anchor_grad=True,
+        cls_threshold_to_reg=-1,
 ):
     """从 model.py 拷贝的 Sparse4D BEV head 构建函数，用于测试。"""
     if anchor_init is None:
@@ -58,7 +61,8 @@ def build_det3D_head(
         num_temp_instances=0,
         default_time_interval=0.5,
         confidence_decay=0.6,
-        feat_grad=False,
+        feat_grad=instance_grad,
+        anchor_grad=anchor_grad
     )
     anchor_encoder = SparseBox3DEncoder(
         embed_dims=[128, 32, 32, 64] if decouple_attn else 256,
@@ -73,7 +77,14 @@ def build_det3D_head(
     graph_model = MHAWrapper(gnn_dim, num_heads, dropout=dropout, batch_first=True)
     norm_layer = nn.LayerNorm(embed_dims)
     ffn = FFN(embed_dims, embed_dims*4, dropout=dropout)
-    kps = SparseBox3DKeyPointsGenerator(embed_dims=embed_dims, num_learnable_pts=0, fix_scale=((0.0, 0.0, 0.0),))
+    kps = SparseBox3DKeyPointsGenerator(embed_dims=embed_dims, num_learnable_pts=4, fix_scale=(
+            (0.0, 0.0, 0.0),
+            (0.45,0,0),
+            (-0.45,0,0),
+            (0,0.45,0),
+            (0,-0.45,0)
+        )
+    )
     bev_agg = BEVFeatureAggregation(
         embed_dims=embed_dims,
         bev_bounds=bev_bounds,
@@ -94,6 +105,9 @@ def build_det3D_head(
             ["gnn", "norm", "deformable", "ffn", "norm", "refine"] * num_single_frame_decoder
             + ["gnn", "norm", "deformable", "ffn", "norm", "refine"] * (num_decoder - num_single_frame_decoder)
     )
+    # In this simplified head we don't have "temp_gnn".
+    # Dropping the first "gnn,norm" keeps the first block starting from
+    # deformable feature aggregation, which is closer to official behavior.
     operation_order = operation_order[2:]
 
     denoise = None
@@ -114,7 +128,8 @@ def build_det3D_head(
             add_neg_dn=add_neg_dn,
             reg_weights=reg_weights,
         )
-    loss_cls = FocalLoss(alpha=0.25, gamma=2.0, ignore_index=-1)
+    # -1 is used as background for unmatched anchors; keep a separate ignore index.
+    loss_cls = FocalLoss(alpha=0.25, gamma=2.0, ignore_index=-100)
     loss_reg = SparseBox3DLoss(reg_weights=reg_weights, loss_centerness=True, loss_yawness=True)
 
     decoder = None
@@ -142,12 +157,12 @@ def build_det3D_head(
         loss_cls=loss_cls,
         loss_reg=loss_reg,
         reg_weights=reg_weights,
+        cls_threshold_to_reg=cls_threshold_to_reg,
         # 与 dataset 真值命名保持一致
         gt_cls_key="gt_labels_det3D",
         gt_reg_key="gt_bboxes_det3D",
         gt_cls_key_mask="gt_labels_det3D_mask",
         gt_reg_key_mask="gt_bboxes_det3D_mask",
-        cls_threshold_to_reg=0.05,
     )
     head.init_weights()
     return head

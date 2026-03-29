@@ -2,7 +2,7 @@ import os
 
 configs = {
 
-    "device":"cuda",# cuda cpu
+    "device":"cpu",# cuda cpu
     "lr":1e-3,
     "max_grad_norm": 5,
     "weight_decay":1e-4,
@@ -13,13 +13,13 @@ configs = {
 
 
     "is_train": True,
-    "batch_size": 2,
+    "batch_size": 1,
     "num_workers": 1,
     "epoch": 100,
     "seq_len": 5,
 
 
-    "log_dir": "../logs/only_dynamic_0326_nodn_resnet18",
+    "log_dir": "../logs/only_dynamic_0327_nodn_resnet18_ok_demo",
     "log_save_interval": 100,
     "log_print_interval": 1,
     "ckpt_save_interval":100,
@@ -36,15 +36,18 @@ configs = {
         'ybound': [-40.0, 40.0, 1],
         'zbound': [-2.0, 4.0, 1.0]
     },
+    # BEV：在 grid_sample 前把相机视线在自车系 xy 上的 sin/cos 编码拼到 2D 特征上（硬编码、无梯度）
+    "bev_use_cam_pos_embed": False,
+    "bev_cam_pos_L": 4,
 
     "clip_paths": {
-        # "dynamic": ["/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/det.txt"],
-        # "static": ["/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/map.txt"],
+        "dynamic": ["/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/det.txt"],
+        "static": ["/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/map.txt"],
 
-        "dynamic": [
-            "/workspace/afb5szh-01/models/e2e_model/e2e_dataset_10Hz_dyo_all.txt"
-            ],
-        "static": ["/workspace/afb5szh-01/models/e2e_model/e2e_dataset_10Hz_lane.txt"],
+        # "dynamic": [
+        #     "/workspace/afb5szh-01/models/e2e_model/e2e_dataset_10Hz_dyo_all.txt"
+        #     ],
+        # "static": ["/workspace/afb5szh-01/models/e2e_model/e2e_dataset_10Hz_lane.txt"],
 
         "dynamic_static": [],
         "e2e": [],
@@ -69,7 +72,7 @@ configs = {
     "mode": "static",  # 默认加载动态数据
     
 
-    "train_clips": 5,  # -1 所有，[]指定几个，xxx.txt写进txt中指定的，>0前N个
+    "train_clips": ["20250508072555"],  # -1 所有，[]指定几个，xxx.txt写进txt中指定的，>0前N个
 
     "total_len": 20 + 1 + 50,  # 一共71帧，当前帧是第21帧，往前20帧，往后50帧 ，最后一帧索引对应着70 ，未来50帧为了获取真值
     "current_frame_index": 20,  # 0 1 2 3 4 5 ... [20] 21 22 23 ... 70
@@ -158,26 +161,32 @@ configs = {
         ],
         "e2e": ["gt_e2e_dynamic_traj","label_path"]
     },
-    "input_names": ["x", "rots", "trans", "intrins", "distorts", "post_rots", "post_trans", "theta_mats"],
+    "input_names": ["x", "rots", "trans", "intrins", "distorts", "post_rots", "post_trans", "theta_mats","intervals"],
 
     # 模型相关
-    "img_outchannels": 256,
+    "img_outchannels": 8,
+    "det3d_loss_weights": {
+        "cls": 2.0,
+        "box": 0.25,
+        "cns": 1.0,
+        "yns": 1.0,
+    },
     # 2d
     "det_2d_num": 6,
     "map_2d_num": 3,
     # det3D
     "det_3d_head": {
-        "num_anchor": 100,
+        "num_anchor": 20,
         "embed_dims": 256,
-        "num_decoder": 6,
-        "num_single_frame_decoder": 5,
+        "num_decoder": 3,
+        "num_single_frame_decoder": 2,
         "num_classes": 6,
         "bev_bounds": None,
         "anchor_init": "../300clips_kmeans512_range_200.npy",
         "decouple_attn": True,
         "num_heads": 8,
         "dropout": 0.1,
-        "use_dn": False,
+        "use_dn": True,
         "num_dn_groups": 5,
         "dn_noise_scale": 0.5,
         "max_dn_gt": 8,
@@ -186,6 +195,9 @@ configs = {
         "use_decoder": True,
         "decoder_num_output": 50,
         "decoder_score_threshold": None,
+        "instance_grad":True,
+        "anchor_grad":True,
+        "cls_threshold_to_reg":-1,
     },
     # tracking
     "track_head": {

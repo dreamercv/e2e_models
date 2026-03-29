@@ -36,21 +36,24 @@ class Model(nn.Module):
         self.input_size = config["final_dim"]
         self.seq_len = config["seq_len"]
 
-        # self.image_backbone = ImageBackboneResNetFPN(
-        #     backbone=config.get("backbone","resnet18"),
-        #     out_channels=img_outchannels,
-        #     pretrain_path=config.get("backbone_path",None),
-        #     pretrained=False if config.get("pretrain",None) is not None else True,
-        #     device = config.get("device","cuda")
-        # )
-        self.image_backbone = ImageBackBone(out_channels=img_outchannels)
+        self.image_backbone = ImageBackboneResNetFPN(
+            backbone=config.get("backbone", "resnet18"),
+            out_channels=img_outchannels,
+            pretrain_path=config.get("backbone_path", None),
+            pretrained=False if config.get("pretrain", None) is not None else True,
+            device=config.get("device", "cuda"),
+        )
         self.det2d_head = ModelDet2D(out_channels=img_outchannels, det_class_num=config["det_2d_num"])
         self.map2d_head = ModelSeg2D(out_channels=img_outchannels, seg_class_num=config["map_2d_num"])
-        self.bev_backbone = BEVBackbone(channels=img_outchannels,
-                                        grid_conf=self.grid_conf,
-                                        input_size=self.input_size,
-                                        num_temporal=self.seq_len,
-                                        num_cams = config["num_cams"] )
+        self.bev_backbone = BEVBackbone(
+            channels=img_outchannels,
+            grid_conf=self.grid_conf,
+            input_size=self.input_size,
+            num_temporal=self.seq_len,
+            num_cams=config["num_cams"],
+            use_cam_pos_embed=config.get("bev_use_cam_pos_embed", True),
+            cam_pos_L=config.get("bev_cam_pos_L", 4),
+        )
 
         config["det_3d_head"]["embed_dims"] = img_outchannels
         config["det_3d_head"]["bev_bounds"] = (self.grid_conf["xbound"], self.grid_conf["ybound"])
@@ -77,6 +80,20 @@ class Model(nn.Module):
         self.map3d_head = build_map_head(**config["map_3d_head"] )
 
         self.config = config
+        self.det3d_loss_weights = config.get("det3d_loss_weights", {})
+
+    def _get_loss_weight(self, name: str) -> float:
+        if not name.startswith("det3d_"):
+            return 1.0
+        if "loss_cls" in name:
+            return float(self.det3d_loss_weights.get("cls", 1.0))
+        if "loss_box" in name:
+            return float(self.det3d_loss_weights.get("box", 1.0))
+        if "loss_cns" in name:
+            return float(self.det3d_loss_weights.get("cns", 1.0))
+        if "loss_yns" in name:
+            return float(self.det3d_loss_weights.get("yns", 1.0))
+        return 1.0
 
     def forward_img_backbone(self,x):
         return self.image_backbone(x)
@@ -157,7 +174,7 @@ class Model(nn.Module):
 
     def forward(self, x, rots, trans, intrins, distorts, post_rot, pos_tran, theta_mats, T_ego_his2curs=None, metas=None,decoder=False,task_names=[]):
         b, m, t, n, c, h, w = x.shape
-
+        # 2, 1, 5, 8, 3, 128, 384
         # from dataset.dataset import denormalize_img
         # import cv2
         # import numpy as np
@@ -166,13 +183,13 @@ class Model(nn.Module):
 
 
         x = rearrange(x, 'b m t n c h w -> (b m t n) c h w')
-        rots = rearrange(rots, 'b m t n h w -> (b m) t n h w')
-        trans = rearrange(trans, 'b m t n h w -> (b m) t n h w')
-        intrins = rearrange(intrins, 'b m t n h w -> (b m) t n h w')
-        distorts = rearrange(distorts, 'b m t n h w -> (b m) t n h w')
-        post_rot = rearrange(post_rot, 'b m t n h w -> (b m) t n h w')
-        pos_tran = rearrange(pos_tran, 'b m t n h w -> (b m) t n h w')
-        theta_mats = rearrange(theta_mats, 'b m t h w -> (b m) t h w')
+        rots = rearrange(rots, 'b m t n h w -> (b m) t n h w')          # torch.Size([2, 1, 5, 8, 3, 3])
+        trans = rearrange(trans, 'b m t n h w -> (b m) t n h w')        # torch.Size([2, 1, 5, 8, 1, 3])
+        intrins = rearrange(intrins, 'b m t n h w -> (b m) t n h w')    # torch.Size([2, 1, 5, 8, 3, 3])
+        distorts = rearrange(distorts, 'b m t n h w -> (b m) t n h w')  # torch.Size([2, 1, 5, 8, 1, 8])
+        post_rot = rearrange(post_rot, 'b m t n h w -> (b m) t n h w')  # torch.Size([2, 1, 5, 8, 3, 3])
+        pos_tran = rearrange(pos_tran, 'b m t n h w -> (b m) t n h w')  # torch.Size([2, 1, 5, 8, 1, 3])
+        theta_mats = rearrange(theta_mats, 'b m t h w -> (b m) t h w')  # torch.Size([2, 1, 5, 2, 3])
         if T_ego_his2curs is None:
             T_ego_his2curs = torch.eye(4, device=x.device).view(1, 1, 4, 4).expand(b, t, 4, 4)
 
@@ -204,7 +221,12 @@ class Model(nn.Module):
 
         total_loss = None
         if len(losses) > 0:
-            total_loss = sum(v for v in losses.values() if torch.is_tensor(v))
+            weighted_losses = []
+            for k, v in losses.items():
+                if not torch.is_tensor(v):
+                    continue
+                weighted_losses.append(v * self._get_loss_weight(k))
+            total_loss = sum(weighted_losses) if len(weighted_losses) > 0 else None
 
 
         return {

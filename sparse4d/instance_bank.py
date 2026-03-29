@@ -54,6 +54,7 @@ class InstanceBank(nn.Module):
             requires_grad=feat_grad,
         )
         self.reset()
+        self.init_weight()
 
     def init_weight(self):
         self.anchor.data = self.anchor.data.new_tensor(self.anchor_init)
