@@ -559,7 +559,8 @@ class Dataset(torch.utils.data.Dataset):
         intervals = timestamps[1:] - timestamps[:-1]
         
         return torch.stack(imgs), torch.stack(rots), torch.stack(trans), \
-                torch.stack(intrins), torch.stack(distorts), torch.stack(post_rots), torch.stack(post_trans),torch.tensor(intervals)
+                torch.stack(intrins), torch.stack(distorts), torch.stack(post_rots), torch.stack(post_trans), \
+                    torch.tensor(intervals),torch.tensor(timestamps)
 
     def get_anno_det2D(self,recs):
         return {
@@ -1144,7 +1145,7 @@ class Dataset(torch.utils.data.Dataset):
         label_paths = {
             "label_path":recs
         }
-        imgs, rots, trans, intrins, distorts, post_rots, post_trans,intervals = self.get_image_data(recs)
+        imgs, rots, trans, intrins, distorts, post_rots, post_trans,intervals,timestamps = self.get_image_data(recs)
         images_parma = {
             "x": imgs,                  # 14 8 3 128 384 # 最后在batch上拼接 # bs * T * 8 * 3 * 128 * 384
             "rots": rots,               # 14 8 3 3        
@@ -1153,7 +1154,8 @@ class Dataset(torch.utils.data.Dataset):
             "distorts": distorts,       # 14 8 3 1 8
             "post_rots": post_rots,     # 14 8 3 2 2
             "post_trans": post_trans,
-            "intervals": intervals
+            "intervals": intervals,
+            "timestamps": timestamps
         }
 
         #时序对其部分

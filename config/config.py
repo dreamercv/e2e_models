@@ -13,7 +13,7 @@ configs = {
 
 
     "is_train": True,
-    "batch_size": 1,
+    "batch_size": 2,
     "num_workers": 1,
     "epoch": 100,
     "seq_len": 5,
@@ -161,7 +161,7 @@ configs = {
         ],
         "e2e": ["gt_e2e_dynamic_traj","label_path"]
     },
-    "input_names": ["x", "rots", "trans", "intrins", "distorts", "post_rots", "post_trans", "theta_mats","intervals"],
+    "input_names": ["x", "rots", "trans", "intrins", "distorts", "post_rots", "post_trans", "theta_mats","intervals","timestamps"],
 
     # 模型相关
     "img_outchannels": 8,
