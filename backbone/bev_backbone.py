@@ -66,12 +66,22 @@ class Splat(nn.Module):
         points = points + trans.view(B, N, 1, 3)
         # points = points.unsqueeze(-2).matmul(torch.inverse(Rs).view(B, N, 1, 3, 3)).squeeze(-2)
 
-        x, y, z = torch.where(points[:, :, :, 2] < 0)
-        points[x, y, z, 0] = 9999 * torch.ones_like(x, dtype=points.dtype)
-        points[x, y, z, 1] = 9999 * torch.ones_like(x, dtype=points.dtype)
-
-        depths = points[..., 2:]
-        points = torch.cat((points[..., :2] / depths, torch.ones_like(depths)), -1)
+        # 相机系深度 z：z<=0 或 z→0 时 x/z、y/z 会得到 inf/极端 UV，进而污染 grid_sample。
+        # 对 z 做下界 + 无效点甩到画面外（与原先 z<0 时 9999 思路一致）。
+        depths = points[..., 2:].clone()
+        z_cam = points[..., 2]
+        eps = torch.as_tensor(1e-3, device=points.device, dtype=points.dtype)
+        invalid = z_cam <= eps
+        safe_z = z_cam.clamp(min=eps)
+        x_norm = points[..., 0] / safe_z
+        y_norm = points[..., 1] / safe_z
+        oob = torch.as_tensor(9999.0, device=points.device, dtype=points.dtype)
+        x_norm = torch.where(invalid, oob, x_norm)
+        y_norm = torch.where(invalid, oob, y_norm)
+        points = torch.cat(
+            (x_norm.unsqueeze(-1), y_norm.unsqueeze(-1), torch.ones_like(depths)),
+            dim=-1,
+        )
 
         intrins = intrins.view(B, N, 1, 3, 3)
         distorts = distorts.view(B, N, 1, 8)
