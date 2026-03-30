@@ -101,7 +101,24 @@ class Splat(nn.Module):
         #     alll.append(image_all)
         # cv2.imwrite("local_map.jpg", np.concatenate(alll,0))
 
-        features_shape = torch.Tensor([self.input_size[0], self.input_size[1]] ).to(points.device) / self.dowmsampe 
+        # points[...,0:2] 在「网络输入图」像素系下，即 config final_dim (H_img,W_img)=(128,384)；
+        # grid_sample 作用在 backbone 特征 x 上，空间分辨率为 (H_feat,W_feat)=输入/下采样。
+        # 不能只用 128x384 做归一化去采 32x96：须先把像素映射到特征格点，再对特征尺寸 normalize（与 align_corners=True 一致）。
+        og_h = float(self.input_size[0])
+        og_w = float(self.input_size[1])
+        ds = float(self.dowmsampe)
+        feat_h = og_h / ds
+        feat_w = og_w / ds
+        den_og_h = max(og_h - 1.0, 1.0)
+        den_og_w = max(og_w - 1.0, 1.0)
+        u = points[..., 0]
+        v = points[..., 1]
+        u_feat = u * (feat_w - 1.0) / den_og_w
+        v_feat = v * (feat_h - 1.0) / den_og_h
+        points = torch.stack([u_feat, v_feat], dim=-1)
+        features_shape = torch.tensor(
+            [feat_h, feat_w], device=points.device, dtype=points.dtype
+        )
         points = self.normalize_coords(coords=points, shape=features_shape)
         depths = depths.view(B, N, Z, Y, X, 1).permute(0, 1, 2, 5, 4, 3).squeeze().view(B * N, Z, X, Y)
         points = points.view(B * N * Z, X, Y, 2)
@@ -348,13 +365,19 @@ class BEVBackbone(nn.Module):
         out_put = out_put.reshape(-1,self.num_cams*out_put.shape[1],*out_put.shape[-2:])
         out_put = self.multiview_fusion(out_put)
         out_put = out_put.view(-1, S, *out_put.shape[-3:])
+        # theta_mats[i]：第 i-1 帧 BEV 网格 -> 第 i 帧网格的仿射（与 dataset get_algin_theta_mat 一致）；
+        # 应对「上一帧已对齐特征」做 warp 到当前帧，再与当前帧 out_put[:, i] 融合，勿对当前帧误做 warp。
         algin_features = []
         for i in range(S):
             if i == 0:
                 algin_features.append(out_put[:, i])
             else:
-                algin_feature = self.warp_feature(out_put[:, i], theta_mats[:, i].to(out_put.dtype))
-                algin_features.append(self.algin_fusion(torch.cat([algin_features[-1], algin_feature], 1)))
+                warped_prev = self.warp_feature(
+                    algin_features[-1], theta_mats[:, i].to(out_put.dtype)
+                )
+                algin_features.append(
+                    self.algin_fusion(torch.cat([warped_prev, out_put[:, i]], 1))
+                )
         algin_features = torch.stack(algin_features).permute(1, 0, 2, 3, 4).flatten(0, 1)
         return algin_features  # 输出时序帧信息，每一帧都和前一阵融合这样子达到了渐进的融合方式
 
