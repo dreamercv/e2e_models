@@ -56,7 +56,7 @@ class Splat(nn.Module):
         voxels = torch.stack((xs, ys, zs), -1)
         return nn.Parameter(voxels, requires_grad=False)
 
-    def bev2eachroi(self, points, rots, trans, intrins, distorts, post_rots, post_trans): #torch.Size([80, 256, 32, 96])
+    def bev2eachroi_1(self, points, rots, trans, intrins, distorts, post_rots, post_trans): #torch.Size([80, 256, 32, 96])
         B, N, _, _ = rots.shape  # [bs*sq,roi,3,3]
         Z, Y, X, _ = points.shape
         P = Z * Y * X
@@ -129,6 +129,74 @@ class Splat(nn.Module):
         features_shape = torch.tensor(
             [feat_h, feat_w], device=points.device, dtype=points.dtype
         )
+        points = self.normalize_coords(coords=points, shape=features_shape)
+        depths = depths.view(B, N, Z, Y, X, 1).permute(0, 1, 2, 5, 4, 3).squeeze().view(B * N, Z, X, Y)
+        points = points.view(B * N * Z, X, Y, 2)
+
+        return points
+    def bev2eachroi(self, points, rots, trans, intrins, distorts, post_rots, post_trans):
+        B, N, _, _ = rots.shape  # [bs*sq,roi,3,3]
+        Z, Y, X, _ = points.shape
+        P = Z * Y * X
+        points = points.view(1, 1, Z * Y * X, 3).expand(B, N, P, 3).clone()
+
+        points = rots.view(B, N, 1, 3, 3).matmul(points.unsqueeze(-1)).squeeze(-1)
+        points = points + trans.view(B, N, 1, 3)
+        # points = points.unsqueeze(-2).matmul(torch.inverse(Rs).view(B, N, 1, 3, 3)).squeeze(-2)
+
+        # 原始---------------------
+        # x, y, z = torch.where(points[:, :, :, 2] < 0)
+        # points[x, y, z, 0] = 9999 * torch.ones_like(x, dtype=points.dtype)
+        # points[x, y, z, 1] = 9999 * torch.ones_like(x, dtype=points.dtype)
+
+        # depths = points[..., 2:]
+        # points = torch.cat((points[..., :2] / depths, torch.ones_like(depths)), -1)
+
+        # 新处理方式
+        depths = points[..., 2:].clone()
+        z_cam = points[..., 2]
+        eps = torch.as_tensor(1e-3, device=points.device, dtype=points.dtype)
+        invalid = z_cam <= eps
+        safe_z = z_cam.clamp(min=eps)
+        x_norm = points[..., 0] / safe_z
+        y_norm = points[..., 1] / safe_z
+        oob = torch.as_tensor(9999.0, device=points.device, dtype=points.dtype)
+        x_norm = torch.where(invalid, oob, x_norm)
+        y_norm = torch.where(invalid, oob, y_norm)
+        points = torch.cat(
+            (x_norm.unsqueeze(-1), y_norm.unsqueeze(-1), torch.ones_like(depths)),
+            dim=-1,
+        )
+
+        intrins = intrins.view(B, N, 1, 3, 3)
+        distorts = distorts.view(B, N, 1, 8)
+        points = self.projectPoints_fisheye(points, distorts, intrins)
+
+        # points1 = points[:, 0:1]
+        # intrins1 = intrins[:, 0:1].view(B, 1, 1, 3, 3)
+        # distorts1 = distorts[:, 0:1].view(B, 1, 1, 8)
+        # points[:, 0:1] = self.projectPoints_fisheye(points1, distorts1, intrins1)
+
+        points = post_rots.view(B, N, 1, 3, 3).matmul(points.unsqueeze(-1)).squeeze(-1)
+        points = points + post_trans.view(B, N, 1, 3)
+        points = points.view(B, N, Z, Y, X, 3).permute(0, 1, 2, 4, 3, 5)[..., :2]
+
+        # # 可视化验证
+        # image_all_000 = feature.cpu().numpy()[0].transpose(1,2,0)
+        # alll = []
+        # for i in range(6):
+        #     pts  = points[0,0,i].reshape(-1, 2).cpu().numpy()
+        #     image_all = image_all_000.copy()
+        #     for m in range(pts.shape[0]):
+
+        #         try:
+        #             cv2.circle(image_all, (int(pts[m, 0]), int(pts[m, 1])), 1, (255, 255, 255), 2)
+        #         except:
+        #             pass
+        #     alll.append(image_all)
+        # cv2.imwrite("local_map.jpg", np.concatenate(alll,0))
+
+        features_shape = torch.Tensor([self.input_size[0], self.input_size[1]]).to(points.device)
         points = self.normalize_coords(coords=points, shape=features_shape)
         depths = depths.view(B, N, Z, Y, X, 1).permute(0, 1, 2, 5, 4, 3).squeeze().view(B * N, Z, X, Y)
         points = points.view(B * N * Z, X, Y, 2)
@@ -229,7 +297,8 @@ class BEVBackbone(nn.Module):
         self.use_cam_pos_embed = use_cam_pos_embed
         self.cam_pos_L = cam_pos_L
         self.cam_pos_ch = (4 * cam_pos_L) if use_cam_pos_embed else 0
-        self.feat_channels = channels + self.cam_pos_ch
+        self.cam_embed_dim = 4
+        self.feat_channels = channels + self.cam_pos_ch + self.cam_embed_dim
 
         self.splat = Splat(grid_conf, input_size)
         self.points = self.splat.create_voxels()
@@ -238,15 +307,43 @@ class BEVBackbone(nn.Module):
         self.bev_emb = rearrange(bev_emb, 'h w c -> c h w')
         self.height = self.points.shape[0]
         self.num_cams = num_cams
+        ogfH, ogfW = int(self.input_size[0]), int(self.input_size[1])
+        ds = float(self.splat.dowmsampe)
+        self.fH, self.fW = int(round(ogfH / ds)), int(round(ogfW / ds))
+
         # self.bev_backbone = nn.Sequential(
         #     nn.Conv2d(3, 128, kernel_size=3, stride=1, padding=1),
         #     nn.MaxPool2d(2, 2),
         #     nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
         #     nn.MaxPool2d(2, 2)
         # )
+        
+        self.cam_embedding_learn = nn.Embedding(num_cams, self.cam_embed_dim) # 可学习的位置编码
+        if use_cam_pos_embed:
+            
+            xs = torch.linspace(0, ogfW - 1, self.fW, dtype=torch.float32).view(1, 1, self.fW).expand(1, self.fH, self.fW)
+            ys = torch.linspace(0, ogfH - 1, self.fH, dtype=torch.float32).view(1, self.fH, 1).expand(1, self.fH, self.fW)
+            ones = torch.ones_like(xs)
+            self.rays = torch.stack((xs, ys, ones), dim=-1)  # (1,1,fH,fW,3)
+
+        self.fusion_campos = nn.Sequential(
+            nn.Conv2d(
+                self.feat_channels ,
+                channels * 3,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+            ),
+            nn.BatchNorm2d(channels*3),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels*3, channels, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True)
+        )
+
         self.fusion_height = nn.Sequential(
             nn.Conv2d(
-                self.feat_channels * self.height + self.bev_emb.shape[0],
+                channels * self.height + self.bev_emb.shape[0],
                 channels * 3,
                 kernel_size=3,
                 stride=1,
@@ -293,15 +390,10 @@ class BEVBackbone(nn.Module):
         post_tran3 = post_tran3.flatten(0, 1)
         # points1 = torch.tensor(points1).view(seq_len * 3, 32, 96, 3).unsqueeze(1).unsqueeze(-1)
         # x = self.bev_backbone(x)
+        BS = x.shape[0]
+
         if self.use_cam_pos_embed:
-            ogfH, ogfW = int(self.input_size[0]), int(self.input_size[1])
-            ds = float(self.splat.dowmsampe)
-            fH, fW = int(round(ogfH / ds)), int(round(ogfW / ds))
-            if x.shape[-2] != fH or x.shape[-1] != fW:
-                raise ValueError(
-                    f"cam_pos_embed: x spatial {x.shape[-2:]} != expected ({fH}, {fW}) "
-                    f"from input_size={self.input_size} / dowmsampe={ds}"
-                )
+            
             cam_emb = self.get_cam_pos_embedding(
                 intrins,
                 post_rot3,
@@ -312,7 +404,13 @@ class BEVBackbone(nn.Module):
                 num_flat=x.shape[0],
             ).to(device=x.device, dtype=x.dtype)
             # x: (B*S*N, C, fH, fW), cam_emb: same batch layout
+    
             x = torch.cat([x, cam_emb], dim=1)
+        cam_ids = torch.arange(self.num_cams, device=x.device).view(1, self.num_cams).expand(BS // self.num_cams, self.num_cams).reshape(-1)
+        cam_embed  = self.cam_embedding_learn(cam_ids)
+        cam_embed = cam_embed.view(BS, self.cam_embed_dim, 1, 1).expand(-1, -1, self.fH, self.fW)
+
+        x = self.fusion_campos(torch.cat([x, cam_embed], dim=1))
 
         points = self.points.to(x.device)  # points[2,40,80] 表示z围为0（地面）ego所在的位置
         bev_emb = self.bev_emb.to(x.device)
@@ -357,18 +455,7 @@ class BEVBackbone(nn.Module):
         B = int(B / self.height)
         indexs = [[self.height * i + j for i in range(B)] for j in range(self.height)]
         outs = [F.grid_sample(input=x, grid=grid[index, ...], mode="bilinear", padding_mode="zeros",align_corners=True) for index in indexs]
-        # index_0 = [6 * i + 0 for i in range(B)]
-        # index_1 = [6 * i + 1 for i in range(B)]
-        # index_2 = [6 * i + 2 for i in range(B)]
-        # index_3 = [6 * i + 3 for i in range(B)]       theta_mats = 6 * 5 * 2 * 3
-        # index_4 = [6 * i + 4 for i in range(B)]
-        # index_5 = [6 * i + 5 for i in range(B)]     b m t n c h w -> (b m t n) c h w # 3 2 5 3
-        # output_0 = F.grid_sample(input=x, grid=grid[index_0, ...], mode="nearest", padding_mode="zeros")
-        # output_1 = F.grid_sample(input=x, grid=grid[index_1, ...], mode="nearest", padding_mode="zeros")
-        # output_2 = F.grid_sample(input=x, grid=grid[index_2, ...], mode="nearest", padding_mode="zeros")
-        # output_3 = F.grid_sample(input=x, grid=grid[index_3, ...], mode="nearest", padding_mode="zeros")
-        # output_4 = F.grid_sample(input=x, grid=grid[index_4, ...], mode="nearest", padding_mode="zeros")
-        # output_5 = F.grid_sample(input=x, grid=grid[index_5, ...], mode="nearest", padding_mode="zeros")
+
         out_put = torch.cat(outs,dim=1)  # B, C, H, W
         out_put = torch.cat([out_put, bev_emb[None].expand(out_put.shape[0], -1, -1, -1)], dim=1) # torch.Size([25, 384, 150, 100]) # 90 256 200 80 # 90 = 3 * 2 * 5 * 3(三个相机)
         out_put = self.fusion_height(out_put)
@@ -388,8 +475,8 @@ class BEVBackbone(nn.Module):
                 algin_features.append(
                     self.algin_fusion(torch.cat([warped_prev, out_put[:, i]], 1))
                 )
-        algin_features = torch.stack(algin_features).permute(1, 0, 2, 3, 4).flatten(0, 1)
-        return algin_features  # 输出时序帧信息，每一帧都和前一阵融合这样子达到了渐进的融合方式
+        out_put = torch.stack(algin_features).permute(1, 0, 2, 3, 4).flatten(0, 1)
+        return out_put  # 输出时序帧信息，每一帧都和前一阵融合这样子达到了渐进的融合方式
 
     def warp_feature(self, features, theta):
         B, C, H, W = features.size()
@@ -415,18 +502,19 @@ class BEVBackbone(nn.Module):
         rots 为 lidar2camera 的 R，满足 p_cam = R @ p_ego + t，故 d_ego = R^T @ d_cam。
         num_flat: 与特征 x 的第一维一致，应为 B*N（B 为时间/样本摊平后的 batch，N 为相机数）。
         """
-        ogfH, ogfW = int(self.input_size[0]), int(self.input_size[1])
-        ds = float(self.splat.dowmsampe)
-        fH, fW = int(round(ogfH / ds)), int(round(ogfW / ds))
+        # ogfH, ogfW = int(self.input_size[0]), int(self.input_size[1])
+        # ds = float(self.splat.dowmsampe)
+        fH, fW = self.fH, self.fW#int(round(ogfH / ds)), int(round(ogfW / ds))
         device = intrins.device
         dtype = intrins.dtype
 
-        xs = torch.linspace(0, ogfW - 1, fW, dtype=dtype, device=device).view(1, 1, fW).expand(1, fH, fW)
-        ys = torch.linspace(0, ogfH - 1, fH, dtype=dtype, device=device).view(1, fH, 1).expand(1, fH, fW)
-        ones = torch.ones_like(xs)
-        rays = torch.stack((xs, ys, ones), dim=-1)  # (1,1,fH,fW,3)
+        # xs = torch.linspace(0, ogfW - 1, fW, dtype=dtype, device=device).view(1, 1, fW).expand(1, fH, fW)
+        # ys = torch.linspace(0, ogfH - 1, fH, dtype=dtype, device=device).view(1, fH, 1).expand(1, fH, fW)
+        # ones = torch.ones_like(xs)
+        # rays = torch.stack((xs, ys, ones), dim=-1)  # (1,1,fH,fW,3)
 
-        N = intrins.shape[1]
+        rays = self.rays.to(device=device, dtype=dtype)
+        N = intrins.shape[1] # (bs*t) * ncams * 3 * 3
         if num_flat % N != 0:
             raise ValueError(f"cam_pos_embed: num_flat={num_flat} not divisible by N_cam={N}")
         B = num_flat // N
@@ -444,12 +532,12 @@ class BEVBackbone(nn.Module):
         if post_t.shape[-1] < 3:
             raise ValueError(f"cam_pos_embed: post_trans last dim {post_t.shape[-1]} < 3")
         post_t = post_t[..., :3]
-        post_t = post_t.view(B, N, 1, 1, 1, 3)
-        post_R = post_rots.reshape(B, N, 3, 3)
+        post_t = post_t.view(B, N, 1, 1, 3) # torch.Size([10, 8, 1, 1, 3])
+        post_R = post_rots.reshape(B, N, 3, 3) # torch.Size([10, 8, 3, 3])
 
         rays_bn = rays.view(1, 1, fH, fW, 3).expand(B, N, fH, fW, 3)
         pre = rays_bn - post_t
-        inv_post = torch.inverse(post_R).view(B, N, 1, 1, 1, 3, 3)
+        inv_post = torch.inverse(post_R).view(B, N, 1, 1,  3, 3) #torch.Size([10, 8, 3, 3])-->torch.Size([10, 8, 1, 1, 1, 3, 3])
         pre_h = torch.matmul(inv_post, pre.unsqueeze(-1)).squeeze(-1)  # (B,N,fH,fW,3)
 
         dist_flat = distorts.view(B, N, -1)
@@ -458,17 +546,17 @@ class BEVBackbone(nn.Module):
         else:
             dist_flat = dist_flat[..., :8]
 
-        intrin_inv = torch.inverse(intrins.view(B, N, 3, 3))
-        pre_flat = pre_h.reshape(B * N, fH * fW, 3)
-        intrin_inv_flat = intrin_inv.reshape(B * N, 1, 3, 3).expand(B * N, fH * fW, 3, 3)
-        dist_flat_bn = dist_flat.reshape(B * N, 1, 8).expand(B * N, fH * fW, 8)
+        intrin_inv = torch.inverse(intrins.view(B, N, 3, 3))     # torch.Size([10, 8, 3, 3])
+        pre_flat = pre_h.reshape(B * N, fH * fW, 3)              # torch.Size([80, 3072, 3])
+        intrin_inv_flat = intrin_inv.reshape(B * N, 1, 3, 3).expand(B * N, fH * fW, 3, 3) # torch.Size([80, 3072, 3, 3])
+        dist_flat_bn = dist_flat.reshape(B * N, 1, 8).expand(B * N, fH * fW, 8) # torch.Size([80, 3072, 8])
 
         d_cam = _pixels_to_cam_dirs_fisheye(pre_flat, intrin_inv_flat, dist_flat_bn)
-        d_cam = d_cam.view(B, N, fH, fW, 3)
+        d_cam = d_cam.view(B, N, fH, fW, 3) # 相机坐标系
 
         rots_bn = rots.view(B, N, 3, 3)
         R_t = rots_bn.transpose(-1, -2).unsqueeze(2).unsqueeze(3).expand(B, N, fH, fW, 3, 3)
-        d_ego = torch.matmul(R_t, d_cam.unsqueeze(-1)).squeeze(-1)
+        d_ego = torch.matmul(R_t, d_cam.unsqueeze(-1)).squeeze(-1)#自车坐标系
 
         enc = self.positional_encoding(d_ego[..., :2], L)
         cam_pos_embedding = enc.view(B * N, fH, fW, -1).permute(0, 3, 1, 2).contiguous()

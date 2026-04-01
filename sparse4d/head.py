@@ -140,8 +140,9 @@ class Sparse4DHead(nn.Module):
             if self.layers[i] is None:
                 continue
             if op != "refine":
-                for p in self.layers[i].parameters():
-                    if p.dim() > 1:
+                # 仅初始化可训练参数；requires_grad=False 的（如 fix_scale、冻结的 buffer 式 Parameter）保持构造时的值。
+                for _, p in self.layers[i].named_parameters(recurse=True):
+                    if p.dim() > 1 and p.requires_grad:
                         nn.init.xavier_uniform_(p)
         for m in self.modules():
             if hasattr(m, "init_weight"):
@@ -391,7 +392,7 @@ class Sparse4DHead(nn.Module):
             reg_target = reg_target.to(device)
             reg_weights = reg_weights.to(device)
             reg_target = reg_target[..., : len(self.reg_weights)]
-            mask = torch.logical_not(torch.all(reg_target == 0, dim=-1))
+            mask = torch.logical_not(torch.all(reg_target == 0, dim=-1))# True是匹配上的，False是没有匹配上的
             # num_pos = max(self._reduce_mean(torch.sum(mask).to(dtype=reg.dtype)), 1.0)
             if self.cls_threshold_to_reg > 0:
                 mask = torch.logical_and(
@@ -412,7 +413,7 @@ class Sparse4DHead(nn.Module):
             else:
                 reg_target_flat = torch.where(
                     reg_target_flat.isnan(), reg.new_tensor(0.0), reg_target_flat
-                )
+                )# 防止数据缺失
                 cls_target_masked = cls_target_flat[mask_flat]
                 qt_masked = qt.flatten(end_dim=1)[mask_flat] if qt is not None else None
                 reg_loss_dict = self.loss_reg(

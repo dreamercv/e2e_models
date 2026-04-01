@@ -93,6 +93,8 @@ class Model(nn.Module):
             return float(self.det3d_loss_weights.get("cns", 1.0))
         if "loss_yns" in name:
             return float(self.det3d_loss_weights.get("yns", 1.0))
+        if "loss_giou" in name:
+            return float(self.det3d_loss_weights.get("giou", 1.0))
         return 1.0
 
     def forward_img_backbone(self,x):

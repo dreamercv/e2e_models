@@ -43,7 +43,25 @@ import time
 # 创建日志目录
 # log_dir = configs["log_dir"]
 # os.makedirs(log_dir, exist_ok=True)
+def create_scheduler_with_warmup(optimizer, warmup_steps, total_steps, base_lr, eta_min=0):
+    # 定义 warmup 阶段的学习率因子
+    def lambda_lr(step):
+        if step < warmup_steps:
+            return step / warmup_steps  # 线性增长到 1
+        else:
+            # 超过 warmup 后，因子保持 1，让 CosineAnnealingLR 接手
+            return 1.0
 
+    warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda_lr)
+    # 余弦退火调度器（假设从 base_lr 开始衰减）
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=total_steps - warmup_steps, eta_min=eta_min
+    )
+    # 将两个调度器串联
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_steps]
+    )
+    return scheduler
 
 def recursive_to_device(data, device):
     """
@@ -137,10 +155,22 @@ def main():
     steps_per_epoch = max(len(dl) for _, dl, _ in active)
     logging.info(f"steps_per_epoch: {steps_per_epoch}")
 
-    scheduler = lr_scheduler.CosineAnnealingLR(optimizer,T_max=steps_per_epoch*epochs,eta_min=0)
+
+    total_steps = epochs * steps_per_epoch
+    warmup_steps = int(0.05 * total_steps) 
+    scheduler = create_scheduler_with_warmup(
+        optimizer,
+        warmup_steps=warmup_steps,
+        total_steps=total_steps,
+        base_lr=lr,
+        eta_min=0
+    )
+
+    # scheduler = lr_scheduler.CosineAnnealingLR(optimizer,T_max=steps_per_epoch*epochs,eta_min=0)
 
     iteration = -1
-    if  strict:      
+    start_epoch = 0
+    if  strict and configs["resume"]:      
         optimizer.load_state_dict(checkpoint['optimizer'])  # 加载优化器参数
         for state in optimizer.state.values():
             for k, v in state.items():
@@ -148,6 +178,7 @@ def main():
                     state[k] = v.to(device)
         scheduler.load_state_dict(checkpoint['lr_schedule'])  # 加载优化器参数
         iteration = checkpoint['iteration'] + 1
+        start_epoch = checkpoint['epoch']
 
     
     log_print_interval = configs.get("log_print_interval", 10)
@@ -158,9 +189,9 @@ def main():
     os.system(f"cp {config_path} {log_dir}")
     writer = SummaryWriter(logdir=log_dir)
     
-    logging.info("Config:\n"+json.dumps(configs,indent=4))
+    # logging.info("Config:\n"+json.dumps(configs,indent=4))
     model.train()
-    for epoch in range(epochs):
+    for epoch in range(start_epoch,epochs):
         np.random.seed()
         for _, _, sp in active:
             if sp is not None and hasattr(sp, "set_epoch"):
@@ -247,9 +278,10 @@ def main():
 
 
             if iteration % log_print_interval == 0:
+                current_lr = optimizer.param_groups[0]['lr']
                 writer.add_scalar('epoch', epoch, iteration)
-
-                logging.info(f"Iteration [{iteration}] Epoch [{epoch+1}/{epochs}] Step [{batch_idx+1}/{steps_per_epoch}] "
+                writer.add_scalar('lr', current_lr, iteration)
+                logging.info(f"Iteration [{iteration}] Epoch [{epoch+1}/{epochs}] Step [{batch_idx+1}/{steps_per_epoch}]; LR: {current_lr:.6f}; "
                       f"loss: {float(total_loss.detach().cpu()):.4f}")
                 message = "/t"
                 writer.add_scalar('all_loss/loss', total_loss, iteration)
@@ -281,7 +313,7 @@ def main():
                     for i, img in enumerate(imgs[j]) :
                         img_np =  denormalize_img(img)
                         img_cv = cv2.cvtColor(np.array(img_np), cv2.COLOR_RGB2BGR)
-                        cv2.imwrite(f"{j}_{i}.jpg", img_cv)
+                        # cv2.imwrite(f"{j}_{i}.jpg", img_cv)
                         writer.add_image(f'{type_name}/input_img/{i}', img_cv, global_step=iteration, dataformats='HWC')
 
 
@@ -310,12 +342,12 @@ def main():
                                                                 boxes_3d=boxes_3d,
                                                                 scores_3d=scores_3d,
                                                                 labels_3d=labels_3d,
-                                                                score_thresh=0.3,  # 可调
-                                                            )
+                                                                score_thresh=0.3  # 可调
+                                                            ) #img_cv = cv2.cvtColor(np.array(img_np), cv2.COLOR_RGB2BGR)
                     for k,v in gt_dynamic_images.items():
-                        writer.add_image(f'dynamic/gt/{k}', v, global_step=iteration, dataformats='HWC')
+                        writer.add_image(f'dynamic/gt/{k}', cv2.cvtColor(v, cv2.COLOR_RGB2BGR), global_step=iteration, dataformats='HWC')
                     for k,v in pt_dynamic_images.items():  
-                        writer.add_image(f'dynamic/pt/{k}', v, global_step=iteration, dataformats='HWC')
+                        writer.add_image(f'dynamic/pt/{k}', cv2.cvtColor(v, cv2.COLOR_RGB2BGR), global_step=iteration, dataformats='HWC')
 
 
 
@@ -348,9 +380,9 @@ def main():
                                                         )
 
                     for k,v in gt_static_images.items():
-                        writer.add_image(f'static/gt/{k}', v, global_step=iteration, dataformats='HWC')
+                        writer.add_image(f'static/gt/{k}', cv2.cvtColor(v, cv2.COLOR_RGB2BGR), global_step=iteration, dataformats='HWC')
                     for k,v in pt_static_images.items():
-                        writer.add_image(f'static/pt/{k}', v, global_step=iteration, dataformats='HWC')
+                        writer.add_image(f'static/pt/{k}', cv2.cvtColor(v, cv2.COLOR_RGB2BGR), global_step=iteration, dataformats='HWC')
 
 
             if iteration % ckpt_save_interval == 0:
@@ -358,16 +390,16 @@ def main():
                 torch.save(model.state_dict(), os.path.join(log_dir,f"iter{iteration}.pth"))
                 model.train()
 
-        model.eval()
-        checkpoint = {
-            "state_dict": model.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            "epoch": epoch,
-            "iteration": iteration,
-            'lr_schedule': scheduler.state_dict()
-        }
-        torch.save(checkpoint, os.path.join(log_dir,f"iter{iteration}_epoch{epoch}.pth"))
-        model.train()
+        # model.eval()
+        # checkpoint = {
+        #     "state_dict": model.state_dict(),
+        #     'optimizer': optimizer.state_dict(),
+        #     "epoch": epoch,
+        #     "iteration": iteration,
+        #     'lr_schedule': scheduler.state_dict()
+        # }
+        # torch.save(checkpoint, os.path.join(log_dir,f"iter{iteration}_epoch{epoch}.pth"))
+        # model.train()
 # 
 
 
@@ -375,5 +407,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    nn.MultiheadAttention
-    from mmdet.models.losses import GaussianFocalLoss, L1Loss, CrossEntropyLoss

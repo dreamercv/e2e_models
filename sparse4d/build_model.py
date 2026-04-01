@@ -129,8 +129,8 @@ def build_det3D_head(
             reg_weights=reg_weights,
         )
     # -1 is used as background for unmatched anchors; keep a separate ignore index.
-    loss_cls = FocalLoss(alpha=0.25, gamma=2.0, ignore_index=-100)
-    loss_reg = SparseBox3DLoss(reg_weights=reg_weights, loss_centerness=True, loss_yawness=True)
+    loss_cls = FocalLoss(alpha=0.25, gamma=2.0, ignore_index=-1)
+    loss_reg = SparseBox3DLoss(reg_weights=reg_weights, loss_centerness=True, loss_yawness=True,loss_giou=True)
 
     decoder = None
     if use_decoder:
@@ -139,6 +139,7 @@ def build_det3D_head(
             score_threshold=decoder_score_threshold,
             sorted=True,
         )
+
 
     head = Sparse4DHead(
         instance_bank=instance_bank,

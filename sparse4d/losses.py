@@ -7,9 +7,8 @@ Sparse4D 检测分支用到的 loss 实现，参考官方 Sparse4D 中
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from .box3d import X, Y, Z, SIN_YAW, COS_YAW, CNS, YNS
-
+from .box3d import X, Y, Z,W, L, H, SIN_YAW, COS_YAW, CNS, YNS
+from .box3d import decode_box
 __all__ = [
     "FocalLoss",
     "L1Loss",
@@ -218,6 +217,7 @@ class SparseBox3DLoss(nn.Module):
         reg_weights=None,
         loss_centerness: bool = False,
         loss_yawness: bool = False,
+        loss_giou: bool = False,
         cls_allow_reverse=None,
     ):
         super().__init__()
@@ -225,6 +225,7 @@ class SparseBox3DLoss(nn.Module):
         self.loss_box = L1Loss(reduction="mean")
         self.loss_cns = CrossEntropyLoss(use_sigmoid=True, reduction="mean") if loss_centerness else None
         self.loss_yns = GaussianFocalLoss(reduction="mean") if loss_yawness else None
+        self.loss_giou = GIoU() if loss_giou else None
         self.cls_allow_reverse = cls_allow_reverse
 
     def forward(
@@ -263,11 +264,11 @@ class SparseBox3DLoss(nn.Module):
         ndim = min(len(self.reg_weights), box.shape[-1], box_target.shape[-1])
         box = box[..., :ndim]
         box_target = box_target[..., :ndim]
-
-        # 新增：清理 NaN，避免 0 * NaN -> NaN
+        weight = torch.where(box_target.isnan(), weight.new_tensor(0.0), weight)
+        weight = torch.where(box.isnan(), weight.new_tensor(0.0), weight)
         box = torch.where(box.isnan(), box.new_tensor(0.0), box)
         box_target = torch.where(box_target.isnan(), box_target.new_tensor(0.0), box_target)
-
+        
         if weight is not None:
             w = weight
             if w.dim() == box.dim() - 1:
@@ -328,4 +329,195 @@ class SparseBox3DLoss(nn.Module):
                 )
                 output[f"loss_yns{suffix}"] = yns_loss
 
+
+        if self.loss_giou is not None:
+            giou_loss = self.loss_giou(box,box_target,avg_factor)
+            output[f"loss_iou{suffix}"] = giou_loss
         return output
+
+
+
+
+
+
+
+
+
+
+
+class GIoU(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self,box, box_target,avg_factor):
+        
+        pred_dec = decode_box(box)    # (num_pos, 10)
+        tgt_dec = decode_box(box_target)
+        pred_bev = torch.stack([pred_dec[..., 0], pred_dec[..., 1],
+                                pred_dec[..., 3], pred_dec[..., 4],
+                                pred_dec[..., 6]], dim=-1)
+        tgt_bev = torch.stack([tgt_dec[..., 0], tgt_dec[..., 1],
+                                tgt_dec[..., 3], tgt_dec[..., 4],
+                                tgt_dec[..., 6]], dim=-1)
+        giou = self.rotated_giou(pred_bev, tgt_bev)   # (num_pos,)
+        loss_giou = (1 - giou).sum() / max(float(avg_factor), 1.0)
+        return loss_giou
+
+    def rotated_giou(self,boxes1, boxes2, eps=1e-8):
+        """
+        计算 BEV 旋转矩形的 GIoU。
+        boxes1, boxes2: (N, 5) 或 (..., 5)，最后一维为 [cx, cy, w, l, yaw]
+        返回 (N,) GIoU 值。
+        """
+        # 提取参数
+        cx1, cy1, w1, l1, yaw1 = boxes1.unbind(-1)
+        cx2, cy2, w2, l2, yaw2 = boxes2.unbind(-1)
+
+        # 获取顶点
+        vert1 = self.get_rect_vertices(cx1, cy1, w1, l1, yaw1)  # (N,4,2)
+        vert2 = self.get_rect_vertices(cx2, cy2, w2, l2, yaw2)  # (N,4,2)
+
+        # 计算交集多边形
+        inters = self.intersect_convex_polygons(vert1, vert2)  # list of (K_i,2)
+
+        # 计算交集面积
+        inter_area = torch.zeros_like(cx1)
+        for i, poly in enumerate(inters):
+            if poly.shape[0] >= 3:
+                inter_area[i] = self.polygon_area(poly.unsqueeze(0)).squeeze()
+
+        # 计算两个矩形自身面积
+        area1 = w1 * l1
+        area2 = w2 * l2
+        union_area = area1 + area2 - inter_area
+
+        # 计算最小外接矩形（轴对齐）的顶点
+        all_pts = torch.cat([vert1, vert2], dim=1)  # (N,8,2)
+        xmin = all_pts[..., 0].min(dim=-1)[0]
+        xmax = all_pts[..., 0].max(dim=-1)[0]
+        ymin = all_pts[..., 1].min(dim=-1)[0]
+        ymax = all_pts[..., 1].max(dim=-1)[0]
+        enclosing_area = (xmax - xmin) * (ymax - ymin)
+
+        iou = inter_area / (union_area + eps)
+        giou = iou - (enclosing_area - union_area) / (enclosing_area + eps)
+        return giou
+
+    
+    def get_rect_vertices(self,cx, cy, w, l, yaw):
+        """
+        获取旋转矩形的四个顶点（顺时针或逆时针，首尾相连）。
+        cx, cy: (...,) 中心坐标
+        w, l: (...,) 宽度（x 方向）和长度（y 方向）
+        yaw: (...,) 旋转角（弧度）
+        返回顶点张量 (..., 4, 2)
+        """
+        dx = w / 2
+        dy = l / 2
+        # 未旋转时的四个角点（顺序：左下、右下、右上、左上）
+        corners = torch.stack([
+            torch.stack([-dx, -dy], dim=-1),  # 左下
+            torch.stack([ dx, -dy], dim=-1),  # 右下
+            torch.stack([ dx,  dy], dim=-1),  # 右上
+            torch.stack([-dx,  dy], dim=-1),  # 左上
+        ], dim=-2)  # (..., 4, 2)
+        center = torch.stack([cx, cy], dim=-1)
+        sin, cos = torch.sin(yaw), torch.cos(yaw)
+        vertices = self.rotate_points(corners, center, sin, cos)
+        return vertices
+
+    
+    def intersect_convex_polygons(self,poly1, poly2):
+        """
+        计算两个凸多边形的交集，返回交集顶点列表（每个 batch 独立）。
+        poly1, poly2: (..., M, 2), (..., N, 2)
+        """
+        batch_size = poly1.shape[0]
+        out_polys = []
+        for b in range(batch_size):
+            subject = poly1[b]  # (M,2)
+            clip = poly2[b]     # (N,2)
+            # 用 clip 的每条边裁剪 subject
+            result = subject
+            for i in range(clip.shape[0]):
+                a = clip[i]
+                b = clip[(i+1) % clip.shape[0]]
+                result_list = self.clip_polygon_by_halfplane(result.unsqueeze(0), a.unsqueeze(0), b.unsqueeze(0))
+                result = result_list[0] if len(result_list[0]) > 0 else torch.zeros(0, 2, device=poly1.device)
+                if result.shape[0] < 3:
+                    result = torch.zeros(0, 2, device=poly1.device)
+                    break
+            out_polys.append(result)
+        return out_polys
+
+    def polygon_area(self,poly):
+        """
+        计算多边形面积（鞋带公式），poly: (..., N, 2)
+        """
+        N = poly.shape[-2]
+        shift = torch.roll(poly, shifts=-1, dims=-2)
+        cross = poly[..., 0] * shift[..., 1] - poly[..., 1] * shift[..., 0]
+        area = cross.sum(dim=-1) / 2.0
+        return area.abs()
+    
+    def rotate_points(self, points, center, sin, cos):
+        """绕中心旋转点集 points: (..., N, 2)；center (..., 2)；sin/cos (...) 与 batch 维对齐。"""
+        x, y = points[..., 0], points[..., 1]
+        cx = center[..., 0].unsqueeze(-1)
+        cy = center[..., 1].unsqueeze(-1)
+        s = sin.unsqueeze(-1)
+        c = cos.unsqueeze(-1)
+        x_rel = x - cx
+        y_rel = y - cy
+        x_rot = x_rel * c - y_rel * s
+        y_rot = x_rel * s + y_rel * c
+        return torch.stack([x_rot + cx, y_rot + cy], dim=-1)
+
+    
+
+    def clip_polygon_by_halfplane(self,poly, a, b):
+        """
+        使用 Sutherland-Hodgman 算法，将多边形 poly 裁剪到半平面左侧（含边界）。
+        poly: (..., N, 2)
+        a, b: (..., 2) 定义半平面的边（从 a 到 b）
+        返回裁剪后的多边形顶点列表（每个 batch 独立）。
+        """
+        # 对每个 batch 独立处理（可并行，但为清晰采用循环）
+        batch_shape = poly.shape[:-2]
+        N = poly.shape[-2]
+        out_polys = []
+        for idx in range(poly.shape[0]):  # 假设 poly 至少有 batch 维度
+            p = poly[idx]  # (N, 2)
+            a_ = a[idx]
+            b_ = b[idx]
+            output = [p[-1]]  # 从最后一个点开始，便于循环
+            for i in range(N):
+                cur = p[i]
+                prev = p[i-1]
+                # 判断点是否在左侧（叉积 >= 0）
+                def is_left(p):
+                    return (b_[0]-a_[0])*(p[1]-a_[1]) - (b_[1]-a_[1])*(p[0]-a_[0]) >= 0
+                cur_inside = is_left(cur)
+                prev_inside = is_left(prev)
+                if prev_inside and cur_inside:
+                    output.append(cur)
+                elif prev_inside and not cur_inside:
+                    # 求交点
+                    # 线段 prev-cur 与边 a-b 的交点
+                    # 参数方程解
+                    t = ((a_[0]-prev[0])*(b_[1]-a_[1]) - (a_[1]-prev[1])*(b_[0]-a_[0])) / \
+                        ((cur[0]-prev[0])*(b_[1]-a_[1]) - (cur[1]-prev[1])*(b_[0]-a_[0]) + 1e-8)
+                    ip = prev + t * (cur - prev)
+                    output.append(ip)
+                elif not prev_inside and cur_inside:
+                    t = ((a_[0]-prev[0])*(b_[1]-a_[1]) - (a_[1]-prev[1])*(b_[0]-a_[0])) / \
+                        ((cur[0]-prev[0])*(b_[1]-a_[1]) - (cur[1]-prev[1])*(b_[0]-a_[0]) + 1e-8)
+                    ip = prev + t * (cur - prev)
+                    output.append(ip)
+                    output.append(cur)
+            # 去掉最后一个重复点（起始点重复）
+            if len(output) > 0:
+                output = output[1:]  # 去掉初始的 prev
+            out_polys.append(torch.stack(output, dim=0) if output else torch.zeros(0, 2, device=poly.device, dtype=poly.dtype))
+        # 返回 list of tensors
+        return out_polys

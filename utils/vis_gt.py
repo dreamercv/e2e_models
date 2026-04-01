@@ -460,6 +460,7 @@ def vis_dynamic_gt(camera_names,label_path,labels,bboxes,label_masks=None,bboxes
         thickness=1
     )
     for i in range(obj_num):
+        label = labels[i]
         if label_masks is not None :
             label_mask = label_masks[i]
         else:
@@ -468,7 +469,7 @@ def vis_dynamic_gt(camera_names,label_path,labels,bboxes,label_masks=None,bboxes
             color = (0,0,0)
         else:
             color = class_colors[int(label)]
-        label = labels[i]
+        
         x, y, z, width, length, height, yaw, vx,vy,vz = bboxes[i]
         pitch,roll = 0,0
         box3d_lidar = create_3d_bbox_corners([x,y,z],[length,width,height],[roll,pitch,yaw])
@@ -490,6 +491,8 @@ def vis_dynamic_gt(camera_names,label_path,labels,bboxes,label_masks=None,bboxes
     # print("bev",bev_img.shape)
     # print("done")
     canvas = create_overview(images, target_height=300)
+    # for k,v in images.items():
+    #     cv2.imwrite(f"{k}.jpg", v)
     return canvas,images
 
 

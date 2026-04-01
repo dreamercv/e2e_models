@@ -492,7 +492,10 @@ class Dataset(torch.utils.data.Dataset):
         cnis = {}
         timestamps = []
         for i, label_path in enumerate(recs):
-            timestamp = os.path.basename(recs[i]).replace(".json","")
+            try:
+                timestamp = os.path.basename(recs[i]).replace(".json","").split("_")[1]
+            except:
+                timestamp = os.path.basename(recs[i]).replace(".json","")
             from datetime import datetime
             # if timestamp.isdigit():
             dt = datetime.strptime(timestamp, '%Y%m%d%H%M%S.%f')

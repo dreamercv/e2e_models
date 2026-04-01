@@ -114,7 +114,7 @@ class DenoisingSampler(nn.Module):
             else:
                 dynamic_w = torch.ones_like(static_w)
             weight = static_w * dynamic_w * box_pred.new_tensor(self.reg_weights)
-            cost_i = torch.sum(diff * weight, dim=-1) * self.box_weight
+            cost_i = torch.sum(diff * weight, dim=-1) * self.box_weight # 50 * 24
             cost.append(cost_i)
         return cost
 

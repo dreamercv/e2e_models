@@ -6,21 +6,21 @@ configs = {
     "lr":1e-3,
     "max_grad_norm": 5,
     "weight_decay":1e-4,
-
+    "resume":False,
     "pretrain":None,
     "backbone":"resnet18",
     "backbone_path":"../resnet18-f37072fd.pth",
 
 
     "is_train": True,
-    "batch_size": 2,
+    "batch_size": 1,
     "num_workers": 1,
-    "epoch": 100,
+    "epoch": 200,
     "seq_len": 5,
 
 
-    "log_dir": "../logs/only_dynamic_0327_nodn_resnet18_ok_demo",
-    "log_save_interval": 100,
+    "log_dir": "../logs/only_dynamic_0331_5frames_dn_algin_cnsx2_oriroi_newdepth_newaug_campos_learn",
+    "log_save_interval": 10,
     "log_print_interval": 1,
     "ckpt_save_interval":100,
 
@@ -37,7 +37,7 @@ configs = {
         'zbound': [-2.0, 4.0, 1.0]
     },
     # BEV：在 grid_sample 前把相机视线在自车系 xy 上的 sin/cos 编码拼到 2D 特征上（硬编码、无梯度）
-    "bev_use_cam_pos_embed": False,
+    "bev_use_cam_pos_embed": True,
     "bev_cam_pos_L": 4,
 
     "clip_paths": {
@@ -54,14 +54,14 @@ configs = {
     },
     "camera_infos": {
         "FrontCam02": {
-            "resize_lim": [(0.1, 0.1), (0.17, 0.23), (0.35, 0.45)],
-            "bot_pct_lim": [(0.15, 0.25), (0.27, 0.37), (0.37, 0.47)]
+            "resize_lim": [(0.1, 0.1), (0.12, 0.15), (0.25, 0.30)],
+            "bot_pct_lim": [(0.15, 0.25), (0.10, 0.20), (0.30, 0.37)]
         },  # 前 大
-        "RearCam01": {"resize_lim": [(0.2, 0.3)], "bot_pct_lim": [(0.2, 0.5)]},  # 后方
-        "SideFrontCam01": {"resize_lim": [(0.2, 0.3)], "bot_pct_lim": [(0.2, 0.5)]},  # 左前
-        "SideFrontCam02": {"resize_lim": [(0.2, 0.3)], "bot_pct_lim": [(0.2, 0.5)]},  # 右前
-        "SideRearCam01": {"resize_lim": [(0.2, 0.3)], "bot_pct_lim": [(0.2, 0.5)]},  # 左后
-        "SideRearCam02": {"resize_lim": [(0.2, 0.3)], "bot_pct_lim": [(0.2, 0.5)]}  # 右后
+        "RearCam01": {"resize_lim": [(0.05, 0.25)], "bot_pct_lim": [(0.05, 0.2)]},  # 后方
+        "SideFrontCam01": {"resize_lim": [(0.1, 0.25)], "bot_pct_lim": [(0.05, 0.3)]},  # 左前
+        "SideFrontCam02": {"resize_lim": [(0.1, 0.25)], "bot_pct_lim": [(0.05, 0.3)]},  # 右前
+        "SideRearCam01": {"resize_lim": [(0.1, 0.25)], "bot_pct_lim": [(0.15, 0.25)]},  # 左后
+        "SideRearCam02": {"resize_lim": [(0.1, 0.25)], "bot_pct_lim": [(0.15, 0.25)]}  # 右后
     },
     'rot_lim': (-0.0, 0.0),
     "flip": False,
@@ -72,7 +72,7 @@ configs = {
     "mode": "static",  # 默认加载动态数据
     
 
-    "train_clips": ["20250508072555"],  # -1 所有，[]指定几个，xxx.txt写进txt中指定的，>0前N个
+    "train_clips": 1,#["20260101010101"],  # -1 所有，[]指定几个，xxx.txt写进txt中指定的，>0前N个
 
     "total_len": 20 + 1 + 50,  # 一共71帧，当前帧是第21帧，往前20帧，往后50帧 ，最后一帧索引对应着70 ，未来50帧为了获取真值
     "current_frame_index": 20,  # 0 1 2 3 4 5 ... [20] 21 22 23 ... 70
@@ -140,9 +140,9 @@ configs = {
     ],
     # 3D 检测类别：与 convert_det 输出的 object_infos[].sub_category 对应，用于映射到类别下标
     "det_class_names": [
-        "pedestrian",  # 人
+        # "pedestrian",  # 人
         "car", "truck", "bus",  # 车
-        "bicycle", "motorcycle"  # 骑行者
+        # "bicycle", "motorcycle"  # 骑行者
     ],
     "det_gt_names": ["x", "y", "z", "w", "l", "h", "yaw", "vx", "vy", "vz"],
 
@@ -167,35 +167,36 @@ configs = {
     "img_outchannels": 8,
     "det3d_loss_weights": {
         "cls": 2.0,
-        "box": 0.25,
-        "cns": 1.0,
+        "box": 1,
+        "cns": 2,
         "yns": 1.0,
+        "giou":1.0,
     },
     # 2d
     "det_2d_num": 6,
     "map_2d_num": 3,
     # det3D
     "det_3d_head": {
-        "num_anchor": 20,
+        "num_anchor": 50,
         "embed_dims": 256,
         "num_decoder": 3,
         "num_single_frame_decoder": 2,
-        "num_classes": 6,
+        "num_classes": 3,
         "bev_bounds": None,
         "anchor_init": "../300clips_kmeans512_range_200.npy",
         "decouple_attn": True,
         "num_heads": 8,
         "dropout": 0.1,
         "use_dn": True,
-        "num_dn_groups": 5,
+        "num_dn_groups": 2,
         "dn_noise_scale": 0.5,
         "max_dn_gt": 8,
         "add_neg_dn": True,
         "reg_weights": [1.0] * 3 + [1.0] * 3 + [1.0] * 2 + [0.]*3,
         "use_decoder": True,
-        "decoder_num_output": 50,
+        "decoder_num_output": 30,
         "decoder_score_threshold": None,
-        "instance_grad":True,
+        "instance_grad":False,
         "anchor_grad":True,
         "cls_threshold_to_reg":-1,
     },
