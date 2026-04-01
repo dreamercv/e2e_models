@@ -129,10 +129,12 @@ class Model(nn.Module):
         return out,det_loss,result
 
 
-    def forward_static_branch(self,bev_feat,metas,decoder=False):
+    def forward_static_branch(self, bev_feat, metas, decoder=False, temporal_len=None):
         # bev_feat: (B * T, C, H, W)，静态分支希望对整个时间序列 T 帧都计算地图 loss
         Bt, C, H, W = bev_feat.shape
-        T = self.seq_len
+        T = temporal_len if temporal_len is not None else self.seq_len
+        if T <= 0 or Bt % T != 0:
+            T = self.seq_len
         B = Bt // T
         # 直接把每一帧当作一个样本送入 MapHead，batch 视作 B*T
         map_pred = self.map3d_head(bev_feat, metas)
@@ -267,7 +269,9 @@ class Model(nn.Module):
                     for k, v in det_loss.items():
                         losses[f"det3d_{k}"] = v
             if task_name == "static" or task_name == "dynamic_static":
-                map_out = self.forward_static_branch(sub_bev_feture, metas["static"], decoder=decoder)
+                map_out = self.forward_static_branch(
+                    sub_bev_feture, metas["static"], decoder=decoder, temporal_len=t
+                )
                 map_loss = map_out.get("loss_map", None)
                 if isinstance(map_loss, dict):
                     for k, v in map_loss.items():
@@ -357,7 +361,9 @@ class Model(nn.Module):
                     for k, v in det_loss.items():
                         losses[f"det3d_{k}"] = v
             if task_name == "static" or task_name == "dynamic_static":
-                map_out = self.forward_static_branch(sub_bev_feture, metas["static"],decoder=decoder)
+                map_out = self.forward_static_branch(
+                    sub_bev_feture, metas["static"], decoder=decoder, temporal_len=t
+                )
                 map_loss = map_out.get("loss_map", None)
                 if isinstance(map_loss, dict):
                     for k, v in map_loss.items():

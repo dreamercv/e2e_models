@@ -296,12 +296,36 @@ class Dataset(torch.utils.data.Dataset):
         # 数据准备
         self.get_all_paths()
         self.prepro()
-        self.sces_len = [(len(self.ixes[i]) - self.total_len ) for i in self.ixes.keys()]
+        self.sces_len = [self._num_sliding_windows(len(self.ixes[i])) for i in self.ixes.keys()]
         self.scenes = [i for i in self.ixes.keys()]
 
         # 检测配置
         self.det_class_names = config["det_class_names"]
         self.det_gt_names = config["det_gt_names"]
+
+    def _history_sliding_k_count(self):
+        """历史段 [0..H-1] 上长度为 seq_len 的滑动窗口个数，如 H=20,seq_len=5 -> 16。"""
+        if not self.config.get("train_history_sliding_chunks", False):
+            return 1
+        H = int(self.config.get("history_sliding_num_frames", 20))
+        return max(0, H - self.seq_len + 1)
+
+    def _decode_index_history_sliding(self, index: int):
+        """将扁平 index 映射为 (clip_name, 滑动起点 sce_id_ind, 历史内偏移 k_off)。"""
+        K = self._history_sliding_k_count()
+        if K <= 0:
+            raise RuntimeError("train_history_sliding_chunks: history_sliding_num_frames < seq_len")
+        rem = int(index)
+        for clip_name in self.scenes:
+            L = len(self.ixes[clip_name])
+            W = self._num_sliding_windows(L)
+            block = W * K
+            if rem < block:
+                win_idx = rem // K
+                k_off = rem % K
+                return clip_name, win_idx, k_off
+            rem -= block
+        raise IndexError(f"index {index} out of range")
 
     def gen_rays(self):
         ogfH, ogfW = self.fH, self.fW
@@ -1115,6 +1139,28 @@ class Dataset(torch.utils.data.Dataset):
         return indexs_dict
 
 
+    def _num_sliding_windows(self, L):
+        """每个 clip 上长度为 total_len 的滑动窗口个数（与 __len__ / __getitem__ 索引一致）。"""
+        w = max(0, L - self.total_len)
+        # 整窗流式：若 clip 帧数恰好等于 total_len，原公式 L-total_len==0 会导致无样本，补 1 条窗口。
+        if self.config.get("train_full_window_temporal", False) and L == self.total_len and w == 0:
+            return 1
+        return w
+
+    def build_streaming_temporal_indexs(self, rec_len: int):
+        """
+        train_full_window_temporal 时：按当前 rec 实际长度取帧（0..rec_len-1），适配 300/600 等不等长 clip。
+        stream_max_frames：限制单次样本的 T 上限，避免 total_len 过大导致 DataLoader/显存阻塞；长 clip 靠滑动窗口多次采样覆盖。
+        """
+        if rec_len <= 0:
+            return []
+        cap = self.config.get("stream_max_frames", None)
+        if cap is not None and int(cap) > 0:
+            n = min(rec_len, int(cap))
+        else:
+            n = rec_len
+        return list(range(n))
+
     def get_input_indexs(self,mode="dynamic"):
         if self.task_index_random:
             #随机生成的轨迹合并，分成两大类：动态和静态，否则占资源
@@ -1128,23 +1174,65 @@ class Dataset(torch.utils.data.Dataset):
             indexs = sorted(random.sample(indexs,his_len)) + [self.current_frame_index]
         else:
             indexs = [self.current_frame_index - i for i in range(self.seq_len)][::-1]
-        
         return indexs
         
 
 
     def __getitem__(self, index):
-        sces_len = self.sces_len
-        scenes = self.scenes
-        sce_id = [i for i in range(len(sces_len)) if (sum(sces_len[:i]) <= index and sum(sces_len[:i + 1]) > index)][0]
-        clip_name = scenes[sce_id]
-        sce_id_ind = index - sum(sces_len[:sce_id])
-        rec = self.ixes[clip_name][sce_id_ind:sce_id_ind + self.total_len]
+        history_sliding = self.config.get("train_history_sliding_chunks", False)
+        rec_e2e_anchor = None
+
+        if history_sliding:
+            clip_name, win_idx, k_off = self._decode_index_history_sliding(index)
+            clip_paths = self.ixes[clip_name]
+            clip_len = len(clip_paths)
+            sce_id_ind = win_idx
+            end = min(sce_id_ind + self.total_len, clip_len)
+            rec = clip_paths[sce_id_ind:end]
+            rec_len = len(rec)
+            H = int(self.config.get("history_sliding_num_frames", 20))
+            if k_off + self.seq_len > H:
+                raise RuntimeError(
+                    f"history_sliding: k_off={k_off} seq_len={self.seq_len} exceeds history H={H}"
+                )
+            if rec_len < H:
+                raise RuntimeError(
+                    f"history_sliding: rec_len={rec_len} < history_sliding_num_frames={H} "
+                    f"clip={clip_name} sce_id_ind={sce_id_ind}"
+                )
+            indexs = [k_off + i for i in range(self.seq_len)]
+            recs = [rec[i] for i in indexs]
+            if rec_len > self.current_frame_index:
+                rec_e2e_anchor = [rec[self.current_frame_index]]
+            else:
+                rec_e2e_anchor = [rec[-1]]
+        else:
+            sces_len = self.sces_len
+            scenes = self.scenes
+            sce_id = [i for i in range(len(sces_len)) if (sum(sces_len[:i]) <= index and sum(sces_len[:i + 1]) > index)][0]
+            clip_name = scenes[sce_id]
+            sce_id_ind = index - sum(sces_len[:sce_id])
+            clip_paths = self.ixes[clip_name]
+            clip_len = len(clip_paths)
+            # 滑动窗口右端不越界；不足 total_len 时 rec 变短（如 clip 尾段）
+            end = min(sce_id_ind + self.total_len, clip_len)
+            rec = clip_paths[sce_id_ind:end]
+            rec_len = len(rec)
+            if self.config.get("train_full_window_temporal", False):
+                indexs = self.build_streaming_temporal_indexs(rec_len)
+            else:
+                mode0 = self.dynamic_static_data(clip_name)
+                indexs = self.get_input_indexs(mode0)
+                indexs = [i for i in indexs if 0 <= i < rec_len]
+            if rec_len > 0 and len(indexs) == 0:
+                raise RuntimeError(
+                    f"Dataset temporal indexs empty: clip={clip_name}, sce_id_ind={sce_id_ind}, "
+                    f"rec_len={rec_len}, current_frame_index={self.current_frame_index}, seq_len={self.seq_len}"
+                )
+            recs = [rec[i] for i in indexs]
+
         dt = self.get_Hz_by_filename_from_json(rec)
-        mode = self.dynamic_static_data(clip_name) # 判断那种数据类型，是否指标了动态数据，还是只标了静态数据，还是两者都标注了
-        indexs= self.get_input_indexs(mode)  # 16 17 18 19 20
-        #数据增强部分
-        recs = [rec[i] for i in indexs]
+        mode = self.dynamic_static_data(clip_name)
         label_paths = {
             "label_path":recs
         }
@@ -1169,7 +1257,8 @@ class Dataset(torch.utils.data.Dataset):
 
 
         anno_infos = {}
-        
+        # 全窗 current_frame_index 上的自车轨迹真值；history_sliding 时输入仅为 5 帧，锚点仍用窗口内第 current_frame_index 帧
+        rec_e2e = rec_e2e_anchor if rec_e2e_anchor is not None else recs
 
         # 有哪些任务收集哪些真值
         if mode == "dynamic" or mode == "dynamic_static":
@@ -1178,7 +1267,7 @@ class Dataset(torch.utils.data.Dataset):
             if self.task_flags["det3D"]:
                 anno_infos.update(self.get_anno_det3D(recs,dt=dt))
             # if self.task_flags["obj_dynamic_traj"]:
-            #     anno_infos.update(self.get_anno_obj_dynamic_traj(recs,dt=dt))
+            #     anno_infos.update(self.get_anno_obj_dynamic_traj(rec_e2e,dt=dt))
 
         if mode == "static" or mode == "dynamic_static":
             if self.task_flags["map2D"]:
@@ -1186,10 +1275,10 @@ class Dataset(torch.utils.data.Dataset):
             if self.task_flags["map3D"]:
                 anno_infos.update(self.get_anno_map3D(recs))
             if self.task_flags["e2e_static_traj"]:
-                anno_infos.update(self.get_anno_e2e_static_traj(recs,  num_static_pts=20))
+                anno_infos.update(self.get_anno_e2e_static_traj(rec_e2e,  num_static_pts=20))
 
         if self.task_flags["e2e_dynamic_traj"] or mode == "dynamic_static":
-            anno_infos.update(self.get_anno_e2e_dynamic_traj(recs, dt=dt))
+            anno_infos.update(self.get_anno_e2e_dynamic_traj(rec_e2e, dt=dt))
         
         # 避免 DataLoader default_collate 遇到 None 报错：未参与任务的键保持为 None 时改为可 collate 的占位
         for k in list(anno_infos.keys()):
@@ -1206,7 +1295,12 @@ class Dataset(torch.utils.data.Dataset):
 
 
     def __len__(self):
-        return sum([(len(self.ixes[i]) - self.total_len) for i in self.ixes.keys()])
+        if self.config.get("train_history_sliding_chunks", False):
+            K = self._history_sliding_k_count()
+            if K <= 0:
+                return 0
+            return sum(self._num_sliding_windows(len(self.ixes[i])) * K for i in self.ixes.keys())
+        return sum(self._num_sliding_windows(len(self.ixes[i])) for i in self.ixes.keys())
     
     def prepro(self):
         all_clip_names = list(self.clip2path.keys())

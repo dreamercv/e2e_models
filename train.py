@@ -301,11 +301,11 @@ def main():
 
 
             if iteration % log_save_interval == 0:
-                # 可视化真值
-                seq_len = configs["seq_len"]
+                # 可视化真值（时间维长度以当前 batch 为准，支持 train_full_window_temporal）
+                t_vis = inputs_tensor["x"].shape[2]
                 batchidx  = configs["batch_size"]-1
 
-                cur_idx = seq_len-1
+                cur_idx = t_vis - 1
 
                 from dataset.dataset import denormalize_img
                 import cv2
@@ -365,7 +365,7 @@ def main():
                     # 2) 画预测
                     # map_polylines 是 decode 出的结果，通常是 list 长度 B*T
                     map_polylines = outputs["map3d_out"]["map_polylines"]
-                    poly = map_polylines[batchidx * seq_len + cur_idx]
+                    poly = map_polylines[batchidx * t_vis + cur_idx]
                     pred_labels = poly["labels"].detach().cpu().numpy()
                     if poly["pts"].dim() == 3:
                             pred_pts = poly["pts"].detach().cpu().numpy()

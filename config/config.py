@@ -20,6 +20,16 @@ configs = {
 
     # True：训练时在 Model 内按 clip 时间维逐帧前向（2D+BEV 峰值显存按单帧），帧间 BEV 仍用 theta 与上一帧融合特征对齐。
     "train_stream_clip_frames": False,
+    # True：Dataset 一次加载滑动窗口内全部 rec 帧（rec 长度随 clip 变化），不再只采样 seq_len 帧；需与 train_stream_clip_frames=True 同开。
+    # total_len：滑动窗口最大长度（秒）；clip 有 300/600 帧时同一 total_len 即可，rec 实际长度为 min(total_len, 剩余帧)。
+    # stream_max_frames：单次样本最大 T（可选），防止一次 collate 帧数过大阻塞 DataLoader/OOM；长 clip 靠多次滑动窗口覆盖。
+    "train_full_window_temporal": False,
+    "stream_max_frames": None,  # 例如 64 或 128；None 表示不额外截断，用满当前 rec
+
+    # True：每个 total_len 滑动窗内，仅在前 history_sliding_num_frames 帧上做长度为 seq_len 的滑动子窗（如 H=20,seq_len=5 → 0-4,1-5,...,15-19 共 16 段），
+    # 每段仍只加载 seq_len 帧，走标准 BEV 5 帧时序融合（勿与 train_stream_clip_frames 同开）。与 train_full_window_temporal 互斥，优先本项。
+    "train_history_sliding_chunks": False,
+    "history_sliding_num_frames": 20,
 
     "log_dir": "../logs/only_dynamic_0331_5frames_dn_algin_cnsx2_oriroi_newdepth_newaug_campos_learn",
     "log_save_interval": 10,
