@@ -253,7 +253,8 @@ def main():
                 inputs_tensor["theta_mats"],
                 metas=metas,
                 decoder= True if iteration % log_save_interval == 0 else False,
-                task_names=useful_type_names
+                task_names=useful_type_names,
+                stream_clip_frames=configs.get("train_stream_clip_frames", False),
             )
 
             

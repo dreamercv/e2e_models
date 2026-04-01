@@ -18,6 +18,8 @@ configs = {
     "epoch": 200,
     "seq_len": 5,
 
+    # True：训练时在 Model 内按 clip 时间维逐帧前向（2D+BEV 峰值显存按单帧），帧间 BEV 仍用 theta 与上一帧融合特征对齐。
+    "train_stream_clip_frames": False,
 
     "log_dir": "../logs/only_dynamic_0331_5frames_dn_algin_cnsx2_oriroi_newdepth_newaug_campos_learn",
     "log_save_interval": 10,

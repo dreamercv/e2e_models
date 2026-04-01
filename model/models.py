@@ -173,16 +173,158 @@ class Model(nn.Module):
         map_out["map_polylines"] = map_polylines
         return map_out
 
+    def _forward_stream_clip_frames(
+        self,
+        x,
+        rots,
+        trans,
+        intrins,
+        distorts,
+        post_rot,
+        pos_tran,
+        theta_mats,
+        T_ego_his2curs,
+        metas,
+        decoder,
+        task_names,
+    ):
+        """
+        按 clip 内时间维逐帧前向：每帧只做 (b*m*n) 张图与单步 BEV，显存峰值近似按单帧；
+        帧间时序融合与原版 BEV forward 一致：上一帧融合后的 BEV + theta 与当前帧 pre-align 特征再 algin_fusion。
+        """
+        b, m, t, n, c, h, w = x.shape
+        rots_bm = rearrange(rots, "b m t n h w -> (b m) t n h w")
+        trans_bm = rearrange(trans, "b m t n h w -> (b m) t n h w")
+        intrins_bm = rearrange(intrins, "b m t n h w -> (b m) t n h w")
+        distorts_bm = rearrange(distorts, "b m t n h w -> (b m) t n h w")
+        post_rot_bm = rearrange(post_rot, "b m t n h w -> (b m) t n h w")
+        pos_tran_bm = rearrange(pos_tran, "b m t n h w -> (b m) t n h w")
+        theta_bm = rearrange(theta_mats, "b m t h w -> (b m) t h w")
 
-    def forward(self, x, rots, trans, intrins, distorts, post_rot, pos_tran, theta_mats, T_ego_his2curs=None, metas=None,decoder=False,task_names=[]):
+        if T_ego_his2curs is None:
+            T_ego_his2curs = torch.eye(4, device=x.device).view(1, 1, 4, 4).expand(b, t, 4, 4)
+
+        det2d_hms, det2d_offs, det2d_sizes = [], [], []
+        map2d_list = []
+        bev_frames = []
+        prev_fused = None
+
+        for ti in range(t):
+            x_t = x[:, :, ti, :, :, :, :]
+            x_flat = rearrange(x_t, "b m n c h w -> (b m n) c h w")
+            x_feat = self.forward_img_backbone(x_flat)
+
+            hmap, off, sz = self.forward_det2d(x_feat)
+            det2d_hms.append(hmap)
+            det2d_offs.append(off)
+            det2d_sizes.append(sz)
+            map2d_list.append(self.forward_map2d(x_feat))
+
+            rots_t = rots_bm[:, ti : ti + 1, ...]
+            trans_t = trans_bm[:, ti : ti + 1, ...]
+            intrins_t = intrins_bm[:, ti : ti + 1, ...]
+            distorts_t = distorts_bm[:, ti : ti + 1, ...]
+            post_rot_t = post_rot_bm[:, ti : ti + 1, ...]
+            pos_tran_t = pos_tran_bm[:, ti : ti + 1, ...]
+
+            cur_pre = self.bev_backbone.encode_single_frame(
+                x_feat,
+                rots_t,
+                trans_t,
+                intrins_t,
+                distorts_t,
+                post_rot_t,
+                pos_tran_t,
+            )
+            if ti == 0:
+                fused = cur_pre
+            else:
+                theta_t = theta_bm[:, ti]
+                fused = self.bev_backbone.fuse_with_prev(prev_fused, cur_pre, theta_t)
+            prev_fused = fused
+            bev_frames.append(fused)
+
+        bev_stack = torch.stack(bev_frames, dim=1)
+        bev_feat = bev_stack.reshape(b, m, t, *bev_stack.shape[2:])
+
+        det2d_out = (
+            torch.cat(det2d_hms, dim=0),
+            torch.cat(det2d_offs, dim=0),
+            torch.cat(det2d_sizes, dim=0),
+        )
+        map2d_out = torch.cat(map2d_list, dim=0)
+
+        losses = {}
+        det_out, det_result = None, None
+        map_out = None
+        for i, task_name in enumerate(task_names):
+            sub_bev_feture = bev_feat[:, i].flatten(0, 1)
+            if task_name == "dynamic" or task_name == "dynamic_static":
+                det_out, det_loss, det_result = self.forward_dynamic_branch(
+                    sub_bev_feture, T_ego_his2curs, metas["dynamic"], decoder=decoder
+                )
+                if isinstance(det_loss, dict):
+                    for k, v in det_loss.items():
+                        losses[f"det3d_{k}"] = v
+            if task_name == "static" or task_name == "dynamic_static":
+                map_out = self.forward_static_branch(sub_bev_feture, metas["static"], decoder=decoder)
+                map_loss = map_out.get("loss_map", None)
+                if isinstance(map_loss, dict):
+                    for k, v in map_loss.items():
+                        losses[f"map3d_{k}"] = v
+
+        total_loss = None
+        if len(losses) > 0:
+            weighted_losses = []
+            for k, v in losses.items():
+                if not torch.is_tensor(v):
+                    continue
+                weighted_losses.append(v * self._get_loss_weight(k))
+            total_loss = sum(weighted_losses) if len(weighted_losses) > 0 else None
+
+        return {
+            "total_loss": total_loss,
+            "losses": losses,
+            "det2d_out": det2d_out,
+            "map2d_out": map2d_out,
+            "det3d_out": det_out,
+            "det3d_result": det_result,
+            "map3d_out": map_out,
+        }
+
+    def forward(
+        self,
+        x,
+        rots,
+        trans,
+        intrins,
+        distorts,
+        post_rot,
+        pos_tran,
+        theta_mats,
+        T_ego_his2curs=None,
+        metas=None,
+        decoder=False,
+        task_names=[],
+        stream_clip_frames=False,
+    ):
         b, m, t, n, c, h, w = x.shape
         # 2, 1, 5, 8, 3, 128, 384
-        # from dataset.dataset import denormalize_img
-        # import cv2
-        # import numpy as np
-        # a = denormalize_img(x[0,0,0,0])
-        # opencv_image = cv2.cvtColor(np.array(a), cv2.COLOR_RGB2BGR)
-
+        if stream_clip_frames:
+            return self._forward_stream_clip_frames(
+                x,
+                rots,
+                trans,
+                intrins,
+                distorts,
+                post_rot,
+                pos_tran,
+                theta_mats,
+                T_ego_his2curs,
+                metas,
+                decoder,
+                task_names,
+            )
 
         x = rearrange(x, 'b m t n c h w -> (b m t n) c h w')
         rots = rearrange(rots, 'b m t n h w -> (b m) t n h w')          # torch.Size([2, 1, 5, 8, 3, 3])

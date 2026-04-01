@@ -372,28 +372,31 @@ class BEVBackbone(nn.Module):
         # nn.Conv2d(channels * 2, channels, kernel_size=3, stride=1, padding=1)
         self.debug_grid_projection = bool(int(os.environ.get("BEV_DEBUG_GRID", "0")))
 
-    def forward(self, x, rots, trans, intrins, distorts, post_rot3, post_tran3, theta_mats):
-
+    def _forward_pre_align_features(
+        self,
+        x,
+        rots,
+        trans,
+        intrins,
+        distorts,
+        post_rot3,
+        post_tran3,
+        num_temporal,
+    ):
         """
-        # B,5*6,3,128,384
-        # B*5*6,3,128,384
-        B, img_num 6,  c h w
-        x_img.reshape(6, B, img_num, *x_img.shape[2:])
+        多视角 splat → 高度融合 → 环视融合，得到 (B_flat, T, C, H, W)，尚未做帧间 theta 对齐。
+        rots 等: (B_flat, T, N, ...)，x: (B_flat * T * N, C, fH, fW)。
         """
-        S = self.num_temporal
-        # B, S, N, C, H, W = x.shape
+        S = num_temporal
         rots = rots.flatten(0, 1)
         trans = trans.flatten(0, 1)
         intrins = intrins.flatten(0, 1)
         distorts = distorts.flatten(0, 1)
         post_rot3 = post_rot3.flatten(0, 1)
         post_tran3 = post_tran3.flatten(0, 1)
-        # points1 = torch.tensor(points1).view(seq_len * 3, 32, 96, 3).unsqueeze(1).unsqueeze(-1)
-        # x = self.bev_backbone(x)
         BS = x.shape[0]
 
         if self.use_cam_pos_embed:
-            
             cam_emb = self.get_cam_pos_embedding(
                 intrins,
                 post_rot3,
@@ -403,27 +406,29 @@ class BEVBackbone(nn.Module):
                 self.cam_pos_L,
                 num_flat=x.shape[0],
             ).to(device=x.device, dtype=x.dtype)
-            # x: (B*S*N, C, fH, fW), cam_emb: same batch layout
-    
             x = torch.cat([x, cam_emb], dim=1)
         cam_ids = torch.arange(self.num_cams, device=x.device).view(1, self.num_cams).expand(BS // self.num_cams, self.num_cams).reshape(-1)
-        cam_embed  = self.cam_embedding_learn(cam_ids)
+        cam_embed = self.cam_embedding_learn(cam_ids)
         cam_embed = cam_embed.view(BS, self.cam_embed_dim, 1, 1).expand(-1, -1, self.fH, self.fW)
 
         x = self.fusion_campos(torch.cat([x, cam_embed], dim=1))
 
-        points = self.points.to(x.device)  # points[2,40,80] 表示z围为0（地面）ego所在的位置
+        points = self.points.to(x.device)
         bev_emb = self.bev_emb.to(x.device)
-        grid = self.splat.bev2eachroi(points, rots.to(points.dtype), trans.to(points.dtype), intrins.to(points.dtype),
-                                      distorts.to(points.dtype), post_rot3.to(points.dtype),
-                                      post_tran3.to(points.dtype)).to(x.dtype) # points.view(B * N * Z, X, Y, 2) torch.Size([480, 200, 80, 2]) 2*5*8*6 
+        grid = self.splat.bev2eachroi(
+            points,
+            rots.to(points.dtype),
+            trans.to(points.dtype),
+            intrins.to(points.dtype),
+            distorts.to(points.dtype),
+            post_rot3.to(points.dtype),
+            post_tran3.to(points.dtype),
+        ).to(x.dtype)
         if self.debug_grid_projection:
             with torch.no_grad():
-                # grid: (B*N*Z, X, Y, 2), normalized for feature map coordinates.
-                g = grid[0].detach().float().cpu().numpy()  # take first sample/cam/height
+                g = grid[0].detach().float().cpu().numpy()
                 feat_h, feat_w = x.shape[-2], x.shape[-1]
                 img_h, img_w = self.input_size
-                # align_corners=True inverse mapping: pix = (norm + 1) * (size - 1) / 2
                 feat_xy = np.empty_like(g)
                 feat_xy[..., 0] = (g[..., 0] + 1.0) * (feat_w - 1) / 2.0
                 feat_xy[..., 1] = (g[..., 1] + 1.0) * (feat_h - 1) / 2.0
@@ -451,17 +456,58 @@ class BEVBackbone(nn.Module):
                     f"saved debug_grid_feat_32x96.jpg and debug_grid_img_128x384.jpg"
                 )
 
-        B, X, Y, _ = grid.shape #B = bs=3 * mode=2 * seq_len=5 *3（相机数） * 6(高度)
-        B = int(B / self.height)
-        indexs = [[self.height * i + j for i in range(B)] for j in range(self.height)]
-        outs = [F.grid_sample(input=x, grid=grid[index, ...], mode="bilinear", padding_mode="zeros",align_corners=True) for index in indexs]
+        _B, X, Y, _ = grid.shape
+        _B = int(_B / self.height)
+        indexs = [[self.height * i + j for i in range(_B)] for j in range(self.height)]
+        outs = [
+            F.grid_sample(input=x, grid=grid[index, ...], mode="bilinear", padding_mode="zeros", align_corners=True)
+            for index in indexs
+        ]
 
-        out_put = torch.cat(outs,dim=1)  # B, C, H, W
-        out_put = torch.cat([out_put, bev_emb[None].expand(out_put.shape[0], -1, -1, -1)], dim=1) # torch.Size([25, 384, 150, 100]) # 90 256 200 80 # 90 = 3 * 2 * 5 * 3(三个相机)
+        out_put = torch.cat(outs, dim=1)
+        out_put = torch.cat([out_put, bev_emb[None].expand(out_put.shape[0], -1, -1, -1)], dim=1)
         out_put = self.fusion_height(out_put)
-        out_put = out_put.reshape(-1,self.num_cams*out_put.shape[1],*out_put.shape[-2:])
+        out_put = out_put.reshape(-1, self.num_cams * out_put.shape[1], *out_put.shape[-2:])
         out_put = self.multiview_fusion(out_put)
         out_put = out_put.view(-1, S, *out_put.shape[-3:])
+        return out_put
+
+    def fuse_with_prev(self, prev_fused_bev, cur_pre_align_bev, theta_mat):
+        """与 forward 内时序分支一致：warp(prev) 与当前帧拼接后 algin_fusion。"""
+        warped_prev = self.warp_feature(prev_fused_bev, theta_mat.to(cur_pre_align_bev.dtype))
+        return self.algin_fusion(torch.cat([warped_prev, cur_pre_align_bev], 1))
+
+    def encode_single_frame(
+        self,
+        x,
+        rots,
+        trans,
+        intrins,
+        distorts,
+        post_rot3,
+        post_tran3,
+    ):
+        """
+        单时间步 BEV（T=1 的 pre-align 特征），用于训练时按帧减小显存。
+        rots: (B, 1, N, 3, 3)，x: (B * N, C, fH, fW)。
+        返回: (B, C, H, W)
+        """
+        out = self._forward_pre_align_features(
+            x, rots, trans, intrins, distorts, post_rot3, post_tran3, num_temporal=1
+        )
+        return out[:, 0]
+
+    def forward(self, x, rots, trans, intrins, distorts, post_rot3, post_tran3, theta_mats):
+        """
+        # B,5*6,3,128,384
+        # B*5*6,3,128,384
+        B, img_num 6,  c h w
+        x_img.reshape(6, B, img_num, *x_img.shape[2:])
+        """
+        S = self.num_temporal
+        out_put = self._forward_pre_align_features(
+            x, rots, trans, intrins, distorts, post_rot3, post_tran3, num_temporal=S
+        )
         # theta_mats[i]：第 i-1 帧 BEV 网格 -> 第 i 帧网格的仿射（与 dataset get_algin_theta_mat 一致）；
         # 应对「上一帧已对齐特征」做 warp 到当前帧，再与当前帧 out_put[:, i] 融合，勿对当前帧误做 warp。
         algin_features = []
