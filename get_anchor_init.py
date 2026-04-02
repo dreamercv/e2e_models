@@ -22,9 +22,10 @@ def main():
 
 if __name__ == '__main__':
     path = "/workspace/afb5szh-01/models/e2e_model/e2e_dataset_10Hz_dyo_all.txt"
+    kmeans_anchor_path = "../anchor_init_20260101010101_50_xyzlwhr.npy"
     anchors = []
     with open(path,"r") as f:
-        for line in f.readlines():
+        for line in f.readlines(): #box[..., 3:6].clamp(min=1e-4).log()
             # print(line.strip())
             if "20260101010101" not in line:continue
             clip_path = line.strip()
@@ -55,11 +56,27 @@ if __name__ == '__main__':
                     cosy = np.cos(yaw)
 
                     
-                    anchors.append([x, y, z, 1, 1, 1, 1, 0, 0.0, 0.0, 0.0])
+                    anchors.append([x, y, z, log_w, log_l, log_h, siny, cosy, 0.0, 0.0, 0.0])
     print()
     from sklearn.cluster import KMeans
     X = np.array(anchors, dtype=np.float32)
     kmeans = KMeans(n_clusters=50, random_state=42, n_init='auto')
     kmeans.fit(X)
     centers = kmeans.cluster_centers_.astype(np.float32)
-    np.save("../anchor_init_20260101010101_50.npy", centers)
+    np.save(kmeans_anchor_path, centers)
+
+    anchors = np.load(kmeans_anchor_path)
+    anchors[:,3] = np.exp(anchors[:,3])
+    anchors[:,4] = np.exp(anchors[:,4])
+    anchors[:,5] = np.exp(anchors[:,5])
+    print(anchors.shape)
+    imgh,imgw = 200,80
+    worldh,worldw = 20,80
+    scale = 10
+    image = np.zeros((imgh,imgw,3))# 20,8
+    wls = (anchors[:,3:5] * scale).astype(np.int16)
+    print(anchors[:,3:5])
+    import cv2
+    for wl in wls:
+        cv2.rectangle(image, (20,20),(20+wl[0],20+wl[1]), (0,0,255))
+    cv2.imwrite("anchor.jpg", image)

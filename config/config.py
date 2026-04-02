@@ -2,7 +2,8 @@ import os
 
 configs = {
 
-    "device":"cpu",# cuda cpu
+    "device":"cuda",# cuda cpu
+    "warmup_steps":10,
     "lr":1e-3,
     "max_grad_norm": 5,
     "weight_decay":1e-4,
@@ -13,25 +14,13 @@ configs = {
 
 
     "is_train": True,
-    "batch_size": 1,
+    "batch_size": 8,
     "num_workers": 1,
     "epoch": 200,
     "seq_len": 5,
 
-    # True：训练时在 Model 内按 clip 时间维逐帧前向（2D+BEV 峰值显存按单帧），帧间 BEV 仍用 theta 与上一帧融合特征对齐。
-    "train_stream_clip_frames": False,
-    # True：Dataset 一次加载滑动窗口内全部 rec 帧（rec 长度随 clip 变化），不再只采样 seq_len 帧；需与 train_stream_clip_frames=True 同开。
-    # total_len：滑动窗口最大长度（秒）；clip 有 300/600 帧时同一 total_len 即可，rec 实际长度为 min(total_len, 剩余帧)。
-    # stream_max_frames：单次样本最大 T（可选），防止一次 collate 帧数过大阻塞 DataLoader/OOM；长 clip 靠多次滑动窗口覆盖。
-    "train_full_window_temporal": False,
-    "stream_max_frames": None,  # 例如 64 或 128；None 表示不额外截断，用满当前 rec
 
-    # True：每个 total_len 滑动窗内，仅在前 history_sliding_num_frames 帧上做长度为 seq_len 的滑动子窗（如 H=20,seq_len=5 → 0-4,1-5,...,15-19 共 16 段），
-    # 每段仍只加载 seq_len 帧，走标准 BEV 5 帧时序融合（勿与 train_stream_clip_frames 同开）。与 train_full_window_temporal 互斥，优先本项。
-    "train_history_sliding_chunks": False,
-    "history_sliding_num_frames": 20,
-
-    "log_dir": "../logs/only_dynamic_0331_5frames_dn_algin_cnsx2_oriroi_newdepth_newaug_campos_learn",
+    "log_dir": "../logs/only_dynamic_0401_5frames_dn_algin_cnsx2_oriroi_newdepth_newaug_campos_learn_giou_stream_demo",
     "log_save_interval": 10,
     "log_print_interval": 1,
     "ckpt_save_interval":100,
@@ -53,13 +42,13 @@ configs = {
     "bev_cam_pos_L": 4,
 
     "clip_paths": {
-        "dynamic": ["/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/det.txt"],
-        "static": ["/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/map.txt"],
+        # "dynamic": ["/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/det.txt"],
+        # "static": ["/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/map.txt"],
 
-        # "dynamic": [
-        #     "/workspace/afb5szh-01/models/e2e_model/e2e_dataset_10Hz_dyo_all.txt"
-        #     ],
-        # "static": ["/workspace/afb5szh-01/models/e2e_model/e2e_dataset_10Hz_lane.txt"],
+        "dynamic": [
+            "/workspace/afb5szh-01/models/e2e_model/e2e_dataset_10Hz_dyo_all.txt"
+            ],
+        "static": ["/workspace/afb5szh-01/models/e2e_model/e2e_dataset_10Hz_lane.txt"],
 
         "dynamic_static": [],
         "e2e": [],
@@ -84,7 +73,7 @@ configs = {
     "mode": "static",  # 默认加载动态数据
     
 
-    "train_clips": 1,#["20260101010101"],  # -1 所有，[]指定几个，xxx.txt写进txt中指定的，>0前N个
+    "train_clips":["20250508072555"],# ["20260101010101"],  # -1 所有，[]指定几个，xxx.txt写进txt中指定的，>0前N个
 
     "total_len": 20 + 1 + 50,  # 一共71帧，当前帧是第21帧，往前20帧，往后50帧 ，最后一帧索引对应着70 ，未来50帧为了获取真值
     "current_frame_index": 20,  # 0 1 2 3 4 5 ... [20] 21 22 23 ... 70
@@ -112,20 +101,20 @@ configs = {
             "e2e_dynamic_traj"
         ],
     },
-    "task_indexs": {  # 在每次getitem时，随机取值 ,其实这里不需要随随机是为了增加间隔，不同的车速就相当于增加了间隔,
-        # 在dyo的label上取值
-        "det2D": [0, 20],  # 起始帧和结束帧                #输入N帧输出N帧
-        "det3D": [0, 20],  # 起始帧和结束帧              #输入N帧输出N帧
-        "obj_dynamic_traj": [0, 20],  # 起始帧和结束帧    #输入N帧，预测最后一帧的轨迹
-        # 在lane的label上取值
-        "map2D": [0, 20],  # 起始帧和结束帧                #输入N帧输出N帧
-        "map3D": [0, 20],  # 起始帧和结束帧              #输入N帧输出N帧
-        "e2e_dynamic_traj": [0, 20],  # 起始帧和结束帧    #输入N帧，预测最后一帧的轨迹
+    # "task_indexs": {  # 在每次getitem时，随机取值 ,其实这里不需要随随机是为了增加间隔，不同的车速就相当于增加了间隔,
+    #     # 在dyo的label上取值
+    #     "det2D": [0, 20],  # 起始帧和结束帧                #输入N帧输出N帧
+    #     "det3D": [0, 20],  # 起始帧和结束帧              #输入N帧输出N帧
+    #     "obj_dynamic_traj": [0, 20],  # 起始帧和结束帧    #输入N帧，预测最后一帧的轨迹
+    #     # 在lane的label上取值
+    #     "map2D": [0, 20],  # 起始帧和结束帧                #输入N帧输出N帧
+    #     "map3D": [0, 20],  # 起始帧和结束帧              #输入N帧输出N帧
+    #     "e2e_dynamic_traj": [0, 20],  # 起始帧和结束帧    #输入N帧，预测最后一帧的轨迹
 
-        # 在自车位姿上取值
-        "e2e_static_traj": [0, 20],  # 起始帧和结束帧    #输入N帧，预测最后一帧的轨迹
-    },
-    "task_index_random": False,  # 是否使用随机的index，即在历史20帧内随机选择seq_len帧
+    #     # 在自车位姿上取值
+    #     "e2e_static_traj": [0, 20],  # 起始帧和结束帧    #输入N帧，预测最后一帧的轨迹
+    # },
+    # "task_index_random": False,  # 是否使用随机的index，即在历史20帧内随机选择seq_len帧
     
 
     # 预测任务的参数
@@ -173,10 +162,10 @@ configs = {
         ],
         "e2e": ["gt_e2e_dynamic_traj","label_path"]
     },
-    "input_names": ["x", "rots", "trans", "intrins", "distorts", "post_rots", "post_trans", "theta_mats","intervals","timestamps"],
+    "input_names": ["x", "rots", "trans", "intrins", "distorts", "post_rots", "post_trans", "ego_pose","intervals","timestamps"],
 
     # 模型相关
-    "img_outchannels": 8,
+    "img_outchannels": 256,
     "det3d_loss_weights": {
         "cls": 2.0,
         "box": 1,
@@ -195,7 +184,7 @@ configs = {
         "num_single_frame_decoder": 2,
         "num_classes": 3,
         "bev_bounds": None,
-        "anchor_init": "../300clips_kmeans512_range_200.npy",
+        "anchor_init": "../anchor_init_20260101010101_50_xyzlwhr.npy",
         "decouple_attn": True,
         "num_heads": 8,
         "dropout": 0.1,

@@ -278,6 +278,98 @@ def _pixels_to_cam_dirs_fisheye(uv1, intrin_inv, dist, eps=1e-6):
     d = torch.stack([xn, yn, torch.ones_like(xn)], dim=-1)
     return torch.nn.functional.normalize(d, dim=-1, eps=eps)
 
+class TemporalFusion(nn.Module):
+    def __init__(self,seq_len,channels,grid_conf):
+        super(TemporalFusion,self).__init__()
+        self.seq_len = seq_len
+        self.channels = channels
+        self.grid_conf= grid_conf
+        self.bevh = self.grid_conf["xbound"][1] - self.grid_conf["xbound"][0]
+        self.bevw = self.grid_conf["ybound"][1] - self.grid_conf["ybound"][0]
+        sx = self.bevh / 2
+        sy = self.bevw / 2
+
+        pre_mat = torch.tensor([[0., 1./sy, 0.],
+                                [1./sx, 0., -1/5],
+                                [0., 0., 1.]], dtype=torch.float32)
+        post_mat = torch.tensor([[0., sx, sx/5],
+                                 [sy, 0., 0.],
+                                 [0., 0., 1.]], dtype=torch.float32)
+        self.register_buffer('pre_mat', pre_mat)
+        self.register_buffer('post_mat', post_mat)
+
+        self.algin_fusion = nn.Sequential(
+            nn.Conv2d(channels * self.seq_len, channels * self.seq_len // 2, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(channels * self.seq_len // 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels * self.seq_len //2, channels, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def to_theta_mats(self,ego_pose): #torch.Size([1, 5, 4, 4])
+        B, T = ego_pose.shape[:2]
+        device = ego_pose.device
+        dtype = ego_pose.dtype
+
+        T_last = ego_pose[:, -1]                     # (B, 4, 4)
+              # (B, 4, 4)
+
+        theta_mats = []
+        for i in range(T - 1):
+            T_i = ego_pose[:, i]   
+                              # (B, 4, 4)
+            T_i_to_last = torch.inverse(T_i)@T_last           # (B, 4, 4)
+
+            # 提取平移和旋转
+            dx = T_i_to_last[:, 0, 3]                # (B,)
+            dy = T_i_to_last[:, 1, 3]
+            yaw = torch.atan2(T_i_to_last[:, 1, 0], T_i_to_last[:, 0, 0])  # (B,)
+            cos = torch.cos(yaw)
+            sin = torch.sin(yaw)
+
+            # 构造 3x3 齐次变换矩阵 rel_pose
+            rel_pose = torch.zeros(B, 3, 3, device=device, dtype=dtype)
+            rel_pose[:, 0, 0] = cos
+            rel_pose[:, 0, 1] = -sin
+            rel_pose[:, 0, 2] = dx
+            rel_pose[:, 1, 0] = sin
+            rel_pose[:, 1, 1] = cos
+            rel_pose[:, 1, 2] = dy
+            rel_pose[:, 2, 2] = 1.0
+
+            # 计算 BEV 图像仿射矩阵：pre_mat @ (rel_pose @ post_mat)
+            # 注意：pre_mat, post_mat 是 (3,3)，需广播到 batch 维度
+            theta = self.pre_mat @ (rel_pose @ self.post_mat)   # (B, 3, 3)
+            theta = theta[:, :2, :]                            # (B, 2, 3)
+            theta_mats.append(theta)
+
+        # 堆叠为 (B, T-1, 2, 3)
+        theta_mats = torch.stack(theta_mats, dim=1)
+        return theta_mats
+
+    def forward(self,cur_bev,ego_pose,pre_bevs=[]):
+        theta_mats = self.to_theta_mats(ego_pose)
+        bevs = []
+        for i in range(self.seq_len-1):
+            warped_prev = self.warp_feature(
+                    pre_bevs[i], theta_mats[:, i].to(cur_bev.dtype)
+                )
+            bevs.append(warped_prev)
+        bevs.append(cur_bev)
+        algin_features = torch.stack(bevs).permute(1, 0, 2, 3, 4).flatten(1, 2)
+        algin_features = self.algin_fusion(algin_features)
+
+        return algin_features
+
+
+    def warp_feature(self, features, theta):
+        B, C, H, W = features.size()
+        grids = F.affine_grid(theta, torch.Size((B, C, H, W)), align_corners=True)
+        cropped_features = F.grid_sample(features, grids, align_corners=True)
+        return cropped_features
+
+
 
 class BEVBackbone(nn.Module):
     def __init__(
@@ -285,13 +377,13 @@ class BEVBackbone(nn.Module):
         channels=256,
         grid_conf=None,
         input_size=(128, 384),
-        num_temporal=7,
+        # num_temporal=7,
         num_cams=6,
         use_cam_pos_embed=True,
         cam_pos_L=4,
     ):
         super(BEVBackbone, self).__init__()
-        self.num_temporal = num_temporal
+        # self.num_temporal = num_temporal
         self.grid_conf = grid_conf
         self.input_size = input_size
         self.use_cam_pos_embed = use_cam_pos_embed
@@ -364,39 +456,36 @@ class BEVBackbone(nn.Module):
             nn.ReLU(inplace=True)
         )
 
-        self.algin_fusion = nn.Sequential(
-            nn.Conv2d(channels * 2, channels, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(channels),
-            nn.ReLU(inplace=True)
-        )
+        # self.algin_fusion = nn.Sequential(
+        #     nn.Conv2d(channels * 2, channels, kernel_size=3, stride=1, padding=1),
+        #     nn.BatchNorm2d(channels),
+        #     nn.ReLU(inplace=True)
+        # )
         # nn.Conv2d(channels * 2, channels, kernel_size=3, stride=1, padding=1)
         self.debug_grid_projection = bool(int(os.environ.get("BEV_DEBUG_GRID", "0")))
 
-    def _forward_pre_align_features(
-        self,
-        x,
-        rots,
-        trans,
-        intrins,
-        distorts,
-        post_rot3,
-        post_tran3,
-        num_temporal,
-    ):
+    def forward(self, x, rots, trans, intrins, distorts, post_rot3, post_tran3):
+
         """
-        多视角 splat → 高度融合 → 环视融合，得到 (B_flat, T, C, H, W)，尚未做帧间 theta 对齐。
-        rots 等: (B_flat, T, N, ...)，x: (B_flat * T * N, C, fH, fW)。
+        # B,5*6,3,128,384
+        # B*5*6,3,128,384
+        B, img_num 6,  c h w
+        x_img.reshape(6, B, img_num, *x_img.shape[2:])
         """
-        S = num_temporal
+        # S = self.num_temporal
+        # B, S, N, C, H, W = x.shape
         rots = rots.flatten(0, 1)
         trans = trans.flatten(0, 1)
         intrins = intrins.flatten(0, 1)
         distorts = distorts.flatten(0, 1)
         post_rot3 = post_rot3.flatten(0, 1)
         post_tran3 = post_tran3.flatten(0, 1)
+        # points1 = torch.tensor(points1).view(seq_len * 3, 32, 96, 3).unsqueeze(1).unsqueeze(-1)
+        # x = self.bev_backbone(x)
         BS = x.shape[0]
 
         if self.use_cam_pos_embed:
+            
             cam_emb = self.get_cam_pos_embedding(
                 intrins,
                 post_rot3,
@@ -406,29 +495,27 @@ class BEVBackbone(nn.Module):
                 self.cam_pos_L,
                 num_flat=x.shape[0],
             ).to(device=x.device, dtype=x.dtype)
+            # x: (B*S*N, C, fH, fW), cam_emb: same batch layout
+    
             x = torch.cat([x, cam_emb], dim=1)
         cam_ids = torch.arange(self.num_cams, device=x.device).view(1, self.num_cams).expand(BS // self.num_cams, self.num_cams).reshape(-1)
-        cam_embed = self.cam_embedding_learn(cam_ids)
+        cam_embed  = self.cam_embedding_learn(cam_ids)
         cam_embed = cam_embed.view(BS, self.cam_embed_dim, 1, 1).expand(-1, -1, self.fH, self.fW)
 
         x = self.fusion_campos(torch.cat([x, cam_embed], dim=1))
 
-        points = self.points.to(x.device)
+        points = self.points.to(x.device)  # points[2,40,80] 表示z围为0（地面）ego所在的位置
         bev_emb = self.bev_emb.to(x.device)
-        grid = self.splat.bev2eachroi(
-            points,
-            rots.to(points.dtype),
-            trans.to(points.dtype),
-            intrins.to(points.dtype),
-            distorts.to(points.dtype),
-            post_rot3.to(points.dtype),
-            post_tran3.to(points.dtype),
-        ).to(x.dtype)
+        grid = self.splat.bev2eachroi(points, rots.to(points.dtype), trans.to(points.dtype), intrins.to(points.dtype),
+                                      distorts.to(points.dtype), post_rot3.to(points.dtype),
+                                      post_tran3.to(points.dtype)).to(x.dtype) # points.view(B * N * Z, X, Y, 2) torch.Size([480, 200, 80, 2]) 2*5*8*6 
         if self.debug_grid_projection:
             with torch.no_grad():
-                g = grid[0].detach().float().cpu().numpy()
+                # grid: (B*N*Z, X, Y, 2), normalized for feature map coordinates.
+                g = grid[0].detach().float().cpu().numpy()  # take first sample/cam/height
                 feat_h, feat_w = x.shape[-2], x.shape[-1]
                 img_h, img_w = self.input_size
+                # align_corners=True inverse mapping: pix = (norm + 1) * (size - 1) / 2
                 feat_xy = np.empty_like(g)
                 feat_xy[..., 0] = (g[..., 0] + 1.0) * (feat_w - 1) / 2.0
                 feat_xy[..., 1] = (g[..., 1] + 1.0) * (feat_h - 1) / 2.0
@@ -456,79 +543,38 @@ class BEVBackbone(nn.Module):
                     f"saved debug_grid_feat_32x96.jpg and debug_grid_img_128x384.jpg"
                 )
 
-        _B, X, Y, _ = grid.shape
-        _B = int(_B / self.height)
-        indexs = [[self.height * i + j for i in range(_B)] for j in range(self.height)]
-        outs = [
-            F.grid_sample(input=x, grid=grid[index, ...], mode="bilinear", padding_mode="zeros", align_corners=True)
-            for index in indexs
-        ]
+        B, X, Y, _ = grid.shape #B = bs=3 * mode=2 * seq_len=5 *3（相机数） * 6(高度)
+        B = int(B / self.height)
+        indexs = [[self.height * i + j for i in range(B)] for j in range(self.height)]
+        outs = [F.grid_sample(input=x, grid=grid[index, ...], mode="bilinear", padding_mode="zeros",align_corners=True) for index in indexs]
 
-        out_put = torch.cat(outs, dim=1)
-        out_put = torch.cat([out_put, bev_emb[None].expand(out_put.shape[0], -1, -1, -1)], dim=1)
+        out_put = torch.cat(outs,dim=1)  # B, C, H, W
+        out_put = torch.cat([out_put, bev_emb[None].expand(out_put.shape[0], -1, -1, -1)], dim=1) # torch.Size([25, 384, 150, 100]) # 90 256 200 80 # 90 = 3 * 2 * 5 * 3(三个相机)
         out_put = self.fusion_height(out_put)
-        out_put = out_put.reshape(-1, self.num_cams * out_put.shape[1], *out_put.shape[-2:])
+        out_put = out_put.reshape(-1,self.num_cams*out_put.shape[1],*out_put.shape[-2:])
         out_put = self.multiview_fusion(out_put)
-        out_put = out_put.view(-1, S, *out_put.shape[-3:])
-        return out_put
-
-    def fuse_with_prev(self, prev_fused_bev, cur_pre_align_bev, theta_mat):
-        """与 forward 内时序分支一致：warp(prev) 与当前帧拼接后 algin_fusion。"""
-        warped_prev = self.warp_feature(prev_fused_bev, theta_mat.to(cur_pre_align_bev.dtype))
-        return self.algin_fusion(torch.cat([warped_prev, cur_pre_align_bev], 1))
-
-    def encode_single_frame(
-        self,
-        x,
-        rots,
-        trans,
-        intrins,
-        distorts,
-        post_rot3,
-        post_tran3,
-    ):
-        """
-        单时间步 BEV（T=1 的 pre-align 特征），用于训练时按帧减小显存。
-        rots: (B, 1, N, 3, 3)，x: (B * N, C, fH, fW)。
-        返回: (B, C, H, W)
-        """
-        out = self._forward_pre_align_features(
-            x, rots, trans, intrins, distorts, post_rot3, post_tran3, num_temporal=1
-        )
-        return out[:, 0]
-
-    def forward(self, x, rots, trans, intrins, distorts, post_rot3, post_tran3, theta_mats):
-        """
-        # B,5*6,3,128,384
-        # B*5*6,3,128,384
-        B, img_num 6,  c h w
-        x_img.reshape(6, B, img_num, *x_img.shape[2:])
-        """
-        S = self.num_temporal
-        out_put = self._forward_pre_align_features(
-            x, rots, trans, intrins, distorts, post_rot3, post_tran3, num_temporal=S
-        )
+        # out_put = out_put.view(-1, S, *out_put.shape[-3:])
         # theta_mats[i]：第 i-1 帧 BEV 网格 -> 第 i 帧网格的仿射（与 dataset get_algin_theta_mat 一致）；
         # 应对「上一帧已对齐特征」做 warp 到当前帧，再与当前帧 out_put[:, i] 融合，勿对当前帧误做 warp。
-        algin_features = []
-        for i in range(S):
-            if i == 0:
-                algin_features.append(out_put[:, i])
-            else:
-                warped_prev = self.warp_feature(
-                    algin_features[-1], theta_mats[:, i].to(out_put.dtype)
-                )
-                algin_features.append(
-                    self.algin_fusion(torch.cat([warped_prev, out_put[:, i]], 1))
-                )
-        out_put = torch.stack(algin_features).permute(1, 0, 2, 3, 4).flatten(0, 1)
+        # algin_features = []
+        # for i in range(S):
+        #     if i == 0:
+        #         algin_features.append(out_put[:, i])
+        #     else:
+        #         warped_prev = self.warp_feature(
+        #             algin_features[-1], theta_mats[:, i].to(out_put.dtype)
+        #         )
+        #         algin_features.append(
+        #             self.algin_fusion(torch.cat([warped_prev, out_put[:, i]], 1))
+        #         )
+        # out_put = torch.stack(algin_features).permute(1, 0, 2, 3, 4).flatten(0, 1)
         return out_put  # 输出时序帧信息，每一帧都和前一阵融合这样子达到了渐进的融合方式
 
-    def warp_feature(self, features, theta):
-        B, C, H, W = features.size()
-        grids = F.affine_grid(theta, torch.Size((B, C, H, W)), align_corners=True)
-        cropped_features = F.grid_sample(features, grids, align_corners=True)
-        return cropped_features
+    # def warp_feature(self, features, theta):
+    #     B, C, H, W = features.size()
+    #     grids = F.affine_grid(theta, torch.Size((B, C, H, W)), align_corners=True)
+    #     cropped_features = F.grid_sample(features, grids, align_corners=True)
+    #     return cropped_features
 
     def positional_encoding(self, input, L):  # [B,...,N]
         shape = input.shape

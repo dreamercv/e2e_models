@@ -6,44 +6,37 @@
 @E-mail       :afb5szh@bosch.com
 @Version      :V1.0.0
 @Description  :
-            整体思路----数据不同源版本，并且分段训练：
-                1、时序图像作为输入（2*bs*5*8*3*128*384）,其中5表示时序五帧，8表示环视相机一共有8个，2表示两种数据:只标注目标相关的动态数据和只标注了车道线相关的金泰数据,3*128*384是输入图像的尺寸
-                2、输入图像经过自定义的纯2d卷积网络，下采样四倍，输出的通道数是256，卷积网络输出的大小为2*bs*5*8*256*32*96,我称这个模型是image_backbone模块
-                3、image_backbone的输出经过内外参的转换将其投影到3d的bev空间，具体方法为：在自车坐标系初始化一个200米*80米*6米(xyz)的3d空间,然后通过内外参将其转到像素坐标coor，然后根据coor的索引将image_backbone的像素特征对齐到3d空间,多视角就可以融合成一个bev空间。这个模块称之为bev_backbone,输出的大小是2*bs*5*256*200*80
-                4、时序融合模块algin_module:bev_backbone的输出是5帧，通过自车的相对位姿将特征图对齐warp/插值方式，对齐方式如下：
-                    第一帧：第一帧F1,输出维度是bs*256*200*80
-                    第二帧：第一帧对齐到第二帧，conv(cat(algin(F1),F2)) = algin_F2,输出维度是bs*256*200*80
-                    第三帧：将对齐后的第二帧对齐在第三帧，conv(cat(algin(algin_F2),F3)) = algin_F3,输出维度是bs*256*200*80
-                    第四帧：将对齐后的第三帧对齐到第四帧，conv(cat(algin(algin_F3),F4)) = algin_F4,输出维度是bs*256*200*80
-                    第五帧：将对齐后的第四帧对齐到第五帧，conv(cat(algin(algin_F4),F5)) = algin_F5,输出维度是bs*256*200*80
-                    algin_F1_5 = cat(F1,algin_F2,algin_F3,algin_F4,algin_F5)
-                    这样就的得到了时序对齐的特征algin_F1_5 ,输出维度是2*bs*5*256*200*80，与上一帧对齐，最久可以对齐历史五帧（记忆历史五帧的信息）
-                5、split_module:该模块将两种数据分开，分别为dynamic_input=bs*5*256*200*80，static_input=bs*5*256*200*80
+    整体思路----数据不同源版本，并且分段训练：
+        1、时序图像作为输入（2*bs*5*8*3*128*384）,其中5表示时序五帧，8表示环视相机一共有8个，2表示两种数据:只标注目标相关的动态数据和只标注了车道线相关的金泰数据,3*128*384是输入图像的尺寸
+        2、输入图像经过自定义的纯2d卷积网络，下采样四倍，输出的通道数是256，卷积网络输出的大小为2*bs*5*8*256*32*96,我称这个模型是image_backbone模块
+        3、image_backbone的输出经过内外参的转换将其投影到3d的bev空间，具体方法为：在自车坐标系初始化一个200米*80米*6米(xyz)的3d空间,然后通过内外参将其转到像素坐标coor，然后根据coor的索引将image_backbone的像素特征对齐到3d空间,多视角就可以融合成一个bev空间。这个模块称之为bev_backbone,输出的大小是2*bs*5*256*200*80
+        4、时序融合模块algin_module:bev_backbone的输出是5帧，通过自车的相对位姿将特征图对齐warp/插值方式，对齐方式如下：
+            第一帧：第一帧F1,输出维度是bs*256*200*80
+            第二帧：第一帧对齐到第二帧，conv(cat(algin(F1),F2)) = algin_F2,输出维度是bs*256*200*80
+            第三帧：将对齐后的第二帧对齐在第三帧，conv(cat(algin(algin_F2),F3)) = algin_F3,输出维度是bs*256*200*80
+            第四帧：将对齐后的第三帧对齐到第四帧，conv(cat(algin(algin_F3),F4)) = algin_F4,输出维度是bs*256*200*80
+            第五帧：将对齐后的第四帧对齐到第五帧，conv(cat(algin(algin_F4),F5)) = algin_F5,输出维度是bs*256*200*80
+            algin_F1_5 = cat(F1,algin_F2,algin_F3,algin_F4,algin_F5)
+            这样就的得到了时序对齐的特征algin_F1_5 ,输出维度是2*bs*5*256*200*80，与上一帧对齐，最久可以对齐历史五帧（记忆历史五帧的信息）
+        5、split_module:该模块将两种数据分开，分别为dynamic_input=bs*5*256*200*80，static_input=bs*5*256*200*80
 
-                世界模型分支
-                    6、在algin_module模块的输出后接入decoder，输入上一帧，输出当前帧的bev然后和当前帧的bev计算相似度从而达到重建bev的效果。
+        世界模型分支
+            6、在algin_module模块的输出后接入decoder，输入上一帧，输出当前帧的bev然后和当前帧的bev计算相似度从而达到重建bev的效果。
 
-                动态分支：
-                    7、det_head目标检测输出头:algin_module的输出dynamic_input后接入sparse4d的输出头，将在bev上获取检测的instance（bs，5*900*256）和anchor(bs*5*900*11),900指的是最大目标数量900，256是instance的特征维度，11是anchor的预测值包括：x,y,z,w,h,l,vx,vy,vz,yaw,id
-                    8、动态目标轨迹预测头(obj_traj_head)：（融合历史五帧信息出当前一帧的轨迹）将algin_module输出的第五帧帧和检测第五帧的instance，以及历史历史5帧的轨迹（bs*900*10）作为动态目标迹预测头的输入，最后预测出当前帧(第五帧)周围目标5秒的轨迹（bs*900*100）和对应的insance（bs*900*256），其中100是50*2，2是xy两个分量，50是未来50帧
+        动态分支：
+            7、det_head目标检测输出头:algin_module的输出dynamic_input后接入sparse4d的输出头，将在bev上获取检测的instance（bs，5*900*256）和anchor(bs*5*900*11),900指的是最大目标数量900，256是instance的特征维度，11是anchor的预测值包括：x,y,z,w,h,l,vx,vy,vz,yaw,id
+            8、动态目标轨迹预测头(obj_traj_head)：（融合历史五帧信息出当前一帧的轨迹）将algin_module输出的第五帧帧和检测第五帧的instance，以及历史历史5帧的轨迹（bs*900*10）作为动态目标迹预测头的输入，最后预测出当前帧(第五帧)周围目标5秒的轨迹（bs*900*100）和对应的insance（bs*900*256），其中100是50*2，2是xy两个分量，50是未来50帧
 
-                静态分支
-                    9、map_head地图检测头:algin_module输出对齐后的bev特征static_input后接入maptr的输出头，将在bev上获取map的instance（bs*5*200*256）和anchor(bs*5*200*3),200指的是最大地图instance为200个，3是(x,y和类别)
-                    10、自车未来行驶的拓扑轨迹头-ego_static_head:将maphead的instance和algin_module的最后一帧特征拿出来，输入到ego_static_head中，输出以自车为起点到bev边缘的行驶轨迹(bs*1*20*2)以及对应的instance(bs*1*256),20*2是从自车为起点，等步长走到bev的边缘
-                
-                端到端分支 ： 上面分支训练收敛后才能启动该阶段的训练
-                    11、端到端轨迹头e2ehead:将algin_module的bevfeature(bs*256*200*80)、det的instance(bs*900*256)和动态目标轨迹的instance(bs*900*256)、map的instance(bs*200*256)以及自车未来拓扑轨迹的instance(bs*1*256)的最后一帧取出来作，输入到轨迹头中，即希望输出的端到端轨迹中有5帧的信息融合，输出形状是bs*100。其中bevfeature是bev的场景描述，det的instance和动态目标轨迹的instance是动态场景的理解，map的instance和自车拓扑轨迹是静态场景理解。经过上述的所有场景的融合形成了最终的端到端轨迹
+        静态分支
+            9、map_head地图检测头:algin_module输出对齐后的bev特征static_input后接入maptr的输出头，将在bev上获取map的instance（bs*5*200*256）和anchor(bs*5*200*3),200指的是最大地图instance为200个，3是(x,y和类别)
+            10、自车未来行驶的拓扑轨迹头-ego_static_head:将maphead的instance和algin_module的最后一帧特征拿出来，输入到ego_static_head中，输出以自车为起点到bev边缘的行驶轨迹(bs*1*20*2)以及对应的instance(bs*1*256),20*2是从自车为起点，等步长走到bev的边缘
+        
+        端到端分支 ： 上面分支训练收敛后才能启动该阶段的训练
+            11、端到端轨迹头e2ehead:将algin_module的bevfeature(bs*256*200*80)、det的instance(bs*900*256)和动态目标轨迹的instance(bs*900*256)、map的instance(bs*200*256)以及自车未来拓扑轨迹的instance(bs*1*256)的最后一帧取出来作，输入到轨迹头中，即希望输出的端到端轨迹中有5帧的信息融合，输出形状是bs*100。其中bevfeature是bev的场景描述，det的instance和动态目标轨迹的instance是动态场景的理解，map的instance和自车拓扑轨迹是静态场景理解。经过上述的所有场景的融合形成了最终的端到端轨迹
 
 
 
-由于数据不同源，所以训练逻辑如下：
-    1、假设在dynamic数据上，可以先训练3d+目标轨迹，再训练端到端轨迹
-    2、假设在static数据上，可以选训练map+静态轨迹，再训练端到端轨迹
-    3、假设既要3d表征和map表征以及目标轨迹和静态轨迹，分阶段训练：
-        3.1、先训练3d表征和目标轨迹
-        3.2、再训练map表征和静态轨迹
-        3.3、将上述输入到端到端，最后训练端到端轨迹
-    4、假设想要端到端的训练(图像输入，轨迹输出)，那么就是同源数据，直接训练即可
+
 '''
 
 
@@ -57,113 +50,6 @@ import torchvision
 import torch
 import random
 
-# configs = {
-#     # 总的参数
-#     "grid_conf" : {
-#         'xbound': [-80.0, 120.0, 1],
-#         'ybound': [-40.0, 40.0, 1],
-#         'zbound': [-2.0, 4.0, 1.0]
-#     },
-
-#     "clip_paths":{
-#         "dynamic":["/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/det.txt"],
-#         "static":["/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/map.txt"],
-#         "dynamic_static":["/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/dynamic_static.txt"],
-#         "e2e":["/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/e2e.txt"],
-#     },
-#     "camera_infos":{
-#         "FrontCam02":{
-#             "resize_lim": [(0.1, 0.1),  (0.17,0.23), (0.35, 0.45)],
-#             "bot_pct_lim":[(0.15, 0.25),(0.27, 0.37),(0.37,0.47)]
-#         },     #前 大
-#         "RearCam01":     {"resize_lim":[(0.2, 0.3)],"bot_pct_lim":[(0.2, 0.5)]},      #后方
-#         "SideFrontCam01":{"resize_lim":[(0.2, 0.3)],"bot_pct_lim":[(0.2, 0.5)]}, #左前
-#         "SideFrontCam02":{"resize_lim":[(0.2, 0.3)],"bot_pct_lim":[(0.2, 0.5)]}, #右前
-#         "SideRearCam01": {"resize_lim":[(0.2, 0.3)],"bot_pct_lim":[(0.2, 0.5)]},  #左后
-#         "SideRearCam02": {"resize_lim":[(0.2, 0.3)],"bot_pct_lim":[(0.2, 0.5)]}   #右后
-#     },
-#     'rot_lim': (-0.0, 0.0),
-#     "flip":False,
-
-#     'final_dim': (128, 384),
-
-#     "mode":"dynamic",
-
-
-#     "train_clips":2, # -1 所有，[]指定几个，xxx.txt写进txt中指定的，>0前N个
-    
-#     "total_len":20+1+50, # 一共71帧，当前帧是第21帧，往前20帧，往后50帧 ，最后一帧索引对应着70 ，未来50帧为了获取真值
-#     "current_frame_index":20,# 0 1 2 3 4 5 ... [20] 21 22 23 ... 70
-    
-
-
-#     "task_flag":{
-#         "det2D":False,
-#         "det3D":True,
-
-#         "map2D":False,
-#         "map3D":False,
-
-#         "obj_dynamic_traj":False,
-#         "e2e_static_traj":False,
-#         "e2e_dynamic_traj":False,
-#     },
-#     "task_class_names":{
-#         "dynamic":["det3D","obj_dynamic_traj","det2D","e2e_dynamic_traj"], 
-#         "static":["map3D","map2D","e2e_static_traj","e2e_dynamic_traj"],
-#         "dynamic_static":[
-#             "det3D","obj_dynamic_traj","det2D",
-#             "map3D","map2D","e2e_static_traj",
-#             "e2e_dynamic_traj"
-#             ],
-#         "e2e":[
-#             "e2e_static_traj",
-#             "e2e_dynamic_traj"
-#             ],
-#     },
-#     "task_indexs":{ # 在每次getitem时，随机取值
-#         # 在dyo的label上取值
-#         "det2D":[0,20], # 起始帧和结束帧                #输入N帧输出N帧
-#         "det3D":  [0,20], # 起始帧和结束帧              #输入N帧输出N帧
-#         "obj_dynamic_traj": [0,20], # 起始帧和结束帧    #输入N帧，预测最后一帧的轨迹
-#         # 在lane的label上取值
-#         "map2D":[0,20], # 起始帧和结束帧                #输入N帧输出N帧
-#         "map3D":  [0,20], # 起始帧和结束帧              #输入N帧输出N帧
-
-#         # 在自车位姿上取值
-#         "e2e_dynamic_traj": [0,20], # 起始帧和结束帧    #输入N帧，预测最后一帧的轨迹
-#         "e2e_static_traj":  [0,20], # 起始帧和结束帧    #输入N帧，预测最后一帧的轨迹
-#     },
-#     "seq_len":5, 
-#     # 预测任务的参数
-#     "his_lens":{ # 历史长度 ,对于预测任务来说，需要输入历史真值才能预测未来真值，所以上述task_indexs需要减去历史长度
-#         "obj_dynamic_traj":5, # seq_len 必须大于等于 his_lens 否则无法制作真值
-#         "e2e_dynamic_traj":5,
-#     },
-#     "fur_lens":{ # 未来长度
-#         "obj_dynamic_traj": 50,
-#         "e2e_dynamic_traj": 50,
-#     }, # his_lens , fur_lens 即输入历史真值预测未来轨迹
-#     "frequency":{ # 频率 10Hz
-#         "obj_dynamic_traj": 10, # 真值插值成10Hz,即5秒内真值为50个点
-#         "e2e_dynamic_traj": 10, # 真值插值成10Hz,即5秒内真值为50个点
-#     },
-
-
-
-
-
-#     "camera_names":[
-#         "FrontCam02",     #前 
-#         "RearCam01",      #后方
-#         "SideFrontCam01", #左前
-#         "SideFrontCam02", #右前
-#         "SideRearCam01",  #左后
-#         "SideRearCam02"   #右后
-#     ],
-#     # 3D 检测类别：与 convert_det 输出的 object_infos[].sub_category 对应，用于映射到类别下标
-#     "det_class_names": ["car", "truck", "bus", "pedestrian", "bicycle", "motorcycle", "traffic_cone", "barrier"],
-# }
 
 
 
@@ -284,48 +170,40 @@ class Dataset(torch.utils.data.Dataset):
 
         # 联合训练配置
         self.task_flags = config["task_flag"]
-        self.task_indexs = config["task_indexs"]
+        # self.task_indexs = config["task_indexs"]
         self.task_class_names = config["task_class_names"]
-        self.task_index_random = config["task_index_random"]
+        # self.task_index_random = config["task_index_random"]
         self.seq_len = config["seq_len"]
         self.his_lens = config["his_lens"]
         self.fur_lens = config["fur_lens"]
         self.frequency = config["frequency"]
         # self.useful_indexs,self.group_indexs = self.get_input_indexs()
 
+        self.stride = self.total_len - (self.seq_len - 1)
+
+        
+
+
         # 数据准备
         self.get_all_paths()
         self.prepro()
-        self.sces_len = [self._num_sliding_windows(len(self.ixes[i])) for i in self.ixes.keys()]
+        self.sces_len = [(len(self.ixes[i]) - self.total_len ) for i in self.ixes.keys()]
         self.scenes = [i for i in self.ixes.keys()]
+
+        self.samples = []
+        for clip_name in self.scenes :
+            data = self.ixes[clip_name]
+            start = 0
+            while start < len(data):
+                end = start + self.stride + (self.seq_len - 1)
+                if end > len(data):
+                    end = len(data)
+                self.samples.append([clip_name,end - self.total_len ,end])
+                start += self.stride
 
         # 检测配置
         self.det_class_names = config["det_class_names"]
         self.det_gt_names = config["det_gt_names"]
-
-    def _history_sliding_k_count(self):
-        """历史段 [0..H-1] 上长度为 seq_len 的滑动窗口个数，如 H=20,seq_len=5 -> 16。"""
-        if not self.config.get("train_history_sliding_chunks", False):
-            return 1
-        H = int(self.config.get("history_sliding_num_frames", 20))
-        return max(0, H - self.seq_len + 1)
-
-    def _decode_index_history_sliding(self, index: int):
-        """将扁平 index 映射为 (clip_name, 滑动起点 sce_id_ind, 历史内偏移 k_off)。"""
-        K = self._history_sliding_k_count()
-        if K <= 0:
-            raise RuntimeError("train_history_sliding_chunks: history_sliding_num_frames < seq_len")
-        rem = int(index)
-        for clip_name in self.scenes:
-            L = len(self.ixes[clip_name])
-            W = self._num_sliding_windows(L)
-            block = W * K
-            if rem < block:
-                win_idx = rem // K
-                k_off = rem % K
-                return clip_name, win_idx, k_off
-            rem -= block
-        raise IndexError(f"index {index} out of range")
 
     def gen_rays(self):
         ogfH, ogfW = self.fH, self.fW
@@ -365,149 +243,7 @@ class Dataset(torch.utils.data.Dataset):
         return resize,resize_dims,crop,rotate
 
     
-    # def get_cam_pos_embedding(self, post_trans, post_rots, L, aug_params, public_infos):
-    #     ogfH, ogfW = self.final_dim
-    #     fH, fW = ogfH // self.ds, ogfW // self.ds
-    #     rays = self.rays
-
-    #     N, _ = post_trans.shape
-    #     points = rays - post_trans.view(N, 1, 1, 1, 3)  # (25, 32, 128, 3)
-    #     points = torch.inverse(post_rots).view(N, 1, 1, 1, 3, 3).matmul(points.unsqueeze(-1))
-    #     points = points.squeeze().view(N // 6, 6, 32, 96, 3).numpy()
-
-    #     seq_len = N // 6
-    #     cam_pos = {}
-    #     for key in public_infos.keys():
-    #         public_info = public_infos[key]
-    #         NewCameraMatrix = public_info["NewCameraMatrix"]
-    #         lidar2cam_param = public_info["lidar2cam_param"]
-    #         intrin = np.array(lidar2cam_param['cameraMatrix'])
-    #         distort = np.array(lidar2cam_param['distortion_coeffs'])
-    #         CAM = key_list[key]
-
-    #         if CAM == "front":  # 前
-    #             pointsx = points[:, 0:3, :, :, 0].reshape(-1)
-    #             pointsy = points[:, 0:3, :, :, 1].reshape(-1)
-    #             V = np.c_[pointsx, pointsy]
-    #             points_new = cv2.undistortPoints(V, intrin, distort, None, NewCameraMatrix).reshape(-1, 2)
-    #             ds = np.ones((points_new.shape[0], 1)).astype(np.float32)
-    #             points1 = np.c_[points_new, ds].astype(np.float32)
-    #             points1 = torch.tensor(points1).view(seq_len * 3, 32, 96, 3).unsqueeze(1).unsqueeze(-1)
-    #             NewCameraMatrix = torch.tensor(NewCameraMatrix).expand(seq_len * 3, 3, 3)
-    #             points1 = torch.inverse(NewCameraMatrix).view(seq_len * 3, 1, 1, 1, 3, 3).matmul(points1).squeeze(
-    #                 -1)  # torch.Size([10, 1, 32, 128, 3])
-    #             cam_pos[CAM] = self.positional_encoding(points1[..., :2], L).view(seq_len, 3, fH, fW, -1).permute(0, 1,
-    #                                                                                                               4, 2,
-    #                                                                                                               3)
-    #         elif CAM == "back":  # 后
-    #             pointsx = points[:, 3, :, :, 0].reshape(-1)
-    #             pointsy = points[:, 3, :, :, 1].reshape(-1)
-    #             V = np.c_[pointsx, pointsy]
-    #             points_new = cv2.undistortPoints(V, intrin, distort, None, NewCameraMatrix).reshape(-1, 2)
-    #             ds = np.ones((points_new.shape[0], 1)).astype(np.float32)
-    #             points1 = np.c_[points_new, ds].astype(np.float32)
-    #             points1 = torch.tensor(points1).view(seq_len, 32, 96, 3).unsqueeze(1).unsqueeze(-1)
-
-    #             NewCameraMatrix = torch.tensor(NewCameraMatrix).expand(seq_len, 3, 3)
-    #             points1 = torch.inverse(NewCameraMatrix).view(seq_len, 1, 1, 1, 3, 3).matmul(points1).squeeze(-1)
-    #             cam_pos[CAM] = self.positional_encoding(points1[..., :2], L).view(seq_len, 1, fH, fW, -1).permute(0, 1,
-    #                                                                                                               4, 2,
-    #                                                                                                               3)
-    #         elif CAM == "left":  # 左
-    #             whole_img_size = (1920, 1536)
-    #             D = np.array([distort[0], distort[1], distort[4], distort[5]]).astype(np.float32)
-    #             NewCameraMatrix = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(intrin, D, whole_img_size,
-    #                                                                                      None, balance=1)
-    #             pointsx = points[:, 4, :, :, 0].reshape(-1)
-    #             pointsy = points[:, 4, :, :, 1].reshape(-1)
-    #             V = np.c_[pointsx, pointsy]
-    #             V = V[:, np.newaxis, :]
-    #             points_new = cv2.fisheye.undistortPoints(V, intrin, D, P=NewCameraMatrix).reshape(-1, 2)
-    #             ds = np.ones((points_new.shape[0], 1)).astype(np.float32)
-    #             points1 = np.c_[points_new, ds].astype(np.float32)
-    #             points1 = torch.tensor(points1).view(seq_len, 32, 96, 3).unsqueeze(1).unsqueeze(-1)
-
-    #             NewCameraMatrix = torch.tensor(NewCameraMatrix).expand(seq_len, 3, 3)
-    #             points1 = torch.inverse(NewCameraMatrix).view(seq_len, 1, 1, 1, 3, 3).matmul(points1).squeeze(-1)
-    #             cam_pos[CAM] = self.positional_encoding(points1[..., :2], L).view(seq_len, 1, fH, fW, -1).permute(0, 1,
-    #                                                                                                               4, 2,
-    #                                                                                                               3)
-    #         elif CAM == "right":  # 右
-    #             whole_img_size = (1920, 1536)
-    #             D = np.array([distort[0], distort[1], distort[4], distort[5]]).astype(np.float32)
-    #             NewCameraMatrix = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(intrin, D, whole_img_size,
-    #                                                                                      None, balance=1)
-    #             pointsx = points[:, 5, :, :, 0].reshape(-1)
-    #             pointsy = points[:, 5, :, :, 1].reshape(-1)
-    #             V = np.c_[pointsx, pointsy]
-    #             V = V[:, np.newaxis, :]
-    #             points_new = cv2.fisheye.undistortPoints(V, intrin, D, P=NewCameraMatrix).reshape(-1, 2)
-    #             ds = np.ones((points_new.shape[0], 1)).astype(np.float32)
-    #             points1 = np.c_[points_new, ds].astype(np.float32)
-    #             points1 = torch.tensor(points1).view(seq_len, 32, 96, 3).unsqueeze(1).unsqueeze(-1)
-
-    #             NewCameraMatrix = torch.tensor(NewCameraMatrix).expand(seq_len, 3, 3)
-    #             points1 = torch.inverse(NewCameraMatrix).view(seq_len, 1, 1, 1, 3, 3).matmul(points1).squeeze(-1)
-    #             cam_pos[CAM] = self.positional_encoding(points1[..., :2], L).view(seq_len, 1, fH, fW, -1).permute(0, 1,
-    #                                                                                                               4, 2,
-    #                                                                                                               3)
-    #         # 最好再把原始的x,y也保留并concat起来
-    #     cam_pos_embedding = torch.cat([cam_pos['front'], cam_pos['back'], cam_pos['left'], cam_pos['right']],
-    #                                   dim=1).view(seq_len * 6, 16, 32, 96)
-    #     return cam_pos_embedding
     
-    # def gen_camera_pos_encoding(self, post_img, post_rot, post_tran, intrin, distort, L=4):
-    #     """
-    #     根据增强后的相机参数生成每张图的相机位置编码（camera position embedding）。
-
-    #     参数:
-    #         post_img: (N, 3, H, W) 增强后的图像，只用 N/H/W
-    #         post_rot: (N, 3, 3) 相机到 ego 的旋转矩阵 R
-    #         post_tran: (N, 3)   相机在 ego 坐标下的位置 t（目前不显式用到）
-    #         intrin: (N, 3, 3)   增强后的相机内参
-    #         distort: (N, 8)     畸变参数（当前实现未显式使用）
-    #         L:                  位置编码的频率参数，与你现有 self.positional_encoding 一致
-
-    #     返回:
-    #         cam_pos_embed: (N, C, fH, fW)，C 由 self.positional_encoding 决定，
-    #         fH,fW = final_dim // ds
-    #     """
-    #     import torch
-
-    #     device = post_img.device
-    #     N, _, H, W = post_img.shape
-    #     ogfH, ogfW = self.final_dim        # 例如 (128, 384)
-    #     fH, fW = ogfH // self.ds, ogfW // self.ds   # 例如 (32, 96)
-
-    #     # 特征图网格 (fH, fW)，用增强后图像的分辨率做缩放
-    #     ys = torch.linspace(0.5, H - 0.5, fH, device=device)
-    #     xs = torch.linspace(0.5, W - 0.5, fW, device=device)
-    #     grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")   # (fH, fW)
-
-    #     ones = torch.ones_like(grid_x)
-    #     pix = torch.stack([grid_x, grid_y, ones], dim=-1)        # (fH, fW, 3)
-    #     pix = pix.view(1, fH, fW, 3).repeat(N, 1, 1, 1)          # (N, fH, fW, 3)
-    #     pix_h = pix.view(N, -1, 3).unsqueeze(-1)                 # (N, fH*fW, 3, 1)
-
-    #     # 像素 -> 相机归一化坐标（深度设为 1）
-    #     intrin_inv = torch.inverse(intrin)                       # (N, 3, 3)
-    #     cam_dirs = intrin_inv.view(N, 1, 3, 3).matmul(pix_h).squeeze(-1)  # (N, fH*fW, 3)
-    #     cam_dirs = cam_dirs / (cam_dirs.norm(dim=-1, keepdim=True) + 1e-6)
-
-    #     # 相机系 -> ego 系（方向向量）
-    #     ego_dirs = post_rot.view(N, 1, 3, 3).matmul(
-    #         cam_dirs.unsqueeze(-1)
-    #     ).squeeze(-1)                                            # (N, fH*fW, 3)
-
-    #     # 取前两维 (dx, dy) 作为位置编码输入
-    #     dirs_xy = ego_dirs[..., :2].view(N, fH, fW, 2)           # (N, fH, fW, 2)
-
-    #     # 调用已有的 positional_encoding，保持与 get_cam_pos_embedding 风格一致
-    #     cam_pos_embed = self.positional_encoding(dirs_xy, L)     # (N, fH, fW, C)
-    #     cam_pos_embed = cam_pos_embed.permute(0, 3, 1, 2).contiguous()  # (N, C, fH, fW)
-
-    #     return cam_pos_embed
-
 
     def get_image_data(self,recs):
         "输出增强后的图片(裁剪/旋转)，以及增强的参数，相关的内外惨"
@@ -1056,15 +792,22 @@ class Dataset(torch.utils.data.Dataset):
             "gt_e2e_dynamic_traj": dynamic_traj_v
         }
 
-
-    def get_algin_theta_mat(self,recs):
-        theta_mats = []
+    def get_ego_pose(self,recs):
+        ego_poses = []
         for i ,rec in enumerate(recs):
             label = json.load(open(rec,"r"))
             ego_pose = label["ego_pose"]
             T_ego2wld_cur = TransformationmatrixEgo(ego_pose["orientation"],ego_pose["position"])
+            ego_poses.append(T_ego2wld_cur)
+        return np.array(ego_poses)
+
+    def get_algin_theta_mat(self,recs):
+        theta_mats = []
+        for i ,rec in enumerate(recs[:5]):
+            label = json.load(open(rec,"r"))
+            ego_pose = label["ego_pose"]
+            T_ego2wld_cur = TransformationmatrixEgo(ego_pose["orientation"],ego_pose["position"])
             if i == 0:
-                T_ego2wld_pre = T_ego2wld_cur
                 theta_mat = np.array([
                     [1.,0.,0.],
                     [0.,1.,0.]
@@ -1090,7 +833,60 @@ class Dataset(torch.utils.data.Dataset):
                                     [sy, 0., 0.],
                                     [0., 0., 1.]])
                 theta_mat = (pre_mat@(rel_pose@post_mat))[:2,:]
+            T_ego2wld_pre = T_ego2wld_cur
             theta_mats.append(theta_mat)
+
+        Ts = []
+        
+        for i ,rec in enumerate(recs[:5]):
+            label = json.load(open(rec,"r"))
+            ego_pose = label["ego_pose"]
+            T_ego2wld_cur = TransformationmatrixEgo(ego_pose["orientation"],ego_pose["position"])
+            Ts.append(T_ego2wld_cur)
+
+        theta_mats1 = []
+        for i ,rec in enumerate(recs[:5]):
+            T_ego2wld_pre = Ts[i]
+            T_ego2wld_cur = Ts[4]
+            
+            sx = self.bevh / 2
+            sy = self.bevw / 2
+            pose_diff = np.linalg.inv(T_ego2wld_pre)@T_ego2wld_cur
+            yaw = np.arctan2(pose_diff[1,0], pose_diff[0,0])
+            dx = pose_diff[0, 3]
+            dy = pose_diff[1, 3]
+            cos = np.cos(yaw)
+            sin = np.sin(yaw)
+            eye = np.zeros((3,3),dtype=np.float32)
+            rel_pose = eye.copy()
+            rel_pose[2,2]=1
+            rel_pose[0,0],rel_pose[0,1],rel_pose[0,2] = cos,-sin,dx
+            rel_pose[1,0],rel_pose[1,1],rel_pose[1,2] = sin,cos,dy
+            pre_mat = np.array([[0., 1./sy, 0.], # 车头往下
+                                [1./sx, 0., -1/5],
+                                [0., 0., 1.]])
+            post_mat = np.array([[0., sx, sx/5],
+                                [sy, 0., 0.],
+                                [0., 0., 1.]])
+            theta_mat = (pre_mat@(rel_pose@post_mat))[:2,:]
+            theta_mats1.append(theta_mat)
+        
+        theta_mat =  np.array([
+                    [1.,0.,0.],
+                    [0.,1.,0.],
+                    [0.,0.,1.]
+                ])
+        theta_mats2 = []
+        for i in range(5):
+            if i == 0:
+                theta_mat_pre = np.eye(3,dtype=np.float32)
+            else:
+                
+                theta_mat_i = np.eye(3,dtype=np.float32)
+                theta_mat_i[:2] =  theta_mats[i]
+                theta_mat_pre =  np.linalg.inv(theta_mat_pre)@theta_mat_i
+            theta_mats2.append(theta_mat_pre)
+         
         return np.array(theta_mats)
 
     def gt_value(self,m,src,mask,idx):
@@ -1128,115 +924,61 @@ class Dataset(torch.utils.data.Dataset):
         #     if clip_name in clip_names:
         #         return mode
     
-    def gen_random_history_indexs(self,len=5,mode="dynamic"):
-        indexs_dict = {}
-        for task in self.task_class_names[mode]:
-            if self.task_flags[task]:
-                sub_indexs = sorted(random.sample(
-                    [i for i in range(self.task_indexs[task][0]+len,self.task_indexs[task][1])], # 对预测任务来说
-                    len)) # 历史长度
-                indexs_dict[task] = sub_indexs
-        return indexs_dict
+    # def gen_random_history_indexs(self,len=5,mode="dynamic"):
+    #     indexs_dict = {}
+    #     for task in self.task_class_names[mode]:
+    #         if self.task_flags[task]:
+    #             sub_indexs = sorted(random.sample(
+    #                 [i for i in range(self.task_indexs[task][0]+len,self.task_indexs[task][1])], # 对预测任务来说
+    #                 len)) # 历史长度
+    #             indexs_dict[task] = sub_indexs
+    #     return indexs_dict
 
 
-    def _num_sliding_windows(self, L):
-        """每个 clip 上长度为 total_len 的滑动窗口个数（与 __len__ / __getitem__ 索引一致）。"""
-        w = max(0, L - self.total_len)
-        # 整窗流式：若 clip 帧数恰好等于 total_len，原公式 L-total_len==0 会导致无样本，补 1 条窗口。
-        if self.config.get("train_full_window_temporal", False) and L == self.total_len and w == 0:
-            return 1
-        return w
+    # def get_input_indexs(self,mode="dynamic"):
+    #     if self.task_index_random:
+    #         #随机生成的轨迹合并，分成两大类：动态和静态，否则占资源
+    #         his_len = self.seq_len - 1 # 历史长度
+    #         task_indexs = self.gen_random_history_indexs(len=his_len,mode=mode)
+    #         indexs = []
+    #         for task in self.task_class_names[mode]:
+    #             if task in task_indexs:
+    #                 indexs += task_indexs[task]
+    #         indexs = list(set(indexs))   
+    #         indexs = sorted(random.sample(indexs,his_len)) + [self.current_frame_index]
+    #     else:
+    #         indexs = [self.current_frame_index - i for i in range(self.seq_len)][::-1]
+        
+    #     return indexs
 
-    def build_streaming_temporal_indexs(self, rec_len: int):
-        """
-        train_full_window_temporal 时：按当前 rec 实际长度取帧（0..rec_len-1），适配 300/600 等不等长 clip。
-        stream_max_frames：限制单次样本的 T 上限，避免 total_len 过大导致 DataLoader/显存阻塞；长 clip 靠滑动窗口多次采样覆盖。
-        """
-        if rec_len <= 0:
-            return []
-        cap = self.config.get("stream_max_frames", None)
-        if cap is not None and int(cap) > 0:
-            n = min(rec_len, int(cap))
-        else:
-            n = rec_len
-        return list(range(n))
-
-    def get_input_indexs(self,mode="dynamic"):
-        if self.task_index_random:
-            #随机生成的轨迹合并，分成两大类：动态和静态，否则占资源
-            his_len = self.seq_len - 1 # 历史长度
-            task_indexs = self.gen_random_history_indexs(len=his_len,mode=mode)
-            indexs = []
-            for task in self.task_class_names[mode]:
-                if task in task_indexs:
-                    indexs += task_indexs[task]
-            indexs = list(set(indexs))   
-            indexs = sorted(random.sample(indexs,his_len)) + [self.current_frame_index]
-        else:
-            indexs = [self.current_frame_index - i for i in range(self.seq_len)][::-1]
-        return indexs
+    def get_input_indexs(self):
+        image_indexs = [i for i in range(self.current_frame_index+1)]
+        gt_indexs = image_indexs[self.seq_len-1:]
+        return image_indexs,gt_indexs
         
 
 
     def __getitem__(self, index):
-        history_sliding = self.config.get("train_history_sliding_chunks", False)
-        rec_e2e_anchor = None
+        # sces_len = self.sces_len
+        # scenes = self.scenes
+        # sce_id = [i for i in range(len(sces_len)) if (sum(sces_len[:i]) <= index and sum(sces_len[:i + 1]) > index)][0]
+        # clip_name = scenes[sce_id]
+        # sce_id_ind = index - sum(sces_len[:sce_id])
 
-        if history_sliding:
-            clip_name, win_idx, k_off = self._decode_index_history_sliding(index)
-            clip_paths = self.ixes[clip_name]
-            clip_len = len(clip_paths)
-            sce_id_ind = win_idx
-            end = min(sce_id_ind + self.total_len, clip_len)
-            rec = clip_paths[sce_id_ind:end]
-            rec_len = len(rec)
-            H = int(self.config.get("history_sliding_num_frames", 20))
-            if k_off + self.seq_len > H:
-                raise RuntimeError(
-                    f"history_sliding: k_off={k_off} seq_len={self.seq_len} exceeds history H={H}"
-                )
-            if rec_len < H:
-                raise RuntimeError(
-                    f"history_sliding: rec_len={rec_len} < history_sliding_num_frames={H} "
-                    f"clip={clip_name} sce_id_ind={sce_id_ind}"
-                )
-            indexs = [k_off + i for i in range(self.seq_len)]
-            recs = [rec[i] for i in indexs]
-            if rec_len > self.current_frame_index:
-                rec_e2e_anchor = [rec[self.current_frame_index]]
-            else:
-                rec_e2e_anchor = [rec[-1]]
-        else:
-            sces_len = self.sces_len
-            scenes = self.scenes
-            sce_id = [i for i in range(len(sces_len)) if (sum(sces_len[:i]) <= index and sum(sces_len[:i + 1]) > index)][0]
-            clip_name = scenes[sce_id]
-            sce_id_ind = index - sum(sces_len[:sce_id])
-            clip_paths = self.ixes[clip_name]
-            clip_len = len(clip_paths)
-            # 滑动窗口右端不越界；不足 total_len 时 rec 变短（如 clip 尾段）
-            end = min(sce_id_ind + self.total_len, clip_len)
-            rec = clip_paths[sce_id_ind:end]
-            rec_len = len(rec)
-            if self.config.get("train_full_window_temporal", False):
-                indexs = self.build_streaming_temporal_indexs(rec_len)
-            else:
-                mode0 = self.dynamic_static_data(clip_name)
-                indexs = self.get_input_indexs(mode0)
-                indexs = [i for i in indexs if 0 <= i < rec_len]
-            if rec_len > 0 and len(indexs) == 0:
-                raise RuntimeError(
-                    f"Dataset temporal indexs empty: clip={clip_name}, sce_id_ind={sce_id_ind}, "
-                    f"rec_len={rec_len}, current_frame_index={self.current_frame_index}, seq_len={self.seq_len}"
-                )
-            recs = [rec[i] for i in indexs]
+        
+
+        # rec = self.ixes[clip_name][sce_id_ind:sce_id_ind + self.total_len]
+
+        clip_name,start_idx,end_idx = self.samples[index]
+        rec =  self.ixes[clip_name][start_idx:end_idx]
 
         dt = self.get_Hz_by_filename_from_json(rec)
-        mode = self.dynamic_static_data(clip_name)
-        label_paths = {
-            "label_path":recs
-        }
-        imgs, rots, trans, intrins, distorts, post_rots, post_trans,intervals,timestamps = self.get_image_data(recs)
+        mode = self.dynamic_static_data(clip_name) # 判断那种数据类型，是否指标了动态数据，还是只标了静态数据，还是两者都标注了
+        image_indexs,gt_indexs= self.get_input_indexs()  # 16 17 18 19 20
+        #数据增强部分
+        image_recs = [rec[i] for i in image_indexs]
+        
+        imgs, rots, trans, intrins, distorts, post_rots, post_trans,intervals,timestamps = self.get_image_data(image_recs)
         images_parma = {
             "x": imgs,                  # 14 8 3 128 384 # 最后在batch上拼接 # bs * T * 8 * 3 * 128 * 384
             "rots": rots,               # 14 8 3 3        
@@ -1250,35 +992,39 @@ class Dataset(torch.utils.data.Dataset):
         }
 
         #时序对其部分
-        theta_mats = self.get_algin_theta_mat(recs)
-        algin_matrixs = {
-            "theta_mats": torch.Tensor(theta_mats)
+        ego_pose = self.get_ego_pose(image_recs)
+        ego_pose_matrixs = {
+            "ego_pose": torch.Tensor(ego_pose)
         }
 
+        gt_recs = [rec[i] for i in gt_indexs]
+
+        label_paths = {
+            "label_path":gt_recs
+        }
 
         anno_infos = {}
-        # 全窗 current_frame_index 上的自车轨迹真值；history_sliding 时输入仅为 5 帧，锚点仍用窗口内第 current_frame_index 帧
-        rec_e2e = rec_e2e_anchor if rec_e2e_anchor is not None else recs
+        
 
         # 有哪些任务收集哪些真值
         if mode == "dynamic" or mode == "dynamic_static":
             if self.task_flags["det2D"]:
-                anno_infos.update(self.get_anno_det2D(recs))
+                anno_infos.update(self.get_anno_det2D(gt_recs))
             if self.task_flags["det3D"]:
-                anno_infos.update(self.get_anno_det3D(recs,dt=dt))
+                anno_infos.update(self.get_anno_det3D(gt_recs,dt=dt))
             # if self.task_flags["obj_dynamic_traj"]:
-            #     anno_infos.update(self.get_anno_obj_dynamic_traj(rec_e2e,dt=dt))
+            #     anno_infos.update(self.get_anno_obj_dynamic_traj(gt_recs,dt=dt))
 
         if mode == "static" or mode == "dynamic_static":
             if self.task_flags["map2D"]:
-                anno_infos.update(self.get_anno_map2D(recs))
+                anno_infos.update(self.get_anno_map2D(gt_recs))
             if self.task_flags["map3D"]:
-                anno_infos.update(self.get_anno_map3D(recs))
+                anno_infos.update(self.get_anno_map3D(gt_recs))
             if self.task_flags["e2e_static_traj"]:
-                anno_infos.update(self.get_anno_e2e_static_traj(rec_e2e,  num_static_pts=20))
+                anno_infos.update(self.get_anno_e2e_static_traj(gt_recs,  num_static_pts=20))
 
         if self.task_flags["e2e_dynamic_traj"] or mode == "dynamic_static":
-            anno_infos.update(self.get_anno_e2e_dynamic_traj(rec_e2e, dt=dt))
+            anno_infos.update(self.get_anno_e2e_dynamic_traj(gt_recs, dt=dt))
         
         # 避免 DataLoader default_collate 遇到 None 报错：未参与任务的键保持为 None 时改为可 collate 的占位
         for k in list(anno_infos.keys()):
@@ -1287,7 +1033,7 @@ class Dataset(torch.utils.data.Dataset):
 
         out = {}
         out.update(images_parma)
-        out.update(algin_matrixs)
+        out.update(ego_pose_matrixs)
         out.update(anno_infos)
         out.update(label_paths)
 
@@ -1295,12 +1041,7 @@ class Dataset(torch.utils.data.Dataset):
 
 
     def __len__(self):
-        if self.config.get("train_history_sliding_chunks", False):
-            K = self._history_sliding_k_count()
-            if K <= 0:
-                return 0
-            return sum(self._num_sliding_windows(len(self.ixes[i])) * K for i in self.ixes.keys())
-        return sum(self._num_sliding_windows(len(self.ixes[i])) for i in self.ixes.keys())
+        return len(self.samples)
     
     def prepro(self):
         all_clip_names = list(self.clip2path.keys())
