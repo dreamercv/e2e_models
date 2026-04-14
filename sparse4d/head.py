@@ -318,7 +318,7 @@ class Sparse4DHead(nn.Module):
             out["instance_id"] = self.instance_bank.get_instance_id(
                 cls, anchor, self.decoder.score_threshold
             )
-        return out,instance_feature,anchor
+        return out,instance_feature,anchor # 4 50 256 # 4 50 11
 
     def _reduce_mean(self, x: torch.Tensor) -> torch.Tensor:
         return x.sum()
@@ -383,7 +383,7 @@ class Sparse4DHead(nn.Module):
             gt_reg = [gt_reg[b] for b in range(len(gt_reg)) for _ in range(T)]
         for decoder_idx, (cls, reg, qt) in enumerate(zip(cls_scores, reg_preds, quality)):
             reg = reg[..., : len(self.reg_weights)]
-            cls_target, reg_target, reg_weights = self.sampler.sample(
+            cls_target, reg_target, reg_weights,_ = self.sampler.sample(
                 cls, reg, gt_cls, gt_reg,reg_masks=gt_reg_mask
             )
             # 确保 label / reg target 与预测在同一 device 上
@@ -391,6 +391,7 @@ class Sparse4DHead(nn.Module):
             cls_target = cls_target.to(device)
             reg_target = reg_target.to(device)
             reg_weights = reg_weights.to(device)
+            # traj_target = traj_target.to(device)
             reg_target = reg_target[..., : len(self.reg_weights)]
             mask = torch.logical_not(torch.all(reg_target == 0, dim=-1))# True是匹配上的，False是没有匹配上的
             # num_pos = max(self._reduce_mean(torch.sum(mask).to(dtype=reg.dtype)), 1.0)
@@ -427,6 +428,7 @@ class Sparse4DHead(nn.Module):
                 )
             output[f"loss_cls_{decoder_idx}"] = cls_loss
             output.update(reg_loss_dict)
+            
 
         if "dn_prediction" not in model_outs:
             return output

@@ -1,10 +1,12 @@
-e2e_models/
+e2e_models-master/
 ├── backbone
 │   ├── bev_backbone.py
 │   └── image_backbone.py
 ├── config
-│   └── config.py
+│   ├── config.py
+│   └── ds_config.json
 ├── dataset
+│   ├── clip_dataset
 │   ├── convert_det.py
 │   ├── convert_map.py
 │   ├── dataset.py
@@ -15,16 +17,8 @@ e2e_models/
 │   ├── get_aug_param.py
 │   ├── img.jpg
 │   └── map.json
-├── doc
-│   ├── BEV_BACKBONE_AND_DET3D_LOSS_ANALYSIS.md
-│   ├── BEV_BACKBONE_AND_DET3D_LOSS_NOTES.md
-│   ├── BEV_BACKBONE_AND_DYNAMIC_TRAINING_NOTES.md
-│   ├── CAMERA_POS_EMBEDDING_DATASET_STYLE.md
-│   ├── CAMERA_POS_EMBEDDING_FISHEYE.md
-│   └── TRAIN_STREAM_CLIP_FRAMES.md
 ├── docs
 │   ├── ANCHOR_HANDLER_GUIDE.md
-│   ├── BEV_ALIGN_NAN_DEBUG.md
 │   ├── DATA_FORMAT.md
 │   ├── MAP_DATA_FORMAT.md
 │   ├── MAP_HEAD_CONFIG_CHECK.md
@@ -33,8 +27,10 @@ e2e_models/
 │   ├── README.md
 │   ├── SPARSEBOX3D_REFINEMENT.md
 │   ├── TRACK_HEAD.md
-│   ├── TRAINING_DEBUG_AND_MICRO_OVERFIT.md
 │   └── TRAJECTORY_DESIGN.md
+├── log
+│   ├── log_0402_非流式单机单卡.txt
+│   └── log_0407_流式单机单多卡.txt
 ├── maptr
 │   ├── __init__.py
 │   ├── assigner_loss.py
@@ -55,6 +51,7 @@ e2e_models/
 │   ├── loss_det.py
 │   ├── loss_seg.py
 │   └── seg2d_model.py
+├── nuscenes_mini
 ├── sparse4d
 │   ├── __init__.py
 │   ├── bev_aggregation.py
@@ -66,30 +63,38 @@ e2e_models/
 │   ├── head.py
 │   ├── instance_bank.py
 │   ├── losses.py
+│   ├── sparse4d.txt
 │   └── track_head.py
+├── trajectory_dynamic
+│   ├── attention.py
+│   ├── quantize.py
+│   ├── traj.txt
+│   ├── trajectory_predictor.py
+│   ├── transformer_encoder.py
+│   └── vqvae.py
 ├── utils
 │   ├── get_aug_param.py
 │   ├── opencv_fisheye_equivalent.py
 │   └── vis_gt.py
-├── 0_0.jpg
-├── 0_1.jpg
-├── 0_2.jpg
-├── 0_3.jpg
-├── 0_4.jpg
-├── 0_5.jpg
-├── 0_6.jpg
-├── 0_7.jpg
 ├── README.md
+├── anchor.jpg
 ├── anchor.py
+├── bev.jpg
+├── core.867368
+├── debug_grid_feat_32x96.jpg
+├── debug_grid_img_128x384.jpg
 ├── demo.py
+├── ego_pose.npy
 ├── get_anchor_init.py
 ├── get_keams_anchors.py
-├── local_map.jpg
+├── local_map2.jpg
 ├── log.txt
-├── loss.log
+├── mask.jpg
+├── nohup.out
 ├── restore.py
+├── test_vqvae.py
 ├── train.py
-└── train_accu.py
+└── train_gpuxn.py
 
 ============================================================
 文件内容列表：
@@ -377,98 +382,6 @@ def _pixels_to_cam_dirs_fisheye(uv1, intrin_inv, dist, eps=1e-6):
     d = torch.stack([xn, yn, torch.ones_like(xn)], dim=-1)
     return torch.nn.functional.normalize(d, dim=-1, eps=eps)
 
-class TemporalFusion(nn.Module):
-    def __init__(self,seq_len,channels,grid_conf):
-        super(TemporalFusion,self).__init__()
-        self.seq_len = seq_len
-        self.channels = channels
-        self.grid_conf= grid_conf
-        self.bevh = self.grid_conf["xbound"][1] - self.grid_conf["xbound"][0]
-        self.bevw = self.grid_conf["ybound"][1] - self.grid_conf["ybound"][0]
-        sx = self.bevh / 2
-        sy = self.bevw / 2
-
-        pre_mat = torch.tensor([[0., 1./sy, 0.],
-                                [1./sx, 0., -1/5],
-                                [0., 0., 1.]], dtype=torch.float32)
-        post_mat = torch.tensor([[0., sx, sx/5],
-                                 [sy, 0., 0.],
-                                 [0., 0., 1.]], dtype=torch.float32)
-        self.register_buffer('pre_mat', pre_mat)
-        self.register_buffer('post_mat', post_mat)
-
-        self.algin_fusion = nn.Sequential(
-            nn.Conv2d(channels * self.seq_len, channels * self.seq_len // 2, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(channels * self.seq_len // 2),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channels * self.seq_len //2, channels, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(channels),
-            nn.ReLU(inplace=True)
-        )
-
-    def to_theta_mats(self,ego_pose): #torch.Size([1, 5, 4, 4])
-        B, T = ego_pose.shape[:2]
-        device = ego_pose.device
-        dtype = ego_pose.dtype
-
-        T_last = ego_pose[:, -1]                     # (B, 4, 4)
-              # (B, 4, 4)
-
-        theta_mats = []
-        for i in range(T - 1):
-            T_i = ego_pose[:, i]   
-                              # (B, 4, 4)
-            T_i_to_last = torch.inverse(T_i)@T_last           # (B, 4, 4)
-
-            # 提取平移和旋转
-            dx = T_i_to_last[:, 0, 3]                # (B,)
-            dy = T_i_to_last[:, 1, 3]
-            yaw = torch.atan2(T_i_to_last[:, 1, 0], T_i_to_last[:, 0, 0])  # (B,)
-            cos = torch.cos(yaw)
-            sin = torch.sin(yaw)
-
-            # 构造 3x3 齐次变换矩阵 rel_pose
-            rel_pose = torch.zeros(B, 3, 3, device=device, dtype=dtype)
-            rel_pose[:, 0, 0] = cos
-            rel_pose[:, 0, 1] = -sin
-            rel_pose[:, 0, 2] = dx
-            rel_pose[:, 1, 0] = sin
-            rel_pose[:, 1, 1] = cos
-            rel_pose[:, 1, 2] = dy
-            rel_pose[:, 2, 2] = 1.0
-
-            # 计算 BEV 图像仿射矩阵：pre_mat @ (rel_pose @ post_mat)
-            # 注意：pre_mat, post_mat 是 (3,3)，需广播到 batch 维度
-            theta = self.pre_mat @ (rel_pose @ self.post_mat)   # (B, 3, 3)
-            theta = theta[:, :2, :]                            # (B, 2, 3)
-            theta_mats.append(theta)
-
-        # 堆叠为 (B, T-1, 2, 3)
-        theta_mats = torch.stack(theta_mats, dim=1)
-        return theta_mats
-
-    def forward(self,cur_bev,ego_pose,pre_bevs=[]):
-        theta_mats = self.to_theta_mats(ego_pose)
-        bevs = []
-        for i in range(self.seq_len-1):
-            warped_prev = self.warp_feature(
-                    pre_bevs[i], theta_mats[:, i].to(cur_bev.dtype)
-                )
-            bevs.append(warped_prev)
-        bevs.append(cur_bev)
-        algin_features = torch.stack(bevs).permute(1, 0, 2, 3, 4).flatten(1, 2)
-        algin_features = self.algin_fusion(algin_features)
-
-        return algin_features
-
-
-    def warp_feature(self, features, theta):
-        B, C, H, W = features.size()
-        grids = F.affine_grid(theta, torch.Size((B, C, H, W)), align_corners=True)
-        cropped_features = F.grid_sample(features, grids, align_corners=True)
-        return cropped_features
-
-
 
 class BEVBackbone(nn.Module):
     def __init__(
@@ -476,13 +389,13 @@ class BEVBackbone(nn.Module):
         channels=256,
         grid_conf=None,
         input_size=(128, 384),
-        # num_temporal=7,
+        num_temporal=7,
         num_cams=6,
         use_cam_pos_embed=True,
         cam_pos_L=4,
     ):
         super(BEVBackbone, self).__init__()
-        # self.num_temporal = num_temporal
+        self.num_temporal = num_temporal
         self.grid_conf = grid_conf
         self.input_size = input_size
         self.use_cam_pos_embed = use_cam_pos_embed
@@ -502,12 +415,20 @@ class BEVBackbone(nn.Module):
         ds = float(self.splat.dowmsampe)
         self.fH, self.fW = int(round(ogfH / ds)), int(round(ogfW / ds))
 
-        # self.bev_backbone = nn.Sequential(
-        #     nn.Conv2d(3, 128, kernel_size=3, stride=1, padding=1),
-        #     nn.MaxPool2d(2, 2),
-        #     nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
-        #     nn.MaxPool2d(2, 2)
-        # )
+        self.bevh = self.grid_conf["xbound"][1] - self.grid_conf["xbound"][0]
+        self.bevw = self.grid_conf["ybound"][1] - self.grid_conf["ybound"][0]
+        sx = self.bevh / 2
+        sy = self.bevw / 2
+        pre_mat = torch.tensor([[0., 1./sy, 0.],
+                                [1./sx, 0., -1/5],
+                                [0., 0., 1.]], dtype=torch.float32)
+        post_mat = torch.tensor([[0., sx, sx/5],
+                                 [sy, 0., 0.],
+                                 [0., 0., 1.]], dtype=torch.float32)
+        self.register_buffer('pre_mat', pre_mat)
+        self.register_buffer('post_mat', post_mat)
+
+
         
         self.cam_embedding_learn = nn.Embedding(num_cams, self.cam_embed_dim) # 可学习的位置编码
         if use_cam_pos_embed:
@@ -555,15 +476,15 @@ class BEVBackbone(nn.Module):
             nn.ReLU(inplace=True)
         )
 
-        # self.algin_fusion = nn.Sequential(
-        #     nn.Conv2d(channels * 2, channels, kernel_size=3, stride=1, padding=1),
-        #     nn.BatchNorm2d(channels),
-        #     nn.ReLU(inplace=True)
-        # )
+        self.algin_fusion = nn.Sequential(
+            nn.Conv2d(channels * self.num_temporal, channels, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True)
+        )
         # nn.Conv2d(channels * 2, channels, kernel_size=3, stride=1, padding=1)
         self.debug_grid_projection = bool(int(os.environ.get("BEV_DEBUG_GRID", "0")))
 
-    def forward(self, x, rots, trans, intrins, distorts, post_rot3, post_tran3):
+    def forward(self, x, rots, trans, intrins, distorts, post_rot3, post_tran3, ego_poses,pre_bev=[],prepare_pre_bev=False):
 
         """
         # B,5*6,3,128,384
@@ -571,7 +492,7 @@ class BEVBackbone(nn.Module):
         B, img_num 6,  c h w
         x_img.reshape(6, B, img_num, *x_img.shape[2:])
         """
-        # S = self.num_temporal
+        S = self.num_temporal
         # B, S, N, C, H, W = x.shape
         rots = rots.flatten(0, 1)
         trans = trans.flatten(0, 1)
@@ -651,29 +572,72 @@ class BEVBackbone(nn.Module):
         out_put = torch.cat([out_put, bev_emb[None].expand(out_put.shape[0], -1, -1, -1)], dim=1) # torch.Size([25, 384, 150, 100]) # 90 256 200 80 # 90 = 3 * 2 * 5 * 3(三个相机)
         out_put = self.fusion_height(out_put)
         out_put = out_put.reshape(-1,self.num_cams*out_put.shape[1],*out_put.shape[-2:])
-        out_put = self.multiview_fusion(out_put)
-        # out_put = out_put.view(-1, S, *out_put.shape[-3:])
-        # theta_mats[i]：第 i-1 帧 BEV 网格 -> 第 i 帧网格的仿射（与 dataset get_algin_theta_mat 一致）；
-        # 应对「上一帧已对齐特征」做 warp 到当前帧，再与当前帧 out_put[:, i] 融合，勿对当前帧误做 warp。
-        # algin_features = []
-        # for i in range(S):
-        #     if i == 0:
-        #         algin_features.append(out_put[:, i])
-        #     else:
-        #         warped_prev = self.warp_feature(
-        #             algin_features[-1], theta_mats[:, i].to(out_put.dtype)
-        #         )
-        #         algin_features.append(
-        #             self.algin_fusion(torch.cat([warped_prev, out_put[:, i]], 1))
-        #         )
-        # out_put = torch.stack(algin_features).permute(1, 0, 2, 3, 4).flatten(0, 1)
-        return out_put  # 输出时序帧信息，每一帧都和前一阵融合这样子达到了渐进的融合方式
+        cur_bev = self.multiview_fusion(out_put) # bs * 256 * 32 *96
+        
+        if prepare_pre_bev:
+            return None,cur_bev
+        # # 应对「上一帧已对齐特征」做 warp 到当前帧，再与当前帧 out_put[:, i] 融合，勿对当前帧误做 warp。
+        # if len(pre_bev) == 0 :
+        #     pre_bev = torch.zeros_like(cur_bev).detach()
+        #     ego_poses = torch.cat([ego_poses,ego_poses],1) # bs*1*4*4 --> bs*2*4*4
+        theta_mats = self.egopose2thetamat(ego_poses)
+        warp_bevs = []
+        for i, p_bev in enumerate(pre_bev):
+            warped_prev = self.warp_feature(
+                p_bev, theta_mats[:, i].to(out_put.dtype)
+            )
+            warp_bevs.append(warped_prev)
+        warp_bevs.append(cur_bev)
+        fusion_bev = self.algin_fusion(torch.cat(warp_bevs, 1))
+        return fusion_bev,cur_bev
 
-    # def warp_feature(self, features, theta):
-    #     B, C, H, W = features.size()
-    #     grids = F.affine_grid(theta, torch.Size((B, C, H, W)), align_corners=True)
-    #     cropped_features = F.grid_sample(features, grids, align_corners=True)
-    #     return cropped_features
+    def egopose2thetamat(self,ego_pose): #torch.Size([1, 5, 4, 4])
+        B, T = ego_pose.shape[:2]
+        device = ego_pose.device
+        dtype = ego_pose.dtype
+
+        T_last = ego_pose[:, -1]                     # (B, 4, 4)
+              # (B, 4, 4)
+
+        theta_mats = []
+        for i in range(T - 1):
+            T_i = ego_pose[:, i]   
+                              # (B, 4, 4)
+            T_i_to_last = torch.inverse(T_i)@T_last           # (B, 4, 4)
+
+            # 提取平移和旋转
+            dx = T_i_to_last[:, 0, 3]                # (B,)
+            dy = T_i_to_last[:, 1, 3]
+            yaw = torch.atan2(T_i_to_last[:, 1, 0], T_i_to_last[:, 0, 0])  # (B,)
+            cos = torch.cos(yaw)
+            sin = torch.sin(yaw)
+
+            # 构造 3x3 齐次变换矩阵 rel_pose
+            rel_pose = torch.zeros(B, 3, 3, device=device, dtype=dtype)
+            rel_pose[:, 0, 0] = cos
+            rel_pose[:, 0, 1] = -sin
+            rel_pose[:, 0, 2] = dx
+            rel_pose[:, 1, 0] = sin
+            rel_pose[:, 1, 1] = cos
+            rel_pose[:, 1, 2] = dy
+            rel_pose[:, 2, 2] = 1.0
+
+            # 计算 BEV 图像仿射矩阵：pre_mat @ (rel_pose @ post_mat)
+            # 注意：pre_mat, post_mat 是 (3,3)，需广播到 batch 维度
+            theta = self.pre_mat @ (rel_pose @ self.post_mat)   # (B, 3, 3)
+            theta = theta[:, :2, :]                            # (B, 2, 3)
+            theta_mats.append(theta)
+
+        # 堆叠为 (B, T-1, 2, 3)
+        theta_mats = torch.stack(theta_mats, dim=1)
+        return theta_mats
+        
+
+    def warp_feature(self, features, theta):
+        B, C, H, W = features.size()
+        grids = F.affine_grid(theta, torch.Size((B, C, H, W)), align_corners=True)
+        cropped_features = F.grid_sample(features, grids, align_corners=True)
+        return cropped_features
 
     def positional_encoding(self, input, L):  # [B,...,N]
         shape = input.shape
@@ -961,7 +925,7 @@ configs = {
 
     "device":"cuda",# cuda cpu
     "warmup_steps":10,
-    "lr":1e-3,
+    "lr":1e-3, # 总学习率
     "max_grad_norm": 5,
     "weight_decay":1e-4,
     "resume":False,
@@ -969,16 +933,17 @@ configs = {
     "backbone":"resnet18",
     "backbone_path":"../resnet18-f37072fd.pth",
 
+    "bn2gn_num_groups":32,
 
     "is_train": True,
-    "batch_size": 8,
+    "batch_size": 2, #单卡batchsize
     "num_workers": 1,
-    "epoch": 200,
+    "epoch": 400,
     "seq_len": 5,
 
 
-    "log_dir": "../logs/only_dynamic_0401_5frames_dn_algin_cnsx2_oriroi_newdepth_newaug_campos_learn_giou_stream_demo",
-    "log_save_interval": 10,
+    "log_dir": "../logs/only_dynamic_0407_gradx5_nograd4_gpuxn_dynamictraj",
+    "log_save_interval": 1,
     "log_print_interval": 1,
     "ckpt_save_interval":100,
 
@@ -988,6 +953,19 @@ configs = {
         "dynamic_static": False,
         "e2e": False,
     },
+
+    "task_flag": { # 启动哪些任务
+        "det2D": False,
+        "det3D": True,
+        "obj_dynamic_traj": True,
+
+        "map2D": False,
+        "map3D": True,
+        "e2e_static_traj": True,
+
+        "e2e_dynamic_traj": True,
+    },
+
     # 总的参数
     "grid_conf": {
         'xbound': [-80.0, 120.0, 1],
@@ -1030,22 +1008,12 @@ configs = {
     "mode": "static",  # 默认加载动态数据
     
 
-    "train_clips":["20250508072555"],# ["20260101010101"],  # -1 所有，[]指定几个，xxx.txt写进txt中指定的，>0前N个
+    "train_clips": ["20260101010101"],  # -1 所有，[]指定几个，xxx.txt写进txt中指定的，>0前N个
 
-    "total_len": 20 + 1 + 50,  # 一共71帧，当前帧是第21帧，往前20帧，往后50帧 ，最后一帧索引对应着70 ，未来50帧为了获取真值
-    "current_frame_index": 20,  # 0 1 2 3 4 5 ... [20] 21 22 23 ... 70
+    "total_len": 8 + 1 + 50,  # 一共71帧，当前帧是第21帧，往前20帧，往后50帧 ，最后一帧索引对应着70 ，未来50帧为了获取真值
+    "current_frame_index": 8,  # 0 1 2 3 4 5 ... [20] 21 22 23 ... 70
 
-    "task_flag": {
-        "det2D": False,
-        "det3D": True,
-        "obj_dynamic_traj": True,
-
-        "map2D": False,
-        "map3D": True,
-        "e2e_static_traj": True,
-
-        "e2e_dynamic_traj": True,
-    },
+    
     "task_class_names": {
         "dynamic": ["det2D", "det3D", "obj_dynamic_traj"],
         "static": ["map3D", "map2D", "e2e_static_traj"],
@@ -1119,7 +1087,7 @@ configs = {
         ],
         "e2e": ["gt_e2e_dynamic_traj","label_path"]
     },
-    "input_names": ["x", "rots", "trans", "intrins", "distorts", "post_rots", "post_trans", "ego_pose","intervals","timestamps"],
+    "input_names": ["x", "rots", "trans", "intrins", "distorts", "post_rots", "post_trans", "ego_poses","intervals","timestamps"],
 
     # 模型相关
     "img_outchannels": 256,
@@ -1157,6 +1125,17 @@ configs = {
         "instance_grad":False,
         "anchor_grad":True,
         "cls_threshold_to_reg":-1,
+        "anchor_dim":11,
+    },
+    "traj_dynamic":{
+        "nbooks":1,
+        "d_model":256,
+        "nhead":4,
+        "num_layers":3,
+        "vqvae_num_slots":1024,
+        "e_dim":256,
+        "n_e":1,
+        "freeze_vqvae":False,
     },
     # tracking
     "track_head": {
@@ -1999,37 +1978,44 @@ if __name__ == '__main__':
 @E-mail       :afb5szh@bosch.com
 @Version      :V1.0.0
 @Description  :
-    整体思路----数据不同源版本，并且分段训练：
-        1、时序图像作为输入（2*bs*5*8*3*128*384）,其中5表示时序五帧，8表示环视相机一共有8个，2表示两种数据:只标注目标相关的动态数据和只标注了车道线相关的金泰数据,3*128*384是输入图像的尺寸
-        2、输入图像经过自定义的纯2d卷积网络，下采样四倍，输出的通道数是256，卷积网络输出的大小为2*bs*5*8*256*32*96,我称这个模型是image_backbone模块
-        3、image_backbone的输出经过内外参的转换将其投影到3d的bev空间，具体方法为：在自车坐标系初始化一个200米*80米*6米(xyz)的3d空间,然后通过内外参将其转到像素坐标coor，然后根据coor的索引将image_backbone的像素特征对齐到3d空间,多视角就可以融合成一个bev空间。这个模块称之为bev_backbone,输出的大小是2*bs*5*256*200*80
-        4、时序融合模块algin_module:bev_backbone的输出是5帧，通过自车的相对位姿将特征图对齐warp/插值方式，对齐方式如下：
-            第一帧：第一帧F1,输出维度是bs*256*200*80
-            第二帧：第一帧对齐到第二帧，conv(cat(algin(F1),F2)) = algin_F2,输出维度是bs*256*200*80
-            第三帧：将对齐后的第二帧对齐在第三帧，conv(cat(algin(algin_F2),F3)) = algin_F3,输出维度是bs*256*200*80
-            第四帧：将对齐后的第三帧对齐到第四帧，conv(cat(algin(algin_F3),F4)) = algin_F4,输出维度是bs*256*200*80
-            第五帧：将对齐后的第四帧对齐到第五帧，conv(cat(algin(algin_F4),F5)) = algin_F5,输出维度是bs*256*200*80
-            algin_F1_5 = cat(F1,algin_F2,algin_F3,algin_F4,algin_F5)
-            这样就的得到了时序对齐的特征algin_F1_5 ,输出维度是2*bs*5*256*200*80，与上一帧对齐，最久可以对齐历史五帧（记忆历史五帧的信息）
-        5、split_module:该模块将两种数据分开，分别为dynamic_input=bs*5*256*200*80，static_input=bs*5*256*200*80
+            整体思路----数据不同源版本，并且分段训练：
+                1、时序图像作为输入（2*bs*5*8*3*128*384）,其中5表示时序五帧，8表示环视相机一共有8个，2表示两种数据:只标注目标相关的动态数据和只标注了车道线相关的金泰数据,3*128*384是输入图像的尺寸
+                2、输入图像经过自定义的纯2d卷积网络，下采样四倍，输出的通道数是256，卷积网络输出的大小为2*bs*5*8*256*32*96,我称这个模型是image_backbone模块
+                3、image_backbone的输出经过内外参的转换将其投影到3d的bev空间，具体方法为：在自车坐标系初始化一个200米*80米*6米(xyz)的3d空间,然后通过内外参将其转到像素坐标coor，然后根据coor的索引将image_backbone的像素特征对齐到3d空间,多视角就可以融合成一个bev空间。这个模块称之为bev_backbone,输出的大小是2*bs*5*256*200*80
+                4、时序融合模块algin_module:bev_backbone的输出是5帧，通过自车的相对位姿将特征图对齐warp/插值方式，对齐方式如下：
+                    第一帧：第一帧F1,输出维度是bs*256*200*80
+                    第二帧：第一帧对齐到第二帧，conv(cat(algin(F1),F2)) = algin_F2,输出维度是bs*256*200*80
+                    第三帧：将对齐后的第二帧对齐在第三帧，conv(cat(algin(algin_F2),F3)) = algin_F3,输出维度是bs*256*200*80
+                    第四帧：将对齐后的第三帧对齐到第四帧，conv(cat(algin(algin_F3),F4)) = algin_F4,输出维度是bs*256*200*80
+                    第五帧：将对齐后的第四帧对齐到第五帧，conv(cat(algin(algin_F4),F5)) = algin_F5,输出维度是bs*256*200*80
+                    algin_F1_5 = cat(F1,algin_F2,algin_F3,algin_F4,algin_F5)
+                    这样就的得到了时序对齐的特征algin_F1_5 ,输出维度是2*bs*5*256*200*80，与上一帧对齐，最久可以对齐历史五帧（记忆历史五帧的信息）
+                5、split_module:该模块将两种数据分开，分别为dynamic_input=bs*5*256*200*80，static_input=bs*5*256*200*80
 
-        世界模型分支
-            6、在algin_module模块的输出后接入decoder，输入上一帧，输出当前帧的bev然后和当前帧的bev计算相似度从而达到重建bev的效果。
+                世界模型分支
+                    6、在algin_module模块的输出后接入decoder，输入上一帧，输出当前帧的bev然后和当前帧的bev计算相似度从而达到重建bev的效果。
 
-        动态分支：
-            7、det_head目标检测输出头:algin_module的输出dynamic_input后接入sparse4d的输出头，将在bev上获取检测的instance（bs，5*900*256）和anchor(bs*5*900*11),900指的是最大目标数量900，256是instance的特征维度，11是anchor的预测值包括：x,y,z,w,h,l,vx,vy,vz,yaw,id
-            8、动态目标轨迹预测头(obj_traj_head)：（融合历史五帧信息出当前一帧的轨迹）将algin_module输出的第五帧帧和检测第五帧的instance，以及历史历史5帧的轨迹（bs*900*10）作为动态目标迹预测头的输入，最后预测出当前帧(第五帧)周围目标5秒的轨迹（bs*900*100）和对应的insance（bs*900*256），其中100是50*2，2是xy两个分量，50是未来50帧
+                动态分支：
+                    7、det_head目标检测输出头:algin_module的输出dynamic_input后接入sparse4d的输出头，将在bev上获取检测的instance（bs，5*900*256）和anchor(bs*5*900*11),900指的是最大目标数量900，256是instance的特征维度，11是anchor的预测值包括：x,y,z,w,h,l,vx,vy,vz,yaw,id
+                    8、动态目标轨迹预测头(obj_traj_head)：（融合历史五帧信息出当前一帧的轨迹）将algin_module输出的第五帧帧和检测第五帧的instance，以及历史历史5帧的轨迹（bs*900*10）作为动态目标迹预测头的输入，最后预测出当前帧(第五帧)周围目标5秒的轨迹（bs*900*100）和对应的insance（bs*900*256），其中100是50*2，2是xy两个分量，50是未来50帧
 
-        静态分支
-            9、map_head地图检测头:algin_module输出对齐后的bev特征static_input后接入maptr的输出头，将在bev上获取map的instance（bs*5*200*256）和anchor(bs*5*200*3),200指的是最大地图instance为200个，3是(x,y和类别)
-            10、自车未来行驶的拓扑轨迹头-ego_static_head:将maphead的instance和algin_module的最后一帧特征拿出来，输入到ego_static_head中，输出以自车为起点到bev边缘的行驶轨迹(bs*1*20*2)以及对应的instance(bs*1*256),20*2是从自车为起点，等步长走到bev的边缘
-        
-        端到端分支 ： 上面分支训练收敛后才能启动该阶段的训练
-            11、端到端轨迹头e2ehead:将algin_module的bevfeature(bs*256*200*80)、det的instance(bs*900*256)和动态目标轨迹的instance(bs*900*256)、map的instance(bs*200*256)以及自车未来拓扑轨迹的instance(bs*1*256)的最后一帧取出来作，输入到轨迹头中，即希望输出的端到端轨迹中有5帧的信息融合，输出形状是bs*100。其中bevfeature是bev的场景描述，det的instance和动态目标轨迹的instance是动态场景的理解，map的instance和自车拓扑轨迹是静态场景理解。经过上述的所有场景的融合形成了最终的端到端轨迹
-
-
+                静态分支
+                    9、map_head地图检测头:algin_module输出对齐后的bev特征static_input后接入maptr的输出头，将在bev上获取map的instance（bs*5*200*256）和anchor(bs*5*200*3),200指的是最大地图instance为200个，3是(x,y和类别)
+                    10、自车未来行驶的拓扑轨迹头-ego_static_head:将maphead的instance和algin_module的最后一帧特征拿出来，输入到ego_static_head中，输出以自车为起点到bev边缘的行驶轨迹(bs*1*20*2)以及对应的instance(bs*1*256),20*2是从自车为起点，等步长走到bev的边缘
+                
+                端到端分支 ： 上面分支训练收敛后才能启动该阶段的训练
+                    11、端到端轨迹头e2ehead:将algin_module的bevfeature(bs*256*200*80)、det的instance(bs*900*256)和动态目标轨迹的instance(bs*900*256)、map的instance(bs*200*256)以及自车未来拓扑轨迹的instance(bs*1*256)的最后一帧取出来作，输入到轨迹头中，即希望输出的端到端轨迹中有5帧的信息融合，输出形状是bs*100。其中bevfeature是bev的场景描述，det的instance和动态目标轨迹的instance是动态场景的理解，map的instance和自车拓扑轨迹是静态场景理解。经过上述的所有场景的融合形成了最终的端到端轨迹
 
 
+
+由于数据不同源，所以训练逻辑如下：
+    1、假设在dynamic数据上，可以先训练3d+目标轨迹，再训练端到端轨迹
+    2、假设在static数据上，可以选训练map+静态轨迹，再训练端到端轨迹
+    3、假设既要3d表征和map表征以及目标轨迹和静态轨迹，分阶段训练：
+        3.1、先训练3d表征和目标轨迹
+        3.2、再训练map表征和静态轨迹
+        3.3、将上述输入到端到端，最后训练端到端轨迹
+    4、假设想要端到端的训练(图像输入，轨迹输出)，那么就是同源数据，直接训练即可
 '''
 
 
@@ -2043,6 +2029,113 @@ import torchvision
 import torch
 import random
 
+# configs = {
+#     # 总的参数
+#     "grid_conf" : {
+#         'xbound': [-80.0, 120.0, 1],
+#         'ybound': [-40.0, 40.0, 1],
+#         'zbound': [-2.0, 4.0, 1.0]
+#     },
+
+#     "clip_paths":{
+#         "dynamic":["/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/det.txt"],
+#         "static":["/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/map.txt"],
+#         "dynamic_static":["/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/dynamic_static.txt"],
+#         "e2e":["/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/e2e.txt"],
+#     },
+#     "camera_infos":{
+#         "FrontCam02":{
+#             "resize_lim": [(0.1, 0.1),  (0.17,0.23), (0.35, 0.45)],
+#             "bot_pct_lim":[(0.15, 0.25),(0.27, 0.37),(0.37,0.47)]
+#         },     #前 大
+#         "RearCam01":     {"resize_lim":[(0.2, 0.3)],"bot_pct_lim":[(0.2, 0.5)]},      #后方
+#         "SideFrontCam01":{"resize_lim":[(0.2, 0.3)],"bot_pct_lim":[(0.2, 0.5)]}, #左前
+#         "SideFrontCam02":{"resize_lim":[(0.2, 0.3)],"bot_pct_lim":[(0.2, 0.5)]}, #右前
+#         "SideRearCam01": {"resize_lim":[(0.2, 0.3)],"bot_pct_lim":[(0.2, 0.5)]},  #左后
+#         "SideRearCam02": {"resize_lim":[(0.2, 0.3)],"bot_pct_lim":[(0.2, 0.5)]}   #右后
+#     },
+#     'rot_lim': (-0.0, 0.0),
+#     "flip":False,
+
+#     'final_dim': (128, 384),
+
+#     "mode":"dynamic",
+
+
+#     "train_clips":2, # -1 所有，[]指定几个，xxx.txt写进txt中指定的，>0前N个
+    
+#     "total_len":20+1+50, # 一共71帧，当前帧是第21帧，往前20帧，往后50帧 ，最后一帧索引对应着70 ，未来50帧为了获取真值
+#     "current_frame_index":20,# 0 1 2 3 4 5 ... [20] 21 22 23 ... 70
+    
+
+
+#     "task_flag":{
+#         "det2D":False,
+#         "det3D":True,
+
+#         "map2D":False,
+#         "map3D":False,
+
+#         "obj_dynamic_traj":False,
+#         "e2e_static_traj":False,
+#         "e2e_dynamic_traj":False,
+#     },
+#     "task_class_names":{
+#         "dynamic":["det3D","obj_dynamic_traj","det2D","e2e_dynamic_traj"], 
+#         "static":["map3D","map2D","e2e_static_traj","e2e_dynamic_traj"],
+#         "dynamic_static":[
+#             "det3D","obj_dynamic_traj","det2D",
+#             "map3D","map2D","e2e_static_traj",
+#             "e2e_dynamic_traj"
+#             ],
+#         "e2e":[
+#             "e2e_static_traj",
+#             "e2e_dynamic_traj"
+#             ],
+#     },
+#     "task_indexs":{ # 在每次getitem时，随机取值
+#         # 在dyo的label上取值
+#         "det2D":[0,20], # 起始帧和结束帧                #输入N帧输出N帧
+#         "det3D":  [0,20], # 起始帧和结束帧              #输入N帧输出N帧
+#         "obj_dynamic_traj": [0,20], # 起始帧和结束帧    #输入N帧，预测最后一帧的轨迹
+#         # 在lane的label上取值
+#         "map2D":[0,20], # 起始帧和结束帧                #输入N帧输出N帧
+#         "map3D":  [0,20], # 起始帧和结束帧              #输入N帧输出N帧
+
+#         # 在自车位姿上取值
+#         "e2e_dynamic_traj": [0,20], # 起始帧和结束帧    #输入N帧，预测最后一帧的轨迹
+#         "e2e_static_traj":  [0,20], # 起始帧和结束帧    #输入N帧，预测最后一帧的轨迹
+#     },
+#     "seq_len":5, 
+#     # 预测任务的参数
+#     "his_lens":{ # 历史长度 ,对于预测任务来说，需要输入历史真值才能预测未来真值，所以上述task_indexs需要减去历史长度
+#         "obj_dynamic_traj":5, # seq_len 必须大于等于 his_lens 否则无法制作真值
+#         "e2e_dynamic_traj":5,
+#     },
+#     "fur_lens":{ # 未来长度
+#         "obj_dynamic_traj": 50,
+#         "e2e_dynamic_traj": 50,
+#     }, # his_lens , fur_lens 即输入历史真值预测未来轨迹
+#     "frequency":{ # 频率 10Hz
+#         "obj_dynamic_traj": 10, # 真值插值成10Hz,即5秒内真值为50个点
+#         "e2e_dynamic_traj": 10, # 真值插值成10Hz,即5秒内真值为50个点
+#     },
+
+
+
+
+
+#     "camera_names":[
+#         "FrontCam02",     #前 
+#         "RearCam01",      #后方
+#         "SideFrontCam01", #左前
+#         "SideFrontCam02", #右前
+#         "SideRearCam01",  #左后
+#         "SideRearCam02"   #右后
+#     ],
+#     # 3D 检测类别：与 convert_det 输出的 object_infos[].sub_category 对应，用于映射到类别下标
+#     "det_class_names": ["car", "truck", "bus", "pedestrian", "bicycle", "motorcycle", "traffic_cone", "barrier"],
+# }
 
 
 
@@ -2172,27 +2265,11 @@ class Dataset(torch.utils.data.Dataset):
         self.frequency = config["frequency"]
         # self.useful_indexs,self.group_indexs = self.get_input_indexs()
 
-        self.stride = self.total_len - (self.seq_len - 1)
-
-        
-
-
         # 数据准备
         self.get_all_paths()
         self.prepro()
         self.sces_len = [(len(self.ixes[i]) - self.total_len ) for i in self.ixes.keys()]
         self.scenes = [i for i in self.ixes.keys()]
-
-        self.samples = []
-        for clip_name in self.scenes :
-            data = self.ixes[clip_name]
-            start = 0
-            while start < len(data):
-                end = start + self.stride + (self.seq_len - 1)
-                if end > len(data):
-                    end = len(data)
-                self.samples.append([clip_name,end - self.total_len ,end])
-                start += self.stride
 
         # 检测配置
         self.det_class_names = config["det_class_names"]
@@ -2236,7 +2313,149 @@ class Dataset(torch.utils.data.Dataset):
         return resize,resize_dims,crop,rotate
 
     
+    # def get_cam_pos_embedding(self, post_trans, post_rots, L, aug_params, public_infos):
+    #     ogfH, ogfW = self.final_dim
+    #     fH, fW = ogfH // self.ds, ogfW // self.ds
+    #     rays = self.rays
+
+    #     N, _ = post_trans.shape
+    #     points = rays - post_trans.view(N, 1, 1, 1, 3)  # (25, 32, 128, 3)
+    #     points = torch.inverse(post_rots).view(N, 1, 1, 1, 3, 3).matmul(points.unsqueeze(-1))
+    #     points = points.squeeze().view(N // 6, 6, 32, 96, 3).numpy()
+
+    #     seq_len = N // 6
+    #     cam_pos = {}
+    #     for key in public_infos.keys():
+    #         public_info = public_infos[key]
+    #         NewCameraMatrix = public_info["NewCameraMatrix"]
+    #         lidar2cam_param = public_info["lidar2cam_param"]
+    #         intrin = np.array(lidar2cam_param['cameraMatrix'])
+    #         distort = np.array(lidar2cam_param['distortion_coeffs'])
+    #         CAM = key_list[key]
+
+    #         if CAM == "front":  # 前
+    #             pointsx = points[:, 0:3, :, :, 0].reshape(-1)
+    #             pointsy = points[:, 0:3, :, :, 1].reshape(-1)
+    #             V = np.c_[pointsx, pointsy]
+    #             points_new = cv2.undistortPoints(V, intrin, distort, None, NewCameraMatrix).reshape(-1, 2)
+    #             ds = np.ones((points_new.shape[0], 1)).astype(np.float32)
+    #             points1 = np.c_[points_new, ds].astype(np.float32)
+    #             points1 = torch.tensor(points1).view(seq_len * 3, 32, 96, 3).unsqueeze(1).unsqueeze(-1)
+    #             NewCameraMatrix = torch.tensor(NewCameraMatrix).expand(seq_len * 3, 3, 3)
+    #             points1 = torch.inverse(NewCameraMatrix).view(seq_len * 3, 1, 1, 1, 3, 3).matmul(points1).squeeze(
+    #                 -1)  # torch.Size([10, 1, 32, 128, 3])
+    #             cam_pos[CAM] = self.positional_encoding(points1[..., :2], L).view(seq_len, 3, fH, fW, -1).permute(0, 1,
+    #                                                                                                               4, 2,
+    #                                                                                                               3)
+    #         elif CAM == "back":  # 后
+    #             pointsx = points[:, 3, :, :, 0].reshape(-1)
+    #             pointsy = points[:, 3, :, :, 1].reshape(-1)
+    #             V = np.c_[pointsx, pointsy]
+    #             points_new = cv2.undistortPoints(V, intrin, distort, None, NewCameraMatrix).reshape(-1, 2)
+    #             ds = np.ones((points_new.shape[0], 1)).astype(np.float32)
+    #             points1 = np.c_[points_new, ds].astype(np.float32)
+    #             points1 = torch.tensor(points1).view(seq_len, 32, 96, 3).unsqueeze(1).unsqueeze(-1)
+
+    #             NewCameraMatrix = torch.tensor(NewCameraMatrix).expand(seq_len, 3, 3)
+    #             points1 = torch.inverse(NewCameraMatrix).view(seq_len, 1, 1, 1, 3, 3).matmul(points1).squeeze(-1)
+    #             cam_pos[CAM] = self.positional_encoding(points1[..., :2], L).view(seq_len, 1, fH, fW, -1).permute(0, 1,
+    #                                                                                                               4, 2,
+    #                                                                                                               3)
+    #         elif CAM == "left":  # 左
+    #             whole_img_size = (1920, 1536)
+    #             D = np.array([distort[0], distort[1], distort[4], distort[5]]).astype(np.float32)
+    #             NewCameraMatrix = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(intrin, D, whole_img_size,
+    #                                                                                      None, balance=1)
+    #             pointsx = points[:, 4, :, :, 0].reshape(-1)
+    #             pointsy = points[:, 4, :, :, 1].reshape(-1)
+    #             V = np.c_[pointsx, pointsy]
+    #             V = V[:, np.newaxis, :]
+    #             points_new = cv2.fisheye.undistortPoints(V, intrin, D, P=NewCameraMatrix).reshape(-1, 2)
+    #             ds = np.ones((points_new.shape[0], 1)).astype(np.float32)
+    #             points1 = np.c_[points_new, ds].astype(np.float32)
+    #             points1 = torch.tensor(points1).view(seq_len, 32, 96, 3).unsqueeze(1).unsqueeze(-1)
+
+    #             NewCameraMatrix = torch.tensor(NewCameraMatrix).expand(seq_len, 3, 3)
+    #             points1 = torch.inverse(NewCameraMatrix).view(seq_len, 1, 1, 1, 3, 3).matmul(points1).squeeze(-1)
+    #             cam_pos[CAM] = self.positional_encoding(points1[..., :2], L).view(seq_len, 1, fH, fW, -1).permute(0, 1,
+    #                                                                                                               4, 2,
+    #                                                                                                               3)
+    #         elif CAM == "right":  # 右
+    #             whole_img_size = (1920, 1536)
+    #             D = np.array([distort[0], distort[1], distort[4], distort[5]]).astype(np.float32)
+    #             NewCameraMatrix = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(intrin, D, whole_img_size,
+    #                                                                                      None, balance=1)
+    #             pointsx = points[:, 5, :, :, 0].reshape(-1)
+    #             pointsy = points[:, 5, :, :, 1].reshape(-1)
+    #             V = np.c_[pointsx, pointsy]
+    #             V = V[:, np.newaxis, :]
+    #             points_new = cv2.fisheye.undistortPoints(V, intrin, D, P=NewCameraMatrix).reshape(-1, 2)
+    #             ds = np.ones((points_new.shape[0], 1)).astype(np.float32)
+    #             points1 = np.c_[points_new, ds].astype(np.float32)
+    #             points1 = torch.tensor(points1).view(seq_len, 32, 96, 3).unsqueeze(1).unsqueeze(-1)
+
+    #             NewCameraMatrix = torch.tensor(NewCameraMatrix).expand(seq_len, 3, 3)
+    #             points1 = torch.inverse(NewCameraMatrix).view(seq_len, 1, 1, 1, 3, 3).matmul(points1).squeeze(-1)
+    #             cam_pos[CAM] = self.positional_encoding(points1[..., :2], L).view(seq_len, 1, fH, fW, -1).permute(0, 1,
+    #                                                                                                               4, 2,
+    #                                                                                                               3)
+    #         # 最好再把原始的x,y也保留并concat起来
+    #     cam_pos_embedding = torch.cat([cam_pos['front'], cam_pos['back'], cam_pos['left'], cam_pos['right']],
+    #                                   dim=1).view(seq_len * 6, 16, 32, 96)
+    #     return cam_pos_embedding
     
+    # def gen_camera_pos_encoding(self, post_img, post_rot, post_tran, intrin, distort, L=4):
+    #     """
+    #     根据增强后的相机参数生成每张图的相机位置编码（camera position embedding）。
+
+    #     参数:
+    #         post_img: (N, 3, H, W) 增强后的图像，只用 N/H/W
+    #         post_rot: (N, 3, 3) 相机到 ego 的旋转矩阵 R
+    #         post_tran: (N, 3)   相机在 ego 坐标下的位置 t（目前不显式用到）
+    #         intrin: (N, 3, 3)   增强后的相机内参
+    #         distort: (N, 8)     畸变参数（当前实现未显式使用）
+    #         L:                  位置编码的频率参数，与你现有 self.positional_encoding 一致
+
+    #     返回:
+    #         cam_pos_embed: (N, C, fH, fW)，C 由 self.positional_encoding 决定，
+    #         fH,fW = final_dim // ds
+    #     """
+    #     import torch
+
+    #     device = post_img.device
+    #     N, _, H, W = post_img.shape
+    #     ogfH, ogfW = self.final_dim        # 例如 (128, 384)
+    #     fH, fW = ogfH // self.ds, ogfW // self.ds   # 例如 (32, 96)
+
+    #     # 特征图网格 (fH, fW)，用增强后图像的分辨率做缩放
+    #     ys = torch.linspace(0.5, H - 0.5, fH, device=device)
+    #     xs = torch.linspace(0.5, W - 0.5, fW, device=device)
+    #     grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")   # (fH, fW)
+
+    #     ones = torch.ones_like(grid_x)
+    #     pix = torch.stack([grid_x, grid_y, ones], dim=-1)        # (fH, fW, 3)
+    #     pix = pix.view(1, fH, fW, 3).repeat(N, 1, 1, 1)          # (N, fH, fW, 3)
+    #     pix_h = pix.view(N, -1, 3).unsqueeze(-1)                 # (N, fH*fW, 3, 1)
+
+    #     # 像素 -> 相机归一化坐标（深度设为 1）
+    #     intrin_inv = torch.inverse(intrin)                       # (N, 3, 3)
+    #     cam_dirs = intrin_inv.view(N, 1, 3, 3).matmul(pix_h).squeeze(-1)  # (N, fH*fW, 3)
+    #     cam_dirs = cam_dirs / (cam_dirs.norm(dim=-1, keepdim=True) + 1e-6)
+
+    #     # 相机系 -> ego 系（方向向量）
+    #     ego_dirs = post_rot.view(N, 1, 3, 3).matmul(
+    #         cam_dirs.unsqueeze(-1)
+    #     ).squeeze(-1)                                            # (N, fH*fW, 3)
+
+    #     # 取前两维 (dx, dy) 作为位置编码输入
+    #     dirs_xy = ego_dirs[..., :2].view(N, fH, fW, 2)           # (N, fH, fW, 2)
+
+    #     # 调用已有的 positional_encoding，保持与 get_cam_pos_embedding 风格一致
+    #     cam_pos_embed = self.positional_encoding(dirs_xy, L)     # (N, fH, fW, C)
+    #     cam_pos_embed = cam_pos_embed.permute(0, 3, 1, 2).contiguous()  # (N, C, fH, fW)
+
+    #     return cam_pos_embed
+
 
     def get_image_data(self,recs):
         "输出增强后的图片(裁剪/旋转)，以及增强的参数，相关的内外惨"
@@ -2367,10 +2586,13 @@ class Dataset(torch.utils.data.Dataset):
         il = self.det_gt_names
         for label_path in recs:
             obj_traj_path = label_path.replace(".json","_object_trajectory.npy")
+            obj_traj_path_fix = label_path.replace(".json","_object_trajectory2.npy")
+            object_trajectorys_fix = {}
+            object_trajectorys = {}
             if os.path.exists(obj_traj_path):
                 object_trajectorys =  np.load(obj_traj_path, allow_pickle=True).item()
-            else:
-                object_trajectorys = {}
+            if os.path.exists(obj_traj_path_fix):
+                object_trajectorys_fix =  np.load(obj_traj_path_fix, allow_pickle=True).item()
             
             with open(label_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -2378,7 +2600,10 @@ class Dataset(torch.utils.data.Dataset):
             labels_list = []
             bboxes_list = []
             labels_maks_list,bboxes_mask_list = [],[]
-            for track_id, obj in object_infos.items():
+            for track_id, obj in object_infos.items(): # {'x': 17.53896713256836, 'y': 12.292121887207031, 'z': 0.7497396469116211}
+                traj,traj_mask = self.get_anno_obj_dynamic_traj1(track_id, object_trajectorys, object_trajectorys_fix,dt=0.1)
+                # if len(traj) != 110:
+                #     traj,traj_mask = self.get_anno_obj_dynamic_traj1(track_id, object_trajectorys, object_trajectorys_fix,dt=0.1)
                 label_mask,bboxes_mask = 1,[1 for i in range(10)]
                 pos = obj.get("position")
                 rot = obj.get("rotation")
@@ -2406,10 +2631,14 @@ class Dataset(torch.utils.data.Dataset):
                 h = self.gt_value("height",dim,bboxes_mask,5)# float(dim.get("height", 0))
                 yaw = self.gt_value("yaw",rot,bboxes_mask,6)#float(rot.get("yaw", 0.0))
                 vx,vy,vz = self.diff(object_trajectorys,track_id,bboxes_mask,dt=dt,idx=7)
-                bboxes_list.append([x, y, z, w, length, h, yaw, vx,vy,vz])
+                anchor = [x, y, z, w, length, h, yaw, vx,vy,vz] 
+                out = anchor + traj
+                # if len(out) != 120:
+                #     print(len(out))
+                bboxes_list.append(out)
                 labels_list.append(cls_id)
                 labels_maks_list.append(label_mask)
-                bboxes_mask_list.append(bboxes_mask)
+                bboxes_mask_list.append(bboxes_mask + traj_mask )
             if len(labels_list) == 0:
                 gt_labels_per_frame.append(torch.zeros(0, dtype=torch.long))
                 gt_bboxes_per_frame.append(torch.zeros(0, 10, dtype=torch.float32))
@@ -2420,6 +2649,7 @@ class Dataset(torch.utils.data.Dataset):
                 gt_bboxes_per_frame.append(torch.tensor(bboxes_list, dtype=torch.float32))
                 gt_labels_per_frame_mask.append(torch.tensor(labels_maks_list, dtype=torch.long))
                 gt_bboxes_per_frame_mask.append(torch.tensor(bboxes_mask_list, dtype=torch.float32))
+                    
         # return gt_labels_per_frame, gt_bboxes_per_frame
         return {
             "gt_labels_det3D":gt_labels_per_frame,
@@ -2427,6 +2657,121 @@ class Dataset(torch.utils.data.Dataset):
             "gt_labels_det3D_mask":gt_labels_per_frame_mask,
             "gt_bboxes_det3D_mask":gt_bboxes_per_frame_mask,
         }
+
+    def merge_traj(self,track_id,object_trajectorys,object_trajectorys_fix):
+        
+        object_trajectory = object_trajectorys.get(track_id,None) # 当前trackid 没有轨迹，可能是没有跟踪到的目标
+        if object_trajectory is None:
+            return -1,None
+        obj_trajectory_in_ego = object_trajectory["obj_trajectory_in_ego"]
+        mask_full = obj_trajectory_in_ego[:, -1]
+        cur_idx_arr = np.where(mask_full == 0)[0]
+        if cur_idx_arr.size == 0:
+            return -1,None # 没有找到当前帧索引的叶返回None
+        cur_idx = int(cur_idx_arr[0])
+        if len(object_trajectorys_fix) == 0:
+            return cur_idx, obj_trajectory_in_ego #不需要合并的直接返回对应的轨迹即可
+        
+        # 开始合并，有一批数据在ego坐标系下，当前帧的位姿都是0，存在问题fix对当前帧进行了修复
+        object_trajectory_fix = object_trajectorys_fix[track_id]
+        obj_trajectory_in_ego_fix = object_trajectory_fix["obj_trajectory_in_ego"]
+        obj_trajectory_in_ego[cur_idx,:3] = obj_trajectory_in_ego_fix[cur_idx,:3]
+        return cur_idx , obj_trajectory_in_ego
+
+    def get_anno_obj_dynamic_traj1(self,track_id, object_trajectorys, object_trajectorys_fix,dt=0.1):
+        """
+        从 object_trajectory_in_ego 中获取目标在自车坐标系下的动态轨迹，并做插值补全：
+        - mask=-1: 该帧目标消失
+        - mask=0: 该帧为“当前帧”
+        - mask=1: 该帧存在目标
+        对于每个轨迹，在第一次出现 1 和最后一次出现 1 之间，将 mask=-1 的位置用线性插值
+        补全 xyz，并将这些位置的 mask 置为 1。
+        然后在当前帧附近截取一个时间窗（默认前 40 帧、后 50 帧），计算速度轨迹。
+        """
+        his_len,fur_len,cur_len = self.his_lens["obj_dynamic_traj"],self.fur_lens["obj_dynamic_traj"] , 1
+        traj_len = (his_len + fur_len + cur_len ) - 1 # 换算成速度需要减去一个
+        traj_out = [0 for i in range(traj_len * 2)]
+        mask_out = [0 for i in range(traj_len*2)]
+        cur_idx , traj_mask = self.merge_traj(track_id, object_trajectorys, object_trajectorys_fix)
+        if traj_mask is None:
+            return traj_out,mask_out
+        
+        # 得到了当前帧索引和轨迹，按照配置文件获取对应历史和未来轨迹，并差分转成轨迹
+        coords_full = traj_mask[:, :3].astype(np.float32)  # (T, 3)
+        mask_full = traj_mask[:, -1].astype(np.float32)    # (T,)
+        T = coords_full.shape[0]
+        real_start_idx = cur_idx - his_len
+        real_end_idx = cur_idx + fur_len
+        start_idx = max(0, real_start_idx)
+        end_idx = min(T - 1, real_end_idx)
+        coords = coords_full[start_idx:end_idx + 1].copy()
+        mask = mask_full[start_idx:end_idx + 1].copy()
+        mask[mask==0]=1
+        one_idx = np.where(mask == 1)[0]
+
+        if one_idx.size < 2:
+            return traj_out,mask_out
+            
+        s = int(one_idx[0])
+        e = int(one_idx[-1])
+        x = np.arange(s, e + 1, dtype=np.float32)
+        mask[:s] = 0
+        mask[e+1:] = 0 
+        # 有效点：mask>=0（包括 0 和 1）
+        valid = mask[s:e + 1] >= 0
+        x_valid = x[valid]
+        if x_valid.size >= 2:
+            for d in range(3):
+                y_seg = coords[s:e + 1, d]
+                y_valid = y_seg[valid]
+                # 用相邻有效点对 -1 位置做线性插值
+                y_interp = np.interp(x, x_valid, y_valid)
+                missing = mask[s:e + 1] < 0
+                coords[s:e + 1, d][missing] = y_interp[missing]
+            # 被插值的位置视作存在目标
+            mask[s:e + 1][mask[s:e + 1] < 0] = 1.
+                
+        # 计算速度：一阶差分 / dt，长度为 L-1
+        traj = (coords[1:] - coords[:-1]) / dt # 当前+历史=5帧，未来是50帧
+        
+        mask[s] = 0
+        mask = mask[1:]
+        traj[mask == 0] = 999.
+        traj = traj[:,:2].reshape(-1).tolist()
+        mask = mask.tolist() #和traj_v保持一致
+        mask += mask
+
+        # 还原
+        pos = coords_full[cur_idx,:2][None]
+        traj_n = np.array(traj).reshape(-1,2)
+        
+        fur_traj = np.cumsum(traj_n[his_len:] * dt,0) + pos
+        history_v = traj_n[:his_len]               # 形状 (5, 2)，顺序：v[0]→v[4]
+        history_v_rev = history_v[::-1] # 逆序，现在第1个是 v[4]（从历史最后一点到当前点）
+        history_offset = -np.cumsum(history_v_rev * dt, axis=0)  # 负的累积位移
+        history_coords_rev = pos + history_offset          # 形状 (5, 2)，顺序：coords[4], coords[3], ..., coords[0]
+        # 如需按时间顺序（从早到晚）排列，再反转一次
+        his_traj = history_coords_rev[::-1]  # 形状 (5, 2)，对应 coords[0] 到 coords[4]
+
+        reconstructed = np.vstack([his_traj, pos, fur_traj])
+
+        start_traj = []
+        end_traj = []
+        start_mask = []
+        end_mask = []
+        if real_start_idx < 0:
+            start_traj = [0 for i in range(-1*real_start_idx*2)]
+            start_mask = [0 for i in range(-1*real_start_idx*2)]
+        if real_end_idx > T-1:
+            end_traj = [0 for i in range((real_end_idx - (T-1))*2)]
+            end_mask = [0 for i in range((real_end_idx - (T-1))*2)]
+        traj = start_traj + traj + end_traj
+        mask = start_mask + mask + end_mask
+        return traj,mask
+
+
+
+
 
     def get_anno_map3D(self, recs):
         """
@@ -2616,14 +2961,21 @@ class Dataset(torch.utils.data.Dataset):
         """
 
 
-        label_path = recs[-1]  # 只选择最后一帧作为真值
+        label_path =  recs[self.current_frame_index] # 只选择最后一帧作为真值
         obj_traj_path = label_path.replace(".json", "_object_trajectory.npy")
+        obj_traj_path_fix = label_path.replace(".json", "_object_trajectory2.npy")
+        
+            
         if os.path.exists(obj_traj_path):
             object_trajectorys = np.load(obj_traj_path, allow_pickle=True).item()
+            if os.path.exists(obj_traj_path_fix):
+                object_trajectorys_fix = np.load(obj_traj_path_fix, allow_pickle=True).item()
+            else:
+                object_trajectorys_fix = None
         else:
             object_trajectorys = {}
 
-        trackids = []
+        # trackids = []
         obj_trajs = []
         masks = []
 
@@ -2637,6 +2989,8 @@ class Dataset(torch.utils.data.Dataset):
             if cur_idx_arr.size == 0:
                 continue
             cur_idx = int(cur_idx_arr[0])
+            if object_trajectorys_fix is not None:
+                coords_full[cur_idx,:] = object_trajectorys_fix[trackid]["obj_trajectory_in_ego"][cur_idx,:3].astype(np.float32)
 
             T = coords_full.shape[0]
             start_idx = max(0, cur_idx - self.his_lens["obj_dynamic_traj"])
@@ -2669,7 +3023,7 @@ class Dataset(torch.utils.data.Dataset):
             traj_v = (coords[1:] - coords[:-1]) / dt # 当前+历史=5帧，未来是50帧
             mask[s] = -1.
             mask = mask[1:] #和traj_v保持一致
-            trackids.append(trackid)
+            # trackids.append(trackid)
             obj_trajs.append(traj_v)
             masks.append(mask.tolist())
 
@@ -2686,15 +3040,15 @@ class Dataset(torch.utils.data.Dataset):
 
 
         return {
-            "dynamic_trackids": trackids,
+            # "dynamic_trackids": trackids,
             "dynamic_trajs": obj_trajs,
             "dynamic_traj_masks": masks,
         }
 
     def get_Hz_by_filename_from_json(self, paths):
-        filename1 = paths[0].strip(os.sep).split(os.sep)[-1].replace(".json","").replace("_LidarFusion.json", "").replace("_MainLidar01.json","")
-        filename2 = paths[1].strip(os.sep).split(os.sep)[-1].replace(".json","").replace("_LidarFusion.json", "").replace("_MainLidar01.json","")
-        dt = abs(int(filename1.split(".")[-1][:3]) - int(filename2.split(".")[-1][:3]) / 1000) # 秒为单位
+        filename1 = paths[0].strip(os.sep).split(os.sep)[-1].replace("_LidarFusion.json", "").replace("_MainLidar01.json","")
+        filename2 = paths[1].strip(os.sep).split(os.sep)[-1].replace("_LidarFusion.json", "").replace("_MainLidar01.json","")
+        dt = abs(int(filename1.split(".")[-1][:3]) - int(filename2.split(".")[-1][:3]) )/ 1000 # 秒为单位
         # Hz = 1 / dt # Hz为单位
         return dt
 
@@ -2793,14 +3147,15 @@ class Dataset(torch.utils.data.Dataset):
             T_ego2wld_cur = TransformationmatrixEgo(ego_pose["orientation"],ego_pose["position"])
             ego_poses.append(T_ego2wld_cur)
         return np.array(ego_poses)
-
+        
     def get_algin_theta_mat(self,recs):
         theta_mats = []
-        for i ,rec in enumerate(recs[:5]):
+        for i ,rec in enumerate(recs):
             label = json.load(open(rec,"r"))
             ego_pose = label["ego_pose"]
             T_ego2wld_cur = TransformationmatrixEgo(ego_pose["orientation"],ego_pose["position"])
             if i == 0:
+                
                 theta_mat = np.array([
                     [1.,0.,0.],
                     [0.,1.,0.]
@@ -2828,58 +3183,6 @@ class Dataset(torch.utils.data.Dataset):
                 theta_mat = (pre_mat@(rel_pose@post_mat))[:2,:]
             T_ego2wld_pre = T_ego2wld_cur
             theta_mats.append(theta_mat)
-
-        Ts = []
-        
-        for i ,rec in enumerate(recs[:5]):
-            label = json.load(open(rec,"r"))
-            ego_pose = label["ego_pose"]
-            T_ego2wld_cur = TransformationmatrixEgo(ego_pose["orientation"],ego_pose["position"])
-            Ts.append(T_ego2wld_cur)
-
-        theta_mats1 = []
-        for i ,rec in enumerate(recs[:5]):
-            T_ego2wld_pre = Ts[i]
-            T_ego2wld_cur = Ts[4]
-            
-            sx = self.bevh / 2
-            sy = self.bevw / 2
-            pose_diff = np.linalg.inv(T_ego2wld_pre)@T_ego2wld_cur
-            yaw = np.arctan2(pose_diff[1,0], pose_diff[0,0])
-            dx = pose_diff[0, 3]
-            dy = pose_diff[1, 3]
-            cos = np.cos(yaw)
-            sin = np.sin(yaw)
-            eye = np.zeros((3,3),dtype=np.float32)
-            rel_pose = eye.copy()
-            rel_pose[2,2]=1
-            rel_pose[0,0],rel_pose[0,1],rel_pose[0,2] = cos,-sin,dx
-            rel_pose[1,0],rel_pose[1,1],rel_pose[1,2] = sin,cos,dy
-            pre_mat = np.array([[0., 1./sy, 0.], # 车头往下
-                                [1./sx, 0., -1/5],
-                                [0., 0., 1.]])
-            post_mat = np.array([[0., sx, sx/5],
-                                [sy, 0., 0.],
-                                [0., 0., 1.]])
-            theta_mat = (pre_mat@(rel_pose@post_mat))[:2,:]
-            theta_mats1.append(theta_mat)
-        
-        theta_mat =  np.array([
-                    [1.,0.,0.],
-                    [0.,1.,0.],
-                    [0.,0.,1.]
-                ])
-        theta_mats2 = []
-        for i in range(5):
-            if i == 0:
-                theta_mat_pre = np.eye(3,dtype=np.float32)
-            else:
-                
-                theta_mat_i = np.eye(3,dtype=np.float32)
-                theta_mat_i[:2] =  theta_mats[i]
-                theta_mat_pre =  np.linalg.inv(theta_mat_pre)@theta_mat_i
-            theta_mats2.append(theta_mat_pre)
-         
         return np.array(theta_mats)
 
     def gt_value(self,m,src,mask,idx):
@@ -2946,32 +3249,27 @@ class Dataset(torch.utils.data.Dataset):
 
     def get_input_indexs(self):
         image_indexs = [i for i in range(self.current_frame_index+1)]
-        gt_indexs = image_indexs[self.seq_len-1:]
+        gt_indexs = image_indexs# image_indexs[self.seq_len-1:]
         return image_indexs,gt_indexs
         
 
 
     def __getitem__(self, index):
-        # sces_len = self.sces_len
-        # scenes = self.scenes
-        # sce_id = [i for i in range(len(sces_len)) if (sum(sces_len[:i]) <= index and sum(sces_len[:i + 1]) > index)][0]
-        # clip_name = scenes[sce_id]
-        # sce_id_ind = index - sum(sces_len[:sce_id])
-
-        
-
-        # rec = self.ixes[clip_name][sce_id_ind:sce_id_ind + self.total_len]
-
-        clip_name,start_idx,end_idx = self.samples[index]
-        rec =  self.ixes[clip_name][start_idx:end_idx]
-
+        sces_len = self.sces_len
+        scenes = self.scenes
+        sce_id = [i for i in range(len(sces_len)) if (sum(sces_len[:i]) <= index and sum(sces_len[:i + 1]) > index)][0]
+        clip_name = scenes[sce_id]
+        sce_id_ind = index - sum(sces_len[:sce_id])
+        rec = self.ixes[clip_name][sce_id_ind:sce_id_ind + self.total_len]
         dt = self.get_Hz_by_filename_from_json(rec)
         mode = self.dynamic_static_data(clip_name) # 判断那种数据类型，是否指标了动态数据，还是只标了静态数据，还是两者都标注了
         image_indexs,gt_indexs= self.get_input_indexs()  # 16 17 18 19 20
         #数据增强部分
-        image_recs = [rec[i] for i in image_indexs]
-        
-        imgs, rots, trans, intrins, distorts, post_rots, post_trans,intervals,timestamps = self.get_image_data(image_recs)
+        recs = [rec[i] for i in image_indexs]
+        label_paths = {
+            "label_path":recs
+        }
+        imgs, rots, trans, intrins, distorts, post_rots, post_trans,intervals,timestamps = self.get_image_data(recs)
         images_parma = {
             "x": imgs,                  # 14 8 3 128 384 # 最后在batch上拼接 # bs * T * 8 * 3 * 128 * 384
             "rots": rots,               # 14 8 3 3        
@@ -2985,19 +3283,15 @@ class Dataset(torch.utils.data.Dataset):
         }
 
         #时序对其部分
-        ego_pose = self.get_ego_pose(image_recs)
-        ego_pose_matrixs = {
-            "ego_pose": torch.Tensor(ego_pose)
+        # theta_mats = self.get_algin_theta_mat(recs)
+        ego_poses = self.get_ego_pose(recs)
+        algin_matrixs = {
+            "ego_poses": torch.Tensor(ego_poses)
         }
 
-        gt_recs = [rec[i] for i in gt_indexs]
-
-        label_paths = {
-            "label_path":gt_recs
-        }
 
         anno_infos = {}
-        
+        gt_recs = [rec[i] for i in gt_indexs]
 
         # 有哪些任务收集哪些真值
         if mode == "dynamic" or mode == "dynamic_static":
@@ -3005,8 +3299,8 @@ class Dataset(torch.utils.data.Dataset):
                 anno_infos.update(self.get_anno_det2D(gt_recs))
             if self.task_flags["det3D"]:
                 anno_infos.update(self.get_anno_det3D(gt_recs,dt=dt))
-            # if self.task_flags["obj_dynamic_traj"]:
-            #     anno_infos.update(self.get_anno_obj_dynamic_traj(gt_recs,dt=dt))
+            if self.task_flags["obj_dynamic_traj"]:
+                anno_infos.update(self.get_anno_obj_dynamic_traj(gt_recs,dt=dt))
 
         if mode == "static" or mode == "dynamic_static":
             if self.task_flags["map2D"]:
@@ -3026,7 +3320,7 @@ class Dataset(torch.utils.data.Dataset):
 
         out = {}
         out.update(images_parma)
-        out.update(ego_pose_matrixs)
+        out.update(algin_matrixs)
         out.update(anno_infos)
         out.update(label_paths)
 
@@ -3034,7 +3328,7 @@ class Dataset(torch.utils.data.Dataset):
 
 
     def __len__(self):
-        return len(self.samples)
+        return sum([(len(self.ixes[i]) - self.total_len) for i in self.ixes.keys()])
     
     def prepro(self):
         all_clip_names = list(self.clip2path.keys())
@@ -3117,8 +3411,8 @@ def custom_collate(batch):
         if key in ['gt_labels_det3D', 'gt_bboxes_det3D',
                    'gt_labels_det3D_mask', 'gt_bboxes_det3D_mask',
                    'gt_labels_map3D', 'gt_bboxes_map3D', 'gt_pts_map3D',
-                   'gt_obj_dynamic_traj']:
-            out[key] = values  # 保持为 list of samples' original data
+                   'dynamic_trajs','dynamic_traj_masks']:
+            out[key] = values  # 保持为 list of samples' original
             continue
 
         # 处理需要堆叠的 Tensor 或 NumPy 数组
@@ -5676,10 +5970,12 @@ from torch.utils.collect_env import run_and_return_first_line
 from backbone.image_backbone import ImageBackBone,ImageBackboneResNetFPN
 from model_2d.det2d_model import ModelDet2D
 from model_2d.seg2d_model import ModelSeg2D
-from backbone.bev_backbone import BEVBackbone,TemporalFusion
+from backbone.bev_backbone import BEVBackbone
 
 from sparse4d.build_model import build_det3D_head
 from sparse4d.track_head import TrackHead
+
+from trajectory_dynamic.trajectory_predictor import build_dynamic_trajectory_predictor
 
 from maptr.build_model import build_map_head
 
@@ -5696,6 +5992,7 @@ class Model(nn.Module):
         self.grid_conf = config["grid_conf"]
         self.input_size = config["final_dim"]
         self.seq_len = config["seq_len"]
+        self.bn2gn_num_groups = config["bn2gn_num_groups"]
 
         self.image_backbone = ImageBackboneResNetFPN(
             backbone=config.get("backbone", "resnet18"),
@@ -5710,41 +6007,51 @@ class Model(nn.Module):
             channels=img_outchannels,
             grid_conf=self.grid_conf,
             input_size=self.input_size,
-            # num_temporal=1,
+            num_temporal=self.seq_len,
             num_cams=config["num_cams"],
             use_cam_pos_embed=config.get("bev_use_cam_pos_embed", True),
             cam_pos_L=config.get("bev_cam_pos_L", 4),
         )
 
-        self.temporal_algin = TemporalFusion(self.seq_len,img_outchannels,self.grid_conf)
-
-
         config["det_3d_head"]["embed_dims"] = img_outchannels
         config["det_3d_head"]["bev_bounds"] = (self.grid_conf["xbound"], self.grid_conf["ybound"])
         self.det3d_head = build_det3D_head(**config["det_3d_head"])
+
+        config["traj_dynamic"]["obj_num"] = config["det_3d_head"]["num_anchor"]
+        config["traj_dynamic"]["traj_dim"] = (config["his_lens"]["obj_dynamic_traj"] + config["fur_lens"]["obj_dynamic_traj"])*2
+        config["traj_dynamic"]["instance_feat_dim"] = config["det_3d_head"]["embed_dims"]
+        config["traj_dynamic"]["anchor_dim"] = config["det_3d_head"]["anchor_dim"]
+        self.dynamic_traj = build_dynamic_trajectory_predictor(**config["traj_dynamic"])
 
         config["track_head"]["feat_dim"] = config["det_3d_head"]["embed_dims"]
         self.track_head = TrackHead(**config["track_head"])
 
         config["map_3d_head"]["bev_feat_dim"] = img_outchannels
         config["map_3d_head"]["grid_conf"] = self.grid_conf 
-        # self.map3d_head = build_map_head(bev_feat_dim=config["map_3d_head"]["bev_feat_dim"],
-        #                                  embed_dims=config["map_3d_head"]["embed_dims"],
-        #                                  num_vec=config["map_3d_head"]["num_vec"],
-        #                                  num_pts_per_vec=config["map_3d_head"]["num_pts_per_vec"],
-        #                                  num_pts_per_gt_vec=config["map_3d_head"]["num_pts_per_gt_vec"],
-        #                                  num_classes=config["map_3d_head"]["num_pts_per_vec"],
-        #                                  grid_conf = self.grid_conf,
-        #                                  decoder_num_layers=2,
-        #                                  decoder_num_heads=4,
-        #                                  decoder_im2col_step=192,
-        #                                  decoder_feedforward_channels=512,
-        #                                  bbox_coder_max_num=50, )
-
         self.map3d_head = build_map_head(**config["map_3d_head"] )
 
         self.config = config
         self.det3d_loss_weights = config.get("det3d_loss_weights", {})
+
+        self._replace_all_bn_with_gn(target_groups=self.bn2gn_num_groups)
+
+    def _replace_all_bn_with_gn(self, target_groups=32):
+        def _get_groups(c):
+            g = min(target_groups, c)
+            while c % g != 0 and g > 1:
+                g -= 1
+            return g
+        
+        def _replace(module):
+            for name, child in module.named_children():
+                if isinstance(child, nn.BatchNorm2d):
+                    c = child.num_features
+                    gn = nn.GroupNorm(_get_groups(c), c, eps=child.eps, affine=True)
+                    setattr(module, name, gn)
+                else:
+                    _replace(child)
+        
+        _replace(self)
 
     def _get_loss_weight(self, name: str) -> float:
         if not name.startswith("det3d_"):
@@ -5770,16 +6077,12 @@ class Model(nn.Module):
     def forward_map2d(self,x):
         return self.map2d_head(x)
 
-    def forward_bev_backbone(self,x, rots, trans, intrins, distorts, post_rot, pos_tran):
-        bev_feat = self.bev_backbone(x, rots, trans, intrins, distorts, post_rot, pos_tran)
-        return bev_feat
-
-    def forward_Talgin(self,cur_bev,ego_pose,pre_bevs=[]):
-        bev_feat = self.temporal_algin(cur_bev,ego_pose,pre_bevs)
-        return bev_feat
+    def forward_bev_backbone(self,x, rots, trans, intrins, distorts, post_rot, pos_tran, ego_poses,pre_bev=[],prepare_pre_bev = False):
+        bev_feat,cur_bev = self.bev_backbone(x, rots, trans, intrins, distorts, post_rot, pos_tran, ego_poses,pre_bev,prepare_pre_bev = prepare_pre_bev)
+        return bev_feat,cur_bev
     
     def forward_dynamic_branch(self,bev_feat,T_ego_his2curs,metas,decoder=False):
-        out,seq_features,seq_anchors = self.det3d_head(bev_feat,metas)
+        out,instance_features,instance_anchors = self.det3d_head(bev_feat,metas)
         det_loss = self.det3d_head.loss(out,metas)
             
 
@@ -5794,8 +6097,11 @@ class Model(nn.Module):
             result = None
 
 
-        return out,det_loss,result
+        return out,det_loss,result,instance_features,instance_anchors
 
+    def forward_dynamic_trajectory(self,instance_feature,anchor,decode_trajectory=True,data_gt=None,det_out=None):
+        out = self.dynamic_traj(instance_feature,anchor,decode_trajectory=decode_trajectory,data_gt=data_gt,det_out=det_out)
+        return out
 
     def forward_static_branch(self,bev_feat,metas,decoder=False):
         # bev_feat: (B * T, C, H, W)，静态分支希望对整个时间序列 T 帧都计算地图 loss
@@ -5842,7 +6148,7 @@ class Model(nn.Module):
         return map_out
 
 
-    def forward(self, x, rots, trans, intrins, distorts, post_rot, pos_tran, ego_pose, T_ego_his2curs=None, metas=None,decoder=False,task_names=[],pre_features=[],pre_stream=False):
+    def forward(self, x, rots, trans, intrins, distorts, post_rot, pos_tran, ego_poses,pre_bev, T_ego_his2curs=None, metas=None,decoder=False,task_names=[],prepare_pre_bev = False):
         b, m, t, n, c, h, w = x.shape
         # 2, 1, 5, 8, 3, 128, 384
         # from dataset.dataset import denormalize_img
@@ -5851,7 +6157,6 @@ class Model(nn.Module):
         # a = denormalize_img(x[0,0,0,0])
         # opencv_image = cv2.cvtColor(np.array(a), cv2.COLOR_RGB2BGR)
 
-        out = {}
 
         x = rearrange(x, 'b m t n c h w -> (b m t n) c h w')
         rots = rearrange(rots, 'b m t n h w -> (b m) t n h w')          # torch.Size([2, 1, 5, 8, 3, 3])
@@ -5860,46 +6165,55 @@ class Model(nn.Module):
         distorts = rearrange(distorts, 'b m t n h w -> (b m) t n h w')  # torch.Size([2, 1, 5, 8, 1, 8])
         post_rot = rearrange(post_rot, 'b m t n h w -> (b m) t n h w')  # torch.Size([2, 1, 5, 8, 3, 3])
         pos_tran = rearrange(pos_tran, 'b m t n h w -> (b m) t n h w')  # torch.Size([2, 1, 5, 8, 1, 3])
-        if len(ego_pose) > 0:
-            ego_pose = rearrange(ego_pose, 'b m t h w -> (b m) t h w')  # torch.Size([2, 1, 5, 2, 3])
+        ego_poses = rearrange(ego_poses, 'b m t h w -> (b m) t h w')  # torch.Size([2, 1, 5, 2, 3])
         if T_ego_his2curs is None:
             T_ego_his2curs = torch.eye(4, device=x.device).view(1, 1, 4, 4).expand(b, t, 4, 4)
 
+
+        out = {}
         x = self.forward_img_backbone(x)
 
         det2d_out = self.forward_det2d(x)
         map2d_out = self.forward_map2d(x)
-
         out.update({
             "det2d_out": det2d_out,
             "map2d_out": map2d_out,
         })
-        
-        bev_feat = self.forward_bev_backbone(x, rots, trans, intrins, distorts, post_rot, pos_tran)
 
+        bev_feat,cur_bev = self.forward_bev_backbone(x, rots, trans, intrins, distorts, post_rot, pos_tran, ego_poses,pre_bev,prepare_pre_bev = prepare_pre_bev)
         out.update({
-            "bev_feat":bev_feat,
+            "cur_bev":cur_bev,
         })
-
-        if pre_stream:
+        if prepare_pre_bev:
             return out
 
-        bev_feat = self.forward_Talgin(bev_feat,ego_pose,pre_bevs=pre_features)
-
         bev_feat = bev_feat.reshape(b, m, t,*bev_feat.shape[1:])
-
-        
 
         losses = {}
         det_out,det_result = None,None
         map_out = None
+        dyn_traj = None
         for i, task_name in enumerate(task_names) :
             sub_bev_feture = bev_feat[:,i].flatten(0,1)
             if task_name == "dynamic" or task_name == "dynamic_static":
-                det_out, det_loss, det_result = self.forward_dynamic_branch(sub_bev_feture, T_ego_his2curs, metas["dynamic"],decoder=decoder)
+                det_out, det_loss, det_result,instance_features,instance_anchors = self.forward_dynamic_branch(sub_bev_feture, T_ego_his2curs, metas["dynamic"],decoder=decoder)
                 if isinstance(det_loss, dict):
                     for k, v in det_loss.items():
                         losses[f"det3d_{k}"] = v
+
+                # B, N = instance_features.shape[:2]
+                # traj_dim = 55 * 2
+                # device = instance_features.device
+                # gt_traj = torch.randn(B, N, traj_dim, device=device)
+                # traj_mask = torch.ones(B, N, traj_dim, device=device)
+                # instance_mask = torch.ones(B, N, device=device)
+                # instance_mask[:, N//2:] = 0
+                dyn_traj_loss,dyn_traj = self.forward_dynamic_trajectory(instance_features,instance_anchors,decode_trajectory=True,det_out=det_out,data_gt= metas["dynamic"])
+                if isinstance(dyn_traj_loss, dict):
+                    for k, v in dyn_traj_loss.items():
+                        losses[f"dyntraj_{k}"] = v
+
+
             if task_name == "static" or task_name == "dynamic_static":
                 map_out = self.forward_static_branch(sub_bev_feture, metas["static"],decoder=decoder)
                 map_loss = map_out.get("loss_map", None)
@@ -5922,10 +6236,10 @@ class Model(nn.Module):
             "det3d_out": det_out,
             "det3d_result": det_result,
             "map3d_out": map_out,
+            "dyn_traj":dyn_traj
         })
 
         return out
-
 if __name__ == '__main__':
     pass
 ----------------------------------------
@@ -7528,6 +7842,7 @@ def build_det3D_head(
         instance_grad=True,
         anchor_grad=True,
         cls_threshold_to_reg=-1,
+        anchor_dim=11,
 ):
     """从 model.py 拷贝的 Sparse4D BEV head 构建函数，用于测试。"""
     if anchor_init is None:
@@ -8038,6 +8353,7 @@ class DenoisingSampler(nn.Module):
         alpha: float = 0.25,
         gamma: float = 2.0,
         eps: float = 1e-12,
+        state_dims = 11
     ):
         super().__init__()
         self.num_dn_groups = num_dn_groups
@@ -8052,10 +8368,11 @@ class DenoisingSampler(nn.Module):
         self.alpha = alpha
         self.gamma = gamma
         self.eps = eps
+        self.state_dims = state_dims
 
     def encode_reg_target(self, box_target, reg_masks, device=None):
         """将 GT 框 (x,y,z,w,l,h,yaw,vx,vy,vz) 编码为 11 维：(x,y,z,log(w),log(l),log(h),sin(yaw),cos(yaw),vx,vy,vz)。"""
-        state_dims = 11
+        # state_dims = self.state_dims
         outputs = []
         outputs_mask = []
         for i, box in enumerate(box_target):
@@ -8064,8 +8381,9 @@ class DenoisingSampler(nn.Module):
             yaw = box[..., 6]
             sin_yaw = torch.sin(yaw).unsqueeze(-1)
             cos_yaw = torch.cos(yaw).unsqueeze(-1)
-            vel = box[..., 7:10] if box.shape[-1] >= 10 else box.new_zeros(*box.shape[:-1], 3)
-            out = torch.cat([xyz, whl, sin_yaw, cos_yaw, vel], dim=-1)
+            vel = box[..., 7:10] 
+            traj = box[..., 10:120] 
+            out = torch.cat([xyz, whl, sin_yaw, cos_yaw, vel,traj], dim=-1)
             if reg_masks is not None:
                 reg_mask = reg_masks[i]
                 mask = torch.cat(
@@ -8075,6 +8393,7 @@ class DenoisingSampler(nn.Module):
                         reg_mask[..., 6:7],
                         reg_mask[..., 6:7],
                         reg_mask[..., 7:10],
+                        reg_mask[..., 10:120],
                     ],
                     dim=-1,
                 )
@@ -8110,16 +8429,17 @@ class DenoisingSampler(nn.Module):
         return cost
 
     def _box_cost(self, box_pred, box_target, instance_reg_weights, reg_masks=None):
-        bs = box_pred.shape[0]
+        state_dims = self.state_dims
+        bs,num,dim = box_pred.shape
         cost = []
         for i in range(bs):
             if len(box_target[i]) == 0:
                 cost.append(None)
                 continue
-            diff = torch.abs(box_pred[i, :, None] - box_target[i][None])  # (num_pred, M, D)
-            static_w = instance_reg_weights[i][None]                     # (1, M, D)
+            diff = torch.abs(box_pred[i, :, None] - box_target[i][None,:,:dim])  # (num_pred, M, D)
+            static_w = instance_reg_weights[i][None,:,:dim]                     # (1, M, D)
             if reg_masks is not None:
-                dynamic_w = reg_masks[i][None]                            # (1, M, D)
+                dynamic_w = reg_masks[i][None,:,:dim]                            # (1, M, D)
             else:
                 dynamic_w = torch.ones_like(static_w)
             weight = static_w * dynamic_w * box_pred.new_tensor(self.reg_weights)
@@ -8188,22 +8508,24 @@ class DenoisingSampler(nn.Module):
                 ))
             else:
                 indices.append((None, None))
-
+        state_dims = self.state_dims
         output_cls_target = cls_target[0].new_ones(bs, num_pred, dtype=torch.long) * -1 # torch.Size([10, 100]) -- 6
         output_box_target = box_pred.new_zeros(box_pred.shape)# torch.Size([10, 100, 11])
         output_reg_weights = box_pred.new_zeros(box_pred.shape)
+        output_traj_target = box_pred.new_zeros(*box_pred.shape[:2],110) + 999.
         for i, (pred_idx, target_idx) in enumerate(indices): # bs = 10
             if pred_idx is None or len(cls_target[i]) == 0:
                 continue
             output_cls_target[i, pred_idx] = cls_target[i][target_idx] # 100ge 位置除了指定的位置其他值为6
-            output_box_target[i, pred_idx] = box_target_encoded[i][target_idx]
-            static_weight = reg_weights[i][target_idx]
+            output_box_target[i, pred_idx] = box_target_encoded[i][target_idx,:state_dims]
+            output_traj_target[i, pred_idx] = box_target_encoded[i][target_idx,state_dims:]
+            static_weight = reg_weights[i][target_idx,:state_dims]
             if reg_masks is not None:
-                dynamic_mask = reg_masks[i][target_idx]
+                dynamic_mask = reg_masks[i][target_idx,:state_dims]
                 output_reg_weights[i, pred_idx] = static_weight * dynamic_mask
             else:
                 output_reg_weights[i, pred_idx] = static_weight
-        return output_cls_target, output_box_target, output_reg_weights
+        return output_cls_target, output_box_target, output_reg_weights,output_traj_target
 
     def get_dn_anchors(self, cls_target, box_target,reg_masks=None, gt_instance_id=None):
         """
@@ -8211,6 +8533,7 @@ class DenoisingSampler(nn.Module):
         cls_target: list of (N_gt,) 类别；box_target: list of (N_gt, 10) 或 (N_gt, 11)  decoded 框。
         Returns: (dn_anchor, dn_reg_target, dn_cls_target, dn_attn_mask, valid_mask, dn_id_target)
         """
+        state_dims = self.state_dims
         if self.num_dn_groups <= 0:
             return None
         if self.num_temp_dn_groups <= 0:
@@ -8235,6 +8558,8 @@ class DenoisingSampler(nn.Module):
         box_target, reg_masks = self.encode_reg_target(
             box_target, reg_masks, cls_target.device
         )
+        box_target = [box[...,:state_dims] for box in box_target]
+        reg_masks =  [mask[...,:state_dims] for mask in reg_masks]
         if reg_masks is not None:
             reg_masks = [
                 F.pad(
@@ -8693,7 +9018,7 @@ class Sparse4DHead(nn.Module):
             out["instance_id"] = self.instance_bank.get_instance_id(
                 cls, anchor, self.decoder.score_threshold
             )
-        return out,instance_feature,anchor
+        return out,instance_feature,anchor # 4 50 256 # 4 50 11
 
     def _reduce_mean(self, x: torch.Tensor) -> torch.Tensor:
         return x.sum()
@@ -8758,7 +9083,7 @@ class Sparse4DHead(nn.Module):
             gt_reg = [gt_reg[b] for b in range(len(gt_reg)) for _ in range(T)]
         for decoder_idx, (cls, reg, qt) in enumerate(zip(cls_scores, reg_preds, quality)):
             reg = reg[..., : len(self.reg_weights)]
-            cls_target, reg_target, reg_weights = self.sampler.sample(
+            cls_target, reg_target, reg_weights,_ = self.sampler.sample(
                 cls, reg, gt_cls, gt_reg,reg_masks=gt_reg_mask
             )
             # 确保 label / reg target 与预测在同一 device 上
@@ -8766,6 +9091,7 @@ class Sparse4DHead(nn.Module):
             cls_target = cls_target.to(device)
             reg_target = reg_target.to(device)
             reg_weights = reg_weights.to(device)
+            # traj_target = traj_target.to(device)
             reg_target = reg_target[..., : len(self.reg_weights)]
             mask = torch.logical_not(torch.all(reg_target == 0, dim=-1))# True是匹配上的，False是没有匹配上的
             # num_pos = max(self._reduce_mean(torch.sum(mask).to(dtype=reg.dtype)), 1.0)
@@ -8802,6 +9128,7 @@ class Sparse4DHead(nn.Module):
                 )
             output[f"loss_cls_{decoder_idx}"] = cls_loss
             output.update(reg_loss_dict)
+            
 
         if "dn_prediction" not in model_outs:
             return output
@@ -9744,6 +10071,886 @@ def decode_track(
     return track_ids, positions
 ----------------------------------------
 
+文件: trajectory_dynamic/attention.py
+----------------------------------------
+import torch
+import torch.nn as nn
+import math
+from einops import rearrange
+
+""" Slightly adapted from  https://github.com/karpathy/minGPT/blob/master/mingpt/model.py """
+
+class CausalSelfAttention(nn.Module):
+    """
+    Self-attention, possibly causal.
+    """
+
+    def __init__(self, config,n_embd,n_head,causal,attn_pdrop, resid_pdrop,block_size,in_dim=None):
+        super().__init__()
+        assert n_embd % n_head == 0
+        self.causal = causal
+        # key, query, value projections for all heads
+        if in_dim is None:
+            in_dim = n_embd
+        self.kdim = n_embd
+        self.key = nn.Linear(in_dim, n_embd)
+        self.query = nn.Linear(in_dim, n_embd)
+        self.value = nn.Linear(in_dim, n_embd)
+        # regularization
+        self.attn_drop = nn.Dropout(attn_pdrop)
+        self.resid_drop = nn.Dropout(resid_pdrop)
+        # output projection
+        self.proj = nn.Linear(n_embd, n_embd)
+        # causal mask to ensure that attention is only applied to the left in the input sequence
+        if self.causal:
+            mask = torch.tril(torch.ones(block_size,
+                                         block_size))
+            if hasattr(config, "n_unmasked"):
+                mask[:n_unmasked, :n_unmasked] = 1
+            self.register_buffer("mask", mask.view(1, 1, block_size, block_size))
+        self.n_head = n_head
+
+    def forward(self, x, layer_past=None, valid_mask=None):
+        B, T, C = x.size()
+
+        C = self.kdim
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        k = self.key(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        q = self.query(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        v = self.value(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+
+        present = torch.stack((k, v))
+        if layer_past is not None:
+            past_key, past_value = layer_past
+            k = torch.cat((past_key, k), dim=-2)
+            v = torch.cat((past_value, v), dim=-2)
+
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+
+        if layer_past is None and self.causal:
+            att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float('-inf'))
+
+        if valid_mask is not None:
+            valid_mask = rearrange(valid_mask, 'b j -> b () () j')
+            att = att.masked_fill_(~valid_mask, float('-inf'))
+
+        att = nn.functional.softmax(att, dim=-1)
+        att = self.attn_drop(att)
+        y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)  # re-assemble all head outputs side by side
+
+        # output projection
+        y = self.resid_drop(self.proj(y))
+        return y, present
+
+
+
+----------------------------------------
+
+文件: trajectory_dynamic/quantize.py
+----------------------------------------
+# Copyright (C) 2022-2023 Naver Corporation. All rights reserved.
+# Licensed under CC BY-NC-SA 4.0 (non-commercial use only).
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from torch import einsum
+from einops import rearrange
+from argparse import ArgumentParser
+# import ipdb
+
+""" VectorQuantizer code adapted from by https://github.com/CompVis/taming-transformers/taming/modules/vqvae/quantize.py"""
+
+__all__ = ['VectorQuantizer']
+
+def L2_efficient(x, y):
+    return (x.pow(2).sum(1, keepdim=True) - 2 * x @ y + y.pow(2).sum(0, keepdim=True))
+
+class EmaCodebookMeter:
+    """Compute an estimate of centroid usage, using an EMA to track proportions """
+
+    def __init__(self, codebook_size, ema_alpha=0.05):
+        self.codebook_size = codebook_size
+        self.bins = (torch.ones((self.codebook_size), requires_grad=False) / self.codebook_size).detach().cuda()
+        self.ema_alpha = ema_alpha
+        self.iters = 0
+
+    def bincount(self, val, weights=None):
+        norm = val.shape[0]
+        weights = weights.reshape(-1) if weights is not None else None
+        count = torch.bincount(val.reshape(-1), minlength=self.codebook_size,
+                               weights=weights).detach()
+        self.iters += 1
+        return count / norm
+
+    def load(self, bins):
+        self.bins = torch.tensor(bins, requires_grad=False).detach().cuda()
+
+    def update(self, val, weights=None, n=1):
+        """ Count usage of each value in the codebook """
+        count = self.bincount(val, weights=weights)
+        alpha = max(self.ema_alpha, 1 / (self.iters + 1))
+        self.bins = (1. - alpha) * self.bins + alpha * count
+
+    def get_hist(self):
+        return self.bins
+
+class VectorQuantizer(nn.Module):
+    """
+    Code taken from https://github.com/CompVis/taming-transformers/
+            blob/9d17ea64b820f7633ea6b8823e1f78729447cb57/taming/
+            modules/vqvae/quantize.py#L213
+    for handling input of shape [batch_size, seq_len, hid_dim]
+
+    Improved version over VectorQuantizer, can be used as a drop-in replacement. Mostly
+    avoids costly matrix multiplications and allows for post-hoc remapping of indices.
+    """
+    def __init__(self, n_e, e_dim, beta,
+                 nbooks=1, balance=False):
+        super().__init__()
+        self.n_e = n_e
+        self.e_dim = e_dim
+        self.beta = beta
+        self.nbooks = nbooks
+        self.balance = balance
+
+        assert n_e % nbooks == 0, "nb codebooks should divide nb centroids"
+        self.n_e_i = n_e // nbooks
+
+        embed_dims = (nbooks - 1) * [e_dim // nbooks] + \
+                [e_dim - (nbooks - 1) * (e_dim // nbooks)]
+        self.embed_dims = embed_dims
+
+        self.embeddings = torch.nn.ModuleDict({str(i): nn.Embedding(self.n_e_i, d) for i, d in enumerate(embed_dims)})
+
+        self.trackers = {}
+        for i, e in self.embeddings.items():
+            e.weight.data.uniform_(-1.0 / self.n_e_i, 1.0 / self.n_e_i)
+            print(f"Codebook {i}: {list(e.weight.size())}")
+
+            self.trackers[int(i)] = EmaCodebookMeter(self.n_e_i)
+
+    def get_state(self):
+        return {i: self.trackers[i].get_hist().cpu().data.numpy() for i in self.trackers.keys()}
+
+    def load_state(self, bins):
+        for i, b in bins.items():
+            self.trackers[i].load(b)
+
+    def get_hist(self, i):
+        return self.trackers[i].get_hist()
+
+    def reset(self, i):
+        for i in self.trackers.keys():
+            self.trackers = EmaCodebookMeter(self.embed_dims[int(i)])
+
+    def track_assigment(self, emb_ind, i):
+        self.trackers[i].update(emb_ind)
+
+    def forward_one(self, z, i, weights=None):
+        bsize = self.e_dim // self.nbooks
+        e_dim = bsize  if i < self.nbooks - 1 else self.e_dim - (self.nbooks - 1) * bsize
+
+        z_flattened = z.view(-1, e_dim)
+        dist = L2_efficient(z_flattened, self.embeddings[str(i)].weight.t())
+
+        if self.balance and weights is not None:
+            #weights = (proportions * self.n_embed).unsqueeze(0)
+            wdist = dist * weights.unsqueeze(0)
+            dist = -torch.nn.functional.softmax(-wdist, 1)
+
+        min_encoding_indices = torch.argmin(dist, dim=1).unsqueeze(1)
+        min_encodings = torch.zeros(min_encoding_indices.shape[0], self.n_e_i).to(z)
+        min_encodings.scatter_(1, min_encoding_indices, 1)
+
+        if self.training:
+            self.track_assigment(min_encoding_indices.detach(), i)
+
+        # get quantized latent vectors
+        z_q = torch.matmul(min_encodings, self.embeddings[str(i)].weight).view(z.shape)
+        
+        #min_encoding_indices.view(z.shape)
+        return z_q, min_encoding_indices.view(z.shape[:-1] + (1,))
+
+    def forward(self, z, p=1.0):
+        assert z.size(2) == self.e_dim
+        zs = torch.split(z, z.size(2) // len(self.embeddings), dim=-1)
+        zq_i = [self.forward_one(z, i, self.get_hist(i)) for i, z in enumerate(zs)]
+        z_q, min_encoding_indices = [torch.cat([e[i] for e in zq_i], dim=-1) for i in [0,1]]
+
+        # compute loss for embedding
+        loss = torch.mean((z_q.detach() - z) ** 2, dim=-1) + self.beta * \
+               torch.mean((z_q - z.detach()) ** 2, dim=-1)
+
+        if p != 1.0:
+            # Proba of being quantized.
+            quant_mask = torch.bernoulli(p * torch.ones_like(z)).float()
+            z_q = quant_mask * z_q + (1 - quant_mask) * z
+
+        # preserve gradients
+        z_q = z + (z_q - z).detach()
+        return z_q, loss, min_encoding_indices
+
+    def get_codebook_entry(self, indices, eos_mask=None):
+        """
+        Args:
+            - indices: [batch_size,seq_len]
+        Return:
+            - z_q: [batch_size,seq_len,e_dim]
+        """
+        # This is a hack, but it enables us to keep the '-1' index solely in the gpt
+        embds = [self.embeddings[str(i)](e.squeeze(-1)) for i, e in enumerate(torch.split(indices, 1, dim=-1))]
+        return torch.cat(embds, dim=-1)
+
+if __name__ == "__main__":
+    device = torch.device('cuda')
+    model = VectorQuantizer(n_e=1024, e_dim=256, beta=0.25, nbooks=8, balance=False).to(device)
+    x = torch.randn(32, 64, 256).to(device)
+
+    # two forwards
+    z_q1, _, indices1 = model(x)
+    z_q2, _, indices2 = model(x)
+    print((z_q1 - z_q2).abs().sum())
+
+    # from indices to codebook entry
+    z_q3 = model.get_codebook_entry(indices1)
+    print((z_q2 - z_q3).abs().sum())
+
+----------------------------------------
+
+文件: trajectory_dynamic/trajectory_predictor.py
+----------------------------------------
+# -*- encoding: utf-8 -*-
+'''
+@File         :trajectory_predictor.py
+@Date         :2026/04/09 14:55:57
+@Author       :Binge.Van
+@E-mail       :afb5szh@bosch.com
+@Version      :V1.0.0
+@Description  :
+
+'''
+
+
+import os,sys
+
+import torch
+from torch import nn
+
+from .vqvae import VQVAE
+from .transformer_encoder import TrajectoryEncoder,ce_loss
+
+from sparse4d.dn_sampler import DenoisingSampler as Sampler
+
+class TrajectoryPredictor(nn.Module):
+    """
+    训练：用冻结 VQ-VAE 对 GT 轨迹得到 teacher indices，对 index transformer 做 CE；
+    同时用 argmax 预测 indices 走 decode 得到预测未来轨迹（不参与反向，或仅供日志）。
+
+    槽位 N 默认 100，需与已训好的 TrajectoryVQVAE.num_slots、Sparse4D 目标数一致。
+    """
+
+    def __init__(
+        self,
+        traj_encoder,
+        vqvae,
+        sampler=None,
+        freeze_vqvae: bool = True,
+        use_slot_embedding: bool = True,
+        gt_cls_key = None,
+        gt_reg_key = None,
+        gt_reg_key_mask = None
+
+
+    ):
+        super().__init__()
+
+        
+        
+
+        self.traj_encoder = traj_encoder
+        self.vqvae = vqvae
+        self.sampler = sampler
+        self.freeze_vqvae = freeze_vqvae
+
+        self.n_e = self.vqvae.n_e
+        self.nbooks = self.vqvae.nbooks
+        self.n_e_i = self.n_e // self.nbooks
+        self.max_slots = self.vqvae.num_slots
+        self.d_model = self.traj_encoder.d_model
+        self.instance_num = self.traj_encoder.instance_num
+
+        self.gt_cls_key = gt_cls_key
+        self.gt_reg_key = gt_reg_key
+        self.gt_reg_key_mask = gt_reg_key_mask
+        
+
+        
+        self.code_heads = nn.ModuleList(
+            [nn.Linear(self.d_model, self.n_e_i) for _ in range(self.nbooks)]
+        )
+
+        self.use_slot_embedding = use_slot_embedding
+        if use_slot_embedding:
+            self.slot_embed = nn.Embedding(self.max_slots, self.d_model)
+            self.slot_ids = torch.arange(self.instance_num, dtype=torch.long)
+
+        if freeze_vqvae:
+            self.vqvae.requires_grad_(False)
+            self.vqvae.eval()
+
+    @property
+    def num_slots(self) -> int:
+        return self.vqvae.num_slots
+
+    @torch.inference_mode()
+    def teacher_indices_from_trajectory(
+        self,
+        gt_traj: torch.Tensor,
+        traj_mask: torch.Tensor,
+        instance_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.freeze_vqvae:
+            self.vqvae.eval()
+        out = self.vqvae(gt_traj, traj_mask, instance_mask)
+        return out['indices']
+
+
+    # def loss(self,):
+    #     # vq loss/ vqvae 重建loss/ 分类loss / transformer 重建loss
+
+
+    def forward(
+        self,
+        instance_feature: torch.Tensor,
+        anchor: torch.Tensor,
+        # instance_mask: torch.Tensor,
+        # gt_traj  = None,
+        # traj_mask  = None,
+        teacher_indices = None,
+        decode_trajectory: bool = True,
+        det_out = None,
+        data_gt = None
+    ) :
+        """
+        instance_feature: (B, N, 256)
+        anchor: (B, N, 11)
+        instance_mask: (B, N)
+        gt_traj / traj_mask: 若提供且 teacher_indices 为 None，则用冻结 VQ-VAE 生成教师 indices。
+        teacher_indices: (B, N, nbooks)，可直接监督（无效槽位为 -1）。
+        """
+        gt_traj,traj_mask,instance_mask = self.get_traj_target(det_out,data_gt)
+        b, n = instance_feature.shape[:2]
+        slot_ids =self.slot_ids.unsqueeze(0).expand(b, n).to(instance_feature.device)
+        slot_embed = self.slot_embed(slot_ids)
+
+
+        vqvae_out = self.vqvae(gt_traj, traj_mask, instance_mask)
+        # vqvae_out  ={f"vqvae_{k}":v for k,v in vqvae_out.items()}
+
+
+
+        x = self.traj_encoder(instance_feature, anchor, instance_mask,slot_embed)
+        logits = torch.stack([h(x) for h in self.code_heads], dim=2)
+        pred_indices = logits.argmax(dim=-1).long()
+        vb = instance_mask.bool().unsqueeze(-1).expand_as(pred_indices)
+        pred_indices = pred_indices.masked_fill(~vb, -1)
+
+        decoded = self.vqvae.decode_from_indices(pred_indices, instance_mask)
+
+        cls_loss = ce_loss(logits, vqvae_out["indices"], instance_mask)
+        traj_loss = (((decoded - gt_traj)**2) * traj_mask).sum() / (traj_mask.sum() + 1e-6)
+
+        dyn_traj_loss = {
+            'traj_loss': traj_loss,
+            'cls_loss': cls_loss,
+            'recon_loss': vqvae_out["recon_loss"],
+            'vq_loss': vqvae_out["vq_loss"],
+        }
+        dyn_traj = {
+            
+            'recon_traj': vqvae_out["x_hat"],
+            'decoded_traj': decoded,
+        }
+        return dyn_traj_loss,dyn_traj
+        
+    @staticmethod
+    def _flatten_gt_list(gt_list):
+        """
+        将 data 层输出的形如 [ [t0帧GT, t1帧GT, ...],  [...], ... ] 的二级 list
+        展平为 Sparse4D 期望的一维 list（长度 = B*T）。
+        若本身已是一维 list，则直接返回。
+        """
+        if not isinstance(gt_list, list) or len(gt_list) == 0:
+            return gt_list
+        first = gt_list[0]
+        if isinstance(first, list):
+            flat = []
+            for seq in gt_list:
+                flat.extend(seq)
+            return flat
+        return gt_list
+
+    def get_traj_target(self,det_out,data):
+        cls = det_out["classification"][-1] # 2 * 10 * 100 * 6
+        reg = det_out["prediction"][-1] #2*10*100*11
+        gt_cls = data.get(self.gt_cls_key)
+        gt_reg = data.get(self.gt_reg_key)
+        gt_reg_mask = data.get(self.gt_reg_key_mask, None)
+
+        gt_cls = self._flatten_gt_list(gt_cls)
+        gt_reg = self._flatten_gt_list(gt_reg)
+        if gt_reg_mask is not None:
+            gt_reg_mask = self._flatten_gt_list(gt_reg_mask) # b*t n 10
+
+        _, _, _,traj_target = self.sampler.sample(
+            cls, reg, gt_cls, gt_reg,reg_masks=gt_reg_mask
+        )
+        device = cls.device
+        traj_target = traj_target.to(device)
+        traj_mask =  traj_target.new_zeros(traj_target.shape) 
+        traj_mask[traj_target<100] = 1
+        instance_mask = (traj_target < 50).any(dim=-1).to(traj_target.dtype)
+        return traj_target,traj_mask,instance_mask
+
+
+
+def build_dynamic_trajectory_predictor(
+    obj_num = 50,
+    vqvae_num_slots = 1024,
+    instance_feat_dim: int = 256,
+    anchor_dim: int = 11,
+    d_model: int = 256,
+    nhead: int = 8,
+    num_layers: int = 3,
+    traj_dim: int = 100,
+    e_dim: int = 256,
+    n_e: int = 512,
+    nbooks: int = 1,
+    freeze_vqvae: bool = False,
+):
+    """默认 100 槽位，超参与已训 VQ-VAE 检查点需一致。"""
+    vqvae = VQVAE(
+        num_slots=vqvae_num_slots,
+        traj_dim=traj_dim,
+        e_dim=e_dim,
+        n_e=n_e,
+        nbooks=nbooks,
+    )
+    traj_encoder = TrajectoryEncoder(
+        instance_num = obj_num,
+        instance_feat_dim=instance_feat_dim,
+        anchor_dim=anchor_dim,
+        d_model=d_model,
+        nhead=nhead,
+        num_layers=num_layers,
+    )
+    sampler = Sampler()
+    return TrajectoryPredictor(traj_encoder,
+                                vqvae, 
+                                sampler=sampler,
+                                freeze_vqvae=freeze_vqvae,
+                                gt_cls_key = "gt_labels_det3D",
+                                gt_reg_key = "gt_bboxes_det3D",
+                                gt_reg_key_mask = "gt_bboxes_det3D_mask"
+                            )
+
+
+if __name__ == '__main__':
+    main()
+----------------------------------------
+
+文件: trajectory_dynamic/transformer_encoder.py
+----------------------------------------
+# Transformer that predicts VQ code indices per instance from Sparse4D-style features.
+# Pair with TrajectoryVQVAE.decode_from_indices(pred_indices, instance_mask).
+# Encoder stacks CausalSelfAttention (non-causal) + FFN from blocks/attention.py style.
+
+from __future__ import annotations
+
+from typing import Optional
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from .attention import CausalSelfAttention
+
+__all__ = [
+    'TrajectoryEncoder',
+    'ce_loss',
+    'EncoderBlock',
+]
+
+
+class _EncoderConfig:
+    """Config bundle for CausalSelfAttention (causal=False → full bidirectional attention)."""
+
+    def __init__(
+        self,
+        n_embd: int,
+        n_head: int,
+        attn_pdrop: float,
+        resid_pdrop: float,
+        block_size: int,
+    ):
+        self.n_embd = n_embd
+        self.n_head = n_head
+        self.attn_pdrop = attn_pdrop
+        self.resid_pdrop = resid_pdrop
+        self.block_size = block_size
+        self.causal = False
+
+
+class EncoderBlock(nn.Module):
+    """
+    Pre-LayerNorm block: x += Attn(LN(x)), x += FFN(LN(x)).
+    Padding: pass valid_mask (B, T) True = real slot; keys at False are masked (see CausalSelfAttention).
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int,
+        dropout: float,
+        max_seq: int,
+    ):
+        super().__init__()
+        cfg = _EncoderConfig(
+            n_embd=d_model,
+            n_head=nhead,
+            attn_pdrop=dropout,
+            resid_pdrop=dropout,
+            block_size=max_seq,
+        )
+        self.ln1 = nn.LayerNorm(d_model)
+        self.ln2 = nn.LayerNorm(d_model)
+        self.attn = CausalSelfAttention(cfg,d_model,nhead,False,dropout, dropout,max_seq)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        h, _ = self.attn(self.ln1(x), valid_mask=valid_mask)
+        x = x + h
+        x = x + self.mlp(self.ln2(x))
+        return x
+
+
+class TrajectoryEncoder(nn.Module):
+    """
+    Inputs:
+        instance_feature: (B, N, instance_feat_dim)
+        anchor: (B, N, anchor_dim)
+    Output:
+        logits: (B, N, nbooks, n_e_i)  — n_e_i = n_e // nbooks (matches VectorQuantizer per-book size)
+
+    Use instance_mask=None or all-True when every slot is valid; else padding slots are excluded from attention.
+    """
+
+    def __init__(
+        self,
+        instance_num = 50,
+        instance_feat_dim: int = 256,
+        anchor_dim: int = 11,
+        d_model: int = 256,
+        nhead: int = 8,
+        num_layers: int = 3,
+        dim_feedforward: int = 512,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        assert d_model % nhead == 0, 'd_model must be divisible by nhead'
+        
+        self.d_model = d_model
+
+        self.instance_num = instance_num
+        
+
+        self.input_proj = nn.Linear(instance_feat_dim + anchor_dim, d_model)
+        
+
+        # --- Custom encoder (CausalSelfAttention, blocks/attention.py) ---
+        self.layers = nn.ModuleList(
+            [
+                EncoderBlock(
+                    d_model=d_model,
+                    nhead=nhead,
+                    dim_feedforward=dim_feedforward,
+                    dropout=dropout,
+                    max_seq=instance_num,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        
+
+        self.out_norm = nn.LayerNorm(d_model)
+        # self.code_heads = nn.ModuleList(
+        #     [nn.Linear(d_model, self.n_e_i) for _ in range(nbooks)]
+        # )
+
+    def forward(
+        self,
+        instance_feature: torch.Tensor,
+        anchor: torch.Tensor,
+        instance_mask: Optional[torch.Tensor] = None,
+        slot_embed = None,
+    ) -> torch.Tensor:
+    
+
+        x = torch.cat([instance_feature, anchor], dim=-1)
+        x = self.input_proj(x)
+        if slot_embed is not None:
+            x = x + slot_embed
+
+        # Custom encoder path: valid_mask True = real slot (key not masked)
+        valid_mask: Optional[torch.Tensor] = None
+        if instance_mask is not None:
+            valid_mask = instance_mask.bool()
+
+        for layer in self.layers:
+            x = layer(x, valid_mask=valid_mask)
+            
+
+        x = self.out_norm(x)
+
+        
+        return x
+
+    @torch.inference_mode()
+    def predict_indices(
+        self,
+        instance_feature: torch.Tensor,
+        anchor: torch.Tensor,
+        instance_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        logits = self(instance_feature, anchor, instance_mask)
+        pred = logits.argmax(dim=-1).long()
+        if instance_mask is not None:
+            m = instance_mask.bool().unsqueeze(-1).expand_as(pred)
+            pred = pred.masked_fill(~m, -1)
+        return pred
+
+
+def ce_loss(
+    logits: torch.Tensor,
+    target_indices: torch.Tensor,
+    instance_mask: torch.Tensor,
+) -> torch.Tensor:
+    """
+    logits: (B, N, nbooks, n_e_i)
+    target_indices: (B, N, nbooks) long; use -1 for positions to ignore (padding / no teacher)
+    instance_mask: (B, N) bool or 0/1
+    """
+    if logits.shape[:3] != target_indices.shape:
+        raise ValueError(f'logits {logits.shape} vs targets {target_indices.shape}')
+    b, n, k, c = logits.shape
+    inst = instance_mask.bool()
+    total = logits.new_tensor(0.0)
+    n_terms = 0
+    for i in range(k):
+        li = logits[:, :, i, :]
+        ti = target_indices[:, :, i]
+        valid = inst & (ti >= 0)
+        if valid.any():
+            total = total + F.cross_entropy(li[valid], ti[valid])
+            n_terms += 1
+    if n_terms == 0:
+        return total
+    return total / n_terms
+
+----------------------------------------
+
+文件: trajectory_dynamic/vqvae.py
+----------------------------------------
+# Offline VQ-VAE for per-slot future trajectories (e.g. B x N x 100, 100 = 50 x xy).
+# Uses VectorQuantizer from quantize.py; instance_mask (B, N) marks real vs padded slots.
+
+from typing import Optional
+
+import torch
+import torch.nn as nn
+
+from .quantize import VectorQuantizer
+
+__all__ = ['VQVAE', 'Encoder', 'Decoder']
+
+
+class Encoder(nn.Module):
+    """(B, N, traj_dim) with traj_dim = 2 * num_future_steps -> (B, N, e_dim)."""
+
+    def __init__(self, traj_dim: int = 100, e_dim: int = 128, hidden: int = 64):
+        super().__init__()
+        assert traj_dim % 2 == 0, 'traj_dim must be 2 * num_steps'
+        self.num_steps = traj_dim // 2
+        self.conv = nn.Sequential(
+            nn.Conv1d(2, hidden, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(hidden, hidden, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.to_latent = nn.Linear(hidden, e_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, N, traj_dim)
+        b, n, _ = x.shape
+        h = x.view(b * n, self.num_steps, 2).transpose(1, 2)  # (B*N, 2, T)
+        h = self.conv(h)
+        h = h.mean(dim=-1)
+        z = self.to_latent(h).view(b, n, -1)
+        return z
+
+
+class Decoder(nn.Module):
+    """(B, N, e_dim) -> (B, N, traj_dim)."""
+
+    def __init__(self, traj_dim: int = 100, e_dim: int = 128, hidden: int = 256):
+        super().__init__()
+        self.traj_dim = traj_dim
+        self.net = nn.Sequential(
+            nn.Linear(e_dim, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, traj_dim),
+        )
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        b, n, e = z.shape
+        return self.net(z.reshape(b * n, e)).view(b, n, self.traj_dim)
+
+
+class VQVAE(nn.Module):
+    """
+    Args:
+        num_slots: N (e.g. 100), must match input dim 1.
+        traj_dim: last dim (e.g. 100 = 50 future steps * xy).
+        e_dim: bottleneck dim for VectorQuantizer (must be divisible by nbooks).
+        n_e, beta, nbooks: see VectorQuantizer.
+    Forward:
+        x: (B, N, traj_dim)
+        traj_mask: (B, N, traj_dim), 1 = valid xy to reconstruct
+        instance_mask: (B, N), 1 = real instance, 0 = slot padded to N
+    """
+
+    def __init__(
+        self,
+        num_slots: int = 100, #槽位数量，理解应该要大于anchor的数量即可
+        traj_dim: int = 100,#50*2
+        e_dim: int = 128, #encoder输出维度，每个条目的特征维度
+        n_e: int = 512,#码本总条目，可以理解是kmeans的类别数
+        beta: float = 0.25,
+        nbooks: int = 1,#码本数量
+        enc_hidden: int = 64,
+        dec_hidden: int = 256,
+    ):
+        super().__init__()
+        assert e_dim % nbooks == 0, 'e_dim must be divisible by nbooks'
+        assert n_e % nbooks == 0, 'n_e must be divisible by nbooks'
+        self.num_slots = num_slots
+        self.traj_dim = traj_dim
+        self.e_dim = e_dim
+        self.nbooks = nbooks
+        self.n_e = n_e
+
+        self.encoder = Encoder(traj_dim=traj_dim, e_dim=e_dim, hidden=enc_hidden)
+        self.decoder = Decoder(traj_dim=traj_dim, e_dim=e_dim, hidden=dec_hidden)
+        self.quantizer = VectorQuantizer(n_e=n_e, e_dim=e_dim, beta=beta, nbooks=nbooks)
+
+    def _mask_input(
+        self,
+        x: torch.Tensor,
+        traj_mask: Optional[torch.Tensor],
+        instance_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        w = torch.ones_like(x)
+        if traj_mask is not None:
+            w = w * traj_mask.to(dtype=x.dtype)
+        if instance_mask is not None:
+            w = w * instance_mask.unsqueeze(-1).to(dtype=x.dtype)
+        return x * w
+
+    def encode(
+        self,
+        x: torch.Tensor,
+        traj_mask: Optional[torch.Tensor] = None,
+        instance_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        x_in = self._mask_input(x, traj_mask, instance_mask)
+        return self.encoder(x_in)
+
+    @staticmethod
+    def _apply_instance_to_vq(
+        z_q: torch.Tensor,
+        vq_loss: torch.Tensor,
+        indices: torch.Tensor,
+        instance_mask: Optional[torch.Tensor],
+    ):
+        if instance_mask is None:
+            return z_q, vq_loss.mean(), indices
+        valid = instance_mask.to(dtype=vq_loss.dtype)
+        denom = valid.sum().clamp(min=1.0)
+        vq_reduced = (vq_loss * valid).sum() / denom
+        vb = instance_mask.bool().unsqueeze(-1).expand_as(indices)
+        indices_out = torch.where(vb, indices, torch.full_like(indices, -1))
+        z_q_out = z_q * instance_mask.unsqueeze(-1).to(dtype=z_q.dtype)
+        return z_q_out, vq_reduced, indices_out
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        traj_mask: torch.Tensor,
+        instance_mask: torch.Tensor,
+        quant_prop: float = 1.0,
+    ):
+        """
+        Returns dict with x_hat, recon_loss, vq_loss (scalar), indices (B,N,nbooks),
+        z (encoder out), z_q (after VQ + instance mask).
+        """
+        z = self.encode(x, traj_mask, instance_mask)
+        z = z * instance_mask.unsqueeze(-1).to(dtype=z.dtype)
+        z_q, vq_loss, indices = self.quantizer(z, p=quant_prop)
+        z_q, vq_reduced, indices = self._apply_instance_to_vq(z_q, vq_loss, indices, instance_mask)
+        x_hat = self.decoder(z_q)
+
+        recon_w = instance_mask.unsqueeze(-1).to(dtype=x.dtype) * traj_mask.to(dtype=x.dtype)
+        diff = (x_hat - x) ** 2
+        recon_loss = (diff * recon_w).sum() / recon_w.sum().clamp(min=1.0)
+
+        return {
+            'x_hat': x_hat,
+            'recon_loss': recon_loss,
+            'vq_loss': vq_reduced,
+            'indices': indices,
+            'z': z,
+            'z_q': z_q,
+        }
+
+    def decode_from_indices(self, indices: torch.Tensor, instance_mask: Optional[torch.Tensor] = None):
+        """
+        indices: (B, N, nbooks) long; use -1 only if you will mask via instance_mask.
+        Embedding does not accept -1; invalid slots are looked up with clamp then zeroed.
+        """
+        idx = indices.clamp(min=0)
+        z_q = self.quantizer.get_codebook_entry(idx)
+        if instance_mask is not None:
+            z_q = z_q * instance_mask.unsqueeze(-1).to(dtype=z_q.dtype)
+        return self.decoder(z_q)
+----------------------------------------
+
 文件: utils/get_aug_param.py
 ----------------------------------------
 # -*- encoding: utf-8 -*-
@@ -10195,6 +11402,30 @@ def draw_bev_traj(bev=None,bev_h=200*8,bev_w=80*8,trajs=None,world_x=200,world_y
         cv2.circle(bev, (int(px),int(py)), 1, color, 2)  # 注意：OpenCV使用(x,y)即(列,行)
     return bev
 
+def draw_traj(bev=None,pos = (0,0),bev_h=200*8,bev_w=80*8,trajs=None,masks=None,world_x=200,world_y=80,color=(0,0,255)):
+    # trajs = trajs.astype(np.uint16)
+    ego = (bev_w//2,120*8)
+    if bev is None:
+        bev = np.zeros((bev_h,bev_w,3),dtype=np.uint8) + 255
+    traj_x,traj_y = trajs[:,0],trajs[:,1]
+    piex_y = ego[1] - traj_x * (bev_h /world_x )
+    piex_x = ego[0] - traj_y * (bev_w /world_y )
+
+
+    # x,y = pos
+    # p_y = ego[1] - x * (bev_h /world_x )
+    # p_x = ego[0] - y * (bev_w /world_y )
+    # cv2.circle(bev, (int(p_x),int(p_y)), 2, (0,0,0), 2)
+
+    # print(piex_x,piex_y)
+    for i in range(len(piex_x)):
+    # 用不同颜色表示轨迹点
+        px, py = piex_x[i],piex_y[i]
+        mask = masks[i]
+        if mask==0:continue
+        cv2.circle(bev, (int(px),int(py)), 1, color, 2)  # 注意：OpenCV使用(x,y)即(列,行)
+    return bev
+
 def draw_bev_object(pts, bird_view=None, world_size_x=200, world_size_y=80, 
                     out_size_h=200*8, out_size_w=80*8, ego_position=120,
                     color=(0, 255, 0), thickness=2, draw_edges=True, fill_color=None):
@@ -10418,7 +11649,7 @@ def vis_dynamic_gt(camera_names,label_path,labels,bboxes,label_masks=None,bboxes
             else:
                 color = class_colors[int(label)]
             
-            x, y, z, width, length, height, yaw, vx,vy,vz = bboxes[i]
+            x, y, z, width, length, height, yaw, vx,vy,vz = bboxes[i,:10]
             pitch,roll = 0,0
 
             box3d_lidar = create_3d_bbox_corners([x,y,z],[length,width,height],[roll,pitch,yaw])
@@ -10454,7 +11685,7 @@ def vis_dynamic_gt(camera_names,label_path,labels,bboxes,label_masks=None,bboxes
         else:
             color = class_colors[int(label)]
         
-        x, y, z, width, length, height, yaw, vx,vy,vz = bboxes[i]
+        x, y, z, width, length, height, yaw, vx,vy,vz = bboxes[i,:10]
         pitch,roll = 0,0
         box3d_lidar = create_3d_bbox_corners([x,y,z],[length,width,height],[roll,pitch,yaw])
 
@@ -10469,7 +11700,26 @@ def vis_dynamic_gt(camera_names,label_path,labels,bboxes,label_masks=None,bboxes
             color=class_colors[int(label)],  # 使用分配的颜色
             thickness=2,
             fill_color=color  # 根据visibility_token填充
-        )
+        ) 
+        if traj_mask is not None:
+            if label_mask != 0:
+                dt = 0.1
+                his_len = 5
+                traj_v = bboxes[i,10:].reshape(-1,2)
+                traj_mask = bboxes_masks[i,10:].reshape(-1,2)
+                pos = np.array([x,y])[None]
+                fur_traj = np.cumsum(traj_v[his_len:] * dt,0) + pos
+                history_v = traj_v[:his_len]  
+                history_v_rev = history_v[::-1]
+                history_offset = -np.cumsum(history_v_rev * dt, axis=0)
+                history_coords_rev = pos + history_offset 
+                his_traj = history_coords_rev[::-1]
+                reconstructed = np.vstack([his_traj, fur_traj])
+                bev_img = draw_traj(bev=bev_img,pos={x, y},bev_h=200*8,bev_w=80*8,trajs=reconstructed,masks=traj_mask[:,0],world_x=200,world_y=80,color=class_colors[int(label)])
+            # print(1)
+        # 绘制轨迹
+        cv2.imwrite("bev.jpg",bev_img)
+
     images["bev"] = bev_img
     # cv2.imwrite(f"bev.jpg", bev_img)
     # print("bev",bev_img.shape)
@@ -10860,6 +12110,83 @@ if __name__ == '__main__':
     restore_from_summary('log.txt')
 ----------------------------------------
 
+文件: test_vqvae.py
+----------------------------------------
+# -*- encoding: utf-8 -*-
+'''
+@File         :test_vqvae.py
+@Date         :2026/04/09 14:26:29
+@Author       :Binge.Van
+@E-mail       :afb5szh@bosch.com
+@Version      :V1.0.0
+@Description  :
+
+'''
+
+
+import os,sys
+import torch
+from torch import nn
+from trajectory_dynamic.trajectory_predictor import build_dynamic_trajectory_predictor
+
+def main():
+    pass
+
+
+
+if __name__ == '__main__':
+    device = torch.device('cuda')
+
+    B, N = 4, 55 ###
+    traj_dim = 110 ###
+    instance_feat_dim = 256####
+    anchor_dim = 11###
+
+    nbooks = 1
+
+    traj = build_dynamic_trajectory_predictor(
+        obj_num = N,
+        instance_feat_dim = instance_feat_dim,
+        anchor_dim = anchor_dim,
+        d_model = 256,
+        nhead = 4,
+        num_layers = 3,
+        traj_dim = traj_dim,
+        vqvae_num_slots = 1024,
+        e_dim = 256,
+        n_e = 512,
+        nbooks = nbooks,
+        freeze_vqvae = False,
+    ).to(device)
+    
+    
+    instance_feature = torch.randn(B, N, instance_feat_dim, device=device, requires_grad=True)
+    anchor = torch.randn(B, N, anchor_dim, device=device, requires_grad=True)
+    gt_traj = torch.randn(B, N, traj_dim, device=device)
+    traj_mask = torch.ones(B, N, traj_dim, device=device)
+    instance_mask = torch.ones(B, N, device=device)
+    instance_mask[:, 80:] = 0
+
+    out = traj(
+        instance_feature,
+        anchor,
+        instance_mask,
+        gt_traj=gt_traj,
+        traj_mask=traj_mask,
+        decode_trajectory=True,
+    )
+
+    assert out['loss'] is not None
+    out['loss'].backward()
+
+    assert out['decoded_traj'] is not None
+    assert out['decoded_traj'].shape == (B, N, traj_dim)
+    assert out['pred_indices'].shape == (B, N, nbooks)
+    print('loss', float(out['loss']))
+    print('decoded_traj', tuple(out['decoded_traj'].shape))
+    print('pred_indices', tuple(out['pred_indices'].shape))
+----------------------------------------
+
 文件: train.py
 ----------------------------------------
 # -*- encoding: utf-8 -*-
@@ -10877,7 +12204,7 @@ import sys
 import json
 import argparse
 
-
+from tqdm import tqdm
 import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
@@ -10903,6 +12230,20 @@ from tensorboardX import SummaryWriter
 from collections.abc import Mapping, Sequence
 import logging
 import time
+
+
+def set_seed(seed=42):
+    
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # 多GPU
+    # 确保卷积算法确定性（可能降低性能）
+    # torch.backends.cudnn.deterministic = True
+    # torch.backends.cudnn.benchmark = False
+    # 可选：设置 Python 哈希种子
+    os.environ['PYTHONHASHSEED'] = str(seed)
 
 # 创建日志目录
 # log_dir = configs["log_dir"]
@@ -10956,6 +12297,9 @@ def main():
         device=torch.device("cuda", args.local_rank)
         torch.distributed.init_process_group(backend="nccl", init_method='env://')
 
+
+    set_seed(seed=42)
+
     device = configs["device"]
     model = Model(configs).to(device)
 
@@ -10984,10 +12328,14 @@ def main():
                 model.load_state_dict(checkpoint["state_dict"], strict=False)
 
     # 配置参数
-    seq_len = configs["seq_len"]
     batch_size = configs["batch_size"]
-    batchidx  = batch_size-1
-    cur_idx = 0
+    current_frame_index = configs["current_frame_index"]
+    seq_len = configs["seq_len"]
+    mini_batch = current_frame_index + 1
+    batchidx  = batch_size -1
+    cur_idx = seq_len-1
+    steps_acc = mini_batch + 1 - seq_len
+
     epochs = configs["epoch"]
     load_types = configs["load_types"]
     types_names = sorted(list(load_types.keys()))
@@ -11021,14 +12369,11 @@ def main():
             useful_type_names.append(type_name)
         
     steps_per_epoch = max(len(dl) for _, dl, _ in active)
-    
+    logging.info(f"steps_per_epoch: {steps_per_epoch}")
 
 
-    total_steps = epochs * steps_per_epoch * (configs["current_frame_index"] - seq_len + 1)
-    logging.info(f"epochs: {epochs}; steps_per_epoch: {steps_per_epoch}, total_steps:{total_steps}")
-
-
-    warmup_steps =  int(0.05 * total_steps) 
+    total_steps = epochs * steps_per_epoch
+    warmup_steps = configs["warmup_steps"]# int(0.05 * total_steps) 
     scheduler = create_scheduler_with_warmup(
         optimizer,
         warmup_steps=warmup_steps,
@@ -11070,9 +12415,6 @@ def main():
         iters = [iter(dl) for _, dl, _ in active]
         
         for batch_idx in range(steps_per_epoch):
-
-            
-
             torch.cuda.empty_cache()
 
             batches = [] 
@@ -11089,7 +12431,7 @@ def main():
             gts_values = {}
             gt_names = configs["gt_names"]
             
-            input_names = configs["input_names"]  
+            input_names = configs["input_names"]  #["x","rots","trans","intrins","distorts","post_rots","post_trans","ego_poses"]
             for type_name, batch in batches:
                 for input_name in input_names:
                     if input_name not in inputs_tensor.keys():
@@ -11113,47 +12455,49 @@ def main():
             # 组装 metas（把 dynamic / static 的真值合并）
             metas = recursive_to_device(gts_values,device) #metas["dynamic"]["gt_labels_det3D"] =  list(2, 5, n*d)
 
-            min_batch_num = inputs_tensor["x"].shape[2]
-            bev_feats = []
-            for mb in range(min_batch_num):
-                x = inputs_tensor["x"][:,:,mb:mb+1]    # torch.Size([2, 1, 5, 8, 3, 128, 384])
-                rots = inputs_tensor["rots"][:,:,mb:mb+1]
-                trans = inputs_tensor["trans"][:,:,mb:mb+1] # torch.Size([2, 1, 5, 8, 1, 3])
-                intrins = inputs_tensor["intrins"][:,:,mb:mb+1]
-                distorts = inputs_tensor["distorts"][:,:,mb:mb+1]
-                post_rots = inputs_tensor["post_rots"][:,:,mb:mb+1]
-                post_trans = inputs_tensor["post_trans"][:,:,mb:mb+1]
-                ego_pose = inputs_tensor["ego_pose"][:,:,mb+1-seq_len:mb+1]
-                if mb < seq_len -1 : # 0 1 2 3
+            iteration += 1
+            # mini_batch = inputs_tensor["x"].shape[2]
+            # steps_acc = mini_batch - seq_len
+            pre_bev = []
+            for ii in tqdm(range(mini_batch), desc="Processing frames",leave=False):
+                x = inputs_tensor["x"][:,:,ii:ii+1]
+                rots = inputs_tensor["rots"][:,:,ii:ii+1]
+                trans = inputs_tensor["trans"][:,:,ii:ii+1]
+                intrins = inputs_tensor["intrins"][:,:,ii:ii+1]
+                distorts = inputs_tensor["distorts"][:,:,ii:ii+1]
+                post_rots = inputs_tensor["post_rots"][:,:,ii:ii+1]
+                post_trans = inputs_tensor["post_trans"][:,:,ii:ii+1]
+                ego_poses = inputs_tensor["ego_poses"][:,:,:ii+1][:,:,-1*seq_len:]
+
+                metas_ii = {}
+                for type,gt_infos in metas.items():
+                    type_gts = {}
+                    for key,gts in gt_infos.items(): # key,gts = gt_labels_det3D,gts
+                        gts_batch = []
+                        for gt in gts:
+                            gts_batch.append([gt[ii]])
+                        type_gts[key] = gts_batch
+                    metas_ii[type] = type_gts
+
+                
+                if ii < cur_idx:
                     with torch.no_grad():
-                        outputs = model(x, rots, trans, intrins, distorts, post_rots, post_trans, [],
-                            metas=None,
+                        outputs = model(x, rots,trans, intrins,distorts,post_rots,post_trans,ego_poses,pre_bev=pre_bev,
+                            metas=metas_ii,
                             decoder= False,
                             task_names=useful_type_names,
-                            pre_features=bev_feats,
-                            pre_stream= True,
+                            prepare_pre_bev = True
                         )
                 else:
-                    iteration +=1
-                    metas_mb = {}
-                    for tyepe_name,type_gt in metas.items():
-                        new_type_gt = {}
-                        for key,gts in type_gt.items():
-                            bi_gts = []
-                            for gt in gts:
-                                bi_gts.append([gt[mb - (seq_len-1)]])
-                            new_type_gt[key] = bi_gts
-                        metas_mb[tyepe_name] = new_type_gt
-
-                    outputs = model(x, rots, trans, intrins, distorts, post_rots, post_trans, ego_pose,
-                        metas=metas_mb,
+                    outputs = model(x, rots,trans, intrins,distorts,post_rots,post_trans,ego_poses,pre_bev=pre_bev,
+                        metas=metas_ii,
                         decoder= True if iteration % log_save_interval == 0 else False,
                         task_names=useful_type_names,
-                        pre_features=bev_feats,
-                        pre_stream= False,
+                        prepare_pre_bev = False
                     )
-                bev_feats.append(outputs["bev_feat"].detach())
-                bev_feats = bev_feats[-1*(seq_len -1):]
+
+                pre_bev.append(outputs["cur_bev"].detach())
+                pre_bev = pre_bev[-1*(seq_len-1):]
 
                 total_loss = outputs.get("total_loss", None)
                 if total_loss is None:
@@ -11163,122 +12507,125 @@ def main():
                 # total_loss.backward()
                 # optimizer.step()
 
-                total_loss.backward()
+                # total_loss.backward()
+
+                scaled_loss = total_loss / steps_acc
+                scaled_loss.backward()
                     
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
 
-                # iteration += 1
-
-
-                if iteration % log_print_interval == 0:
-                    current_lr = optimizer.param_groups[0]['lr']
-                    writer.add_scalar('epoch', epoch, iteration)
-                    writer.add_scalar('lr', current_lr, iteration)
-                    logging.info(f"Iteration [{iteration}] Epoch [{epoch+1}/{epochs}] Step [{batch_idx+1}/{steps_per_epoch}]; LR: {current_lr:.6f}; "
-                        f"loss: {float(total_loss.detach().cpu()):.4f}")
-                    message = "/t"
-                    writer.add_scalar('all_loss/loss', total_loss, iteration)
-                    losses = outputs.get("losses", None)
-                    if losses is not None:
-                        for k,v in losses.items():
-                            if k.startswith("det3d_"):
-                                if "dn" in k:
-                                    writer.add_scalar(k.replace("det3d_","det3d/dn/"), v, iteration)
-                                else:
-                                    writer.add_scalar(k.replace("det3d_","det3d/ori/"), v, iteration)
-                            elif k.startswith("map3d_"):
-                                writer.add_scalar(k.replace("map3d_","map3d/"), v, iteration)
-                            message += f"{k}:{float(v.detach().cpu()):.4f}; "
-                    logging.info(message)
+                
 
 
-                if iteration % log_save_interval == 0:
-                    # 可视化真值
+            if iteration % log_print_interval == 0:
+                current_lr = optimizer.param_groups[0]['lr']
+                writer.add_scalar('epoch', epoch, iteration)
+                writer.add_scalar('lr', current_lr, iteration)
+                logging.info(f"Iteration [{iteration}] Epoch [{epoch+1}/{epochs}] Step [{batch_idx+1}/{steps_per_epoch}]; LR: {current_lr:.6f}; "
+                    f"loss: {float(total_loss.detach().cpu()):.4f}")
+                message = "/t"
+                writer.add_scalar('all_loss/loss', total_loss, iteration)
+                losses = outputs.get("losses", None)
+                if losses is not None:
+                    for k,v in losses.items():
+                        if k.startswith("det3d_"):
+                            if "dn" in k:
+                                writer.add_scalar(k.replace("det3d_","det3d/dn/"), v, iteration)
+                            else:
+                                writer.add_scalar(k.replace("det3d_","det3d/ori/"), v, iteration)
+                        elif k.startswith("map3d_"):
+                            writer.add_scalar(k.replace("map3d_","map3d/"), v, iteration)
+                        message += f"{k}:{float(v.detach().cpu()):.4f}; "
+                logging.info(message)
+
+
+            if iteration % log_save_interval == 0:
+                # 可视化真值
+                
+
+                from dataset.dataset import denormalize_img
+                import cv2
+                imgs = inputs_tensor["x"][batchidx,:,cur_idx]
+                for j, type_name in enumerate(type_names):
+                    for i, img in enumerate(imgs[j]) :
+                        img_np =  denormalize_img(img)
+                        img_cv = cv2.cvtColor(np.array(img_np), cv2.COLOR_RGB2BGR)
+                        # cv2.imwrite(f"{j}_{i}.jpg", img_cv)
+                        writer.add_image(f'{type_name}/input_img/{i}', img_cv, global_step=iteration, dataformats='HWC')
+
+
+
+                camera_names = configs["camera_names"]
+                if "dynamic" in metas.keys():
+                    meta = metas["dynamic"]
+                    label_path = meta["label_path"][batchidx][cur_idx]# 最后一个batch的最后一帧(当前在)
+                    gt_labels_det3D = meta["gt_labels_det3D"][batchidx][cur_idx].cpu().numpy()
+                    gt_bboxes_det3D = meta["gt_bboxes_det3D"][batchidx][cur_idx].cpu().numpy()
+                    gt_labels_det3D_mask = meta["gt_labels_det3D_mask"][batchidx][cur_idx].cpu().numpy()
                     
+                    from utils.vis_gt import vis_dynamic_gt,vis_dynamic_pred
+                    gt_dynamic_canvas,gt_dynamic_images = vis_dynamic_gt(camera_names,label_path, gt_labels_det3D, gt_bboxes_det3D, gt_labels_det3D_mask, None)
+                    
+                    # 预测值
+                    det3d_result = outputs["det3d_result"][-1]
+                    boxes_3d = det3d_result["boxes_3d"].detach().cpu().numpy()
+                    scores_3d = det3d_result["scores_3d"].detach().cpu().numpy()
+                    labels_3d = det3d_result["labels_3d"].detach().cpu().numpy()
+                    cls_scores = det3d_result["cls_scores"].detach().cpu().numpy()
 
-                    from dataset.dataset import denormalize_img
-                    import cv2
-                    imgs = x[batchidx,:,cur_idx].cpu()
-                    for j, type_name in enumerate(type_names):
-                        for i, img in enumerate(imgs[j]) :
-                            img_np =  denormalize_img(img)
-                            img_cv = cv2.cvtColor(np.array(img_np), cv2.COLOR_RGB2BGR)
-                            # cv2.imwrite(f"{j}_{i}.jpg", img_cv)
-                            writer.add_image(f'{type_name}/input_img/{i}', img_cv, global_step=iteration, dataformats='HWC')
-
-
-
-                    camera_names = configs["camera_names"]
-                    if "dynamic" in metas_mb.keys():
-                        meta = metas_mb["dynamic"]
-                        label_path = meta["label_path"][batchidx][cur_idx]# 最后一个batch的最后一帧(当前在)
-                        gt_labels_det3D = meta["gt_labels_det3D"][batchidx][cur_idx].cpu().numpy()
-                        gt_bboxes_det3D = meta["gt_bboxes_det3D"][batchidx][cur_idx].cpu().numpy()
-                        gt_labels_det3D_mask = meta["gt_labels_det3D_mask"][batchidx][cur_idx].cpu().numpy()
-                        
-                        from utils.vis_gt import vis_dynamic_gt,vis_dynamic_pred
-                        gt_dynamic_canvas,gt_dynamic_images = vis_dynamic_gt(camera_names,label_path, gt_labels_det3D, gt_bboxes_det3D, gt_labels_det3D_mask, None)
-                        
-                        # 预测值
-                        det3d_result = outputs["det3d_result"][-1]
-                        boxes_3d = det3d_result["boxes_3d"].detach().cpu().numpy()
-                        scores_3d = det3d_result["scores_3d"].detach().cpu().numpy()
-                        labels_3d = det3d_result["labels_3d"].detach().cpu().numpy()
-                        cls_scores = det3d_result["cls_scores"].detach().cpu().numpy()
-
-                        pt_dynamic_canvas,pt_dynamic_images = vis_dynamic_pred(
-                                                                    camera_names=camera_names,  # 来自 config/config.py
-                                                                    label_path=label_path,
-                                                                    boxes_3d=boxes_3d,
-                                                                    scores_3d=scores_3d,
-                                                                    labels_3d=labels_3d,
-                                                                    score_thresh=0.3  # 可调
-                                                                ) #img_cv = cv2.cvtColor(np.array(img_np), cv2.COLOR_RGB2BGR)
-                        for k,v in gt_dynamic_images.items():
-                            writer.add_image(f'dynamic/gt/{k}', cv2.cvtColor(v, cv2.COLOR_RGB2BGR), global_step=iteration, dataformats='HWC')
-                        for k,v in pt_dynamic_images.items():  
-                            writer.add_image(f'dynamic/pt/{k}', cv2.cvtColor(v, cv2.COLOR_RGB2BGR), global_step=iteration, dataformats='HWC')
-
-
-
-                    if "static" in metas_mb.keys():
-                        meta = metas_mb["static"]
-                        label_path = meta["label_path"][batchidx][cur_idx]
-                        gt_labels_map3D = meta["gt_labels_map3D"][batchidx][cur_idx].cpu().numpy()
-                        gt_pts_map3D = meta["gt_pts_map3D"][batchidx][cur_idx].cpu().numpy()
-
-                        from utils.vis_gt import vis_static_gt
-                        gt_static_canvas,gt_static_images = vis_static_gt(camera_names,label_path,gt_labels_map3D,gt_pts_map3D)
-
-
-                        # 2) 画预测
-                        # map_polylines 是 decode 出的结果，通常是 list 长度 B*T
-                        map_polylines = outputs["map3d_out"]["map_polylines"]
-                        poly = map_polylines[batchidx * seq_len + cur_idx]
-                        pred_labels = poly["labels"].detach().cpu().numpy()
-                        if poly["pts"].dim() == 3:
-                                pred_pts = poly["pts"].detach().cpu().numpy()
-                        else:
-                            # (N, num_orders, num_pts, 2)，取 order=0
-                            pred_pts = poly["pts"][:, 0].detach().cpu().numpy()
-
-                        pt_static_canvas,pt_static_images = vis_static_gt(
-                                                                camera_names=camera_names,
+                    pt_dynamic_canvas,pt_dynamic_images = vis_dynamic_pred(
+                                                                camera_names=camera_names,  # 来自 config/config.py
                                                                 label_path=label_path,
-                                                                labels=pred_labels,
-                                                                pts=pred_pts,
-                                                            )
+                                                                boxes_3d=boxes_3d,
+                                                                scores_3d=scores_3d,
+                                                                labels_3d=labels_3d,
+                                                                score_thresh=0.3  # 可调
+                                                            ) #img_cv = cv2.cvtColor(np.array(img_np), cv2.COLOR_RGB2BGR)
+                    for k,v in gt_dynamic_images.items():
+                        writer.add_image(f'dynamic/gt/{k}', cv2.cvtColor(v, cv2.COLOR_RGB2BGR), global_step=iteration, dataformats='HWC')
+                    for k,v in pt_dynamic_images.items():  
+                        writer.add_image(f'dynamic/pt/{k}', cv2.cvtColor(v, cv2.COLOR_RGB2BGR), global_step=iteration, dataformats='HWC')
 
-                        for k,v in gt_static_images.items():
-                            writer.add_image(f'static/gt/{k}', cv2.cvtColor(v, cv2.COLOR_RGB2BGR), global_step=iteration, dataformats='HWC')
-                        for k,v in pt_static_images.items():
-                            writer.add_image(f'static/pt/{k}', cv2.cvtColor(v, cv2.COLOR_RGB2BGR), global_step=iteration, dataformats='HWC')
 
 
-                if iteration % ckpt_save_interval == 0:
+                if "static" in metas.keys():
+                    meta = metas["static"]
+                    label_path = meta["label_path"][batchidx][cur_idx]
+                    gt_labels_map3D = meta["gt_labels_map3D"][batchidx][cur_idx].cpu().numpy()
+                    gt_pts_map3D = meta["gt_pts_map3D"][batchidx][cur_idx].cpu().numpy()
+
+                    from utils.vis_gt import vis_static_gt
+                    gt_static_canvas,gt_static_images = vis_static_gt(camera_names,label_path,gt_labels_map3D,gt_pts_map3D)
+
+
+                    # 2) 画预测
+                    # map_polylines 是 decode 出的结果，通常是 list 长度 B*T
+                    map_polylines = outputs["map3d_out"]["map_polylines"]
+                    poly = map_polylines[batchidx * seq_len + cur_idx]
+                    pred_labels = poly["labels"].detach().cpu().numpy()
+                    if poly["pts"].dim() == 3:
+                            pred_pts = poly["pts"].detach().cpu().numpy()
+                    else:
+                        # (N, num_orders, num_pts, 2)，取 order=0
+                        pred_pts = poly["pts"][:, 0].detach().cpu().numpy()
+
+                    pt_static_canvas,pt_static_images = vis_static_gt(
+                                                            camera_names=camera_names,
+                                                            label_path=label_path,
+                                                            labels=pred_labels,
+                                                            pts=pred_pts,
+                                                        )
+
+                    for k,v in gt_static_images.items():
+                        writer.add_image(f'static/gt/{k}', cv2.cvtColor(v, cv2.COLOR_RGB2BGR), global_step=iteration, dataformats='HWC')
+                    for k,v in pt_static_images.items():
+                        writer.add_image(f'static/pt/{k}', cv2.cvtColor(v, cv2.COLOR_RGB2BGR), global_step=iteration, dataformats='HWC')
+
+
+            if iteration % ckpt_save_interval == 0:
                     model.eval()
                     torch.save(model.state_dict(), os.path.join(log_dir,f"iter{iteration}.pth"))
                     model.train()
@@ -11302,25 +12649,30 @@ if __name__ == "__main__":
     main()
 ----------------------------------------
 
-文件: train_accu.py
+文件: train_gpuxn.py
 ----------------------------------------
 # -*- encoding: utf-8 -*-
 '''
-@File         :train_accu.py
-@Date         :2026/04/02
+@File         :train.py
+@Date         :2026/03/07 13:31:48
 @Author       :Binge.Van
-@Description  :在 train.py 基础上，对 min_batch_num 内多个 mb 的 loss 做梯度累积，
-               循环结束后再 clip / optimizer.step / scheduler.step，等效更大 batch。
-               学习率调度按「外层 step」（每个 dataloader batch 一次更新）计数。
+@E-mail       :1367955240@qq.com
+@Version      :V1.0.0
+@Description  :
+
 '''
 import os
+import sys
 import json
 import argparse
 import random
-
+from tqdm import tqdm
 import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
+from torch import nn
+from torch.optim import lr_scheduler
+
 from config.config import configs
 from dataset.dataset import build_dataloader
 
@@ -11330,8 +12682,8 @@ cudnn.deterministic = True
 cudnn.benchmark = True
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.enabled = True
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
+torch.backends.cuda.matmul.allow_tf32=True
+torch.backends.cudnn.allow_tf32=True
 torch.multiprocessing.set_sharing_strategy('file_system')
 
 from tensorboardX import SummaryWriter
@@ -11340,6 +12692,7 @@ from tensorboardX import SummaryWriter
 from collections.abc import Mapping, Sequence
 import logging
 import time
+
 
 def set_seed(seed=42):
     
@@ -11354,64 +12707,88 @@ def set_seed(seed=42):
     # 可选：设置 Python 哈希种子
     os.environ['PYTHONHASHSEED'] = str(seed)
 
+# 创建日志目录
+# log_dir = configs["log_dir"]
+# os.makedirs(log_dir, exist_ok=True)
 def create_scheduler_with_warmup(optimizer, warmup_steps, total_steps, base_lr, eta_min=0):
+    # 定义 warmup 阶段的学习率因子
     def lambda_lr(step):
         if step < warmup_steps:
-            return step / warmup_steps
+            return step / warmup_steps  # 线性增长到 1
         else:
+            # 超过 warmup 后，因子保持 1，让 CosineAnnealingLR 接手
             return 1.0
 
     warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda_lr)
+    # 余弦退火调度器（假设从 base_lr 开始衰减）
     cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=total_steps - warmup_steps, eta_min=eta_min
     )
+    # 将两个调度器串联
     scheduler = torch.optim.lr_scheduler.SequentialLR(
         optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_steps]
     )
     return scheduler
 
-
 def recursive_to_device(data, device):
+    """
+    递归地将嵌套数据结构中的所有 torch.Tensor 转移到指定设备。
+    支持 dict、list、tuple 以及它们的任意组合。
+    """
     if isinstance(data, torch.Tensor):
         return data.to(device)
-    elif isinstance(data, Mapping):
+    elif isinstance(data, Mapping):  # 处理字典
         return {k: recursive_to_device(v, device) for k, v in data.items()}
-    elif isinstance(data, Sequence) and not isinstance(data, str):
+    elif isinstance(data, Sequence) and not isinstance(data, str):  # 处理列表/元组（排除字符串）
         return [recursive_to_device(item, device) for item in data]
     else:
+        # 其他类型（int, float, str, None, np.ndarray 等）直接返回
+        # 如果你希望将 numpy 数组也转为 Tensor 并移到设备，可以在这里添加相应逻辑
         return data
-
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--local_rank", default=-1, type=int)
+    parser.add_argument("--local_rank", default = -1, type=int)
     args = parser.parse_args()
 
     script_path = os.path.abspath(__file__)
 
-    if args.local_rank != -1:
-        torch.cuda.set_device(args.local_rank)
-        device = torch.device("cuda", args.local_rank)
+    if 'LOCAL_RANK' in os.environ:
+        local_rank = int(os.environ['LOCAL_RANK'])
+    else:
+        local_rank = args.local_rank
+    
+
+    if local_rank != -1:
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
         torch.distributed.init_process_group(backend="nccl", init_method='env://')
         rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
     else:
-        device = configs["device"]
+        device = configs.get("device", "cuda")
         rank = 0
         world_size = 1
-        
+
+
     set_seed(seed=42)
 
-    # device = configs["device"]
+
     model = Model(configs).to(device)
-    if args.local_rank != -1:
+    if local_rank != -1:
         model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[args.local_rank], output_device=args.local_rank,
+            model, device_ids=[local_rank], output_device=local_rank,
             find_unused_parameters=True
         )
 
+    # BN层多卡数据共享均值方差
+    num_gpus = torch.cuda.device_count()
+    
+    
+
     path_checkpoint = configs.get("pretrain", None)
     strict = False
+    checkpoint = None
     if path_checkpoint is not None:
         checkpoint = torch.load(path_checkpoint, map_location=device)
         if "state_dict" not in checkpoint.keys():
@@ -11421,10 +12798,10 @@ def main():
         else:
             state_dict = checkpoint["state_dict"]
         
-        if args.local_rank != -1 and not any(k.startswith('module.') for k in state_dict):
+        if local_rank != -1 and not any(k.startswith('module.') for k in state_dict):
                 # 添加 'module.' 前缀
             state_dict = {'module.' + k: v for k, v in state_dict.items()}
-        elif args.local_rank == -1 and any(k.startswith('module.') for k in state_dict):
+        elif local_rank == -1 and any(k.startswith('module.') for k in state_dict):
             # 去除 'module.' 前缀
             state_dict = {k[7:]: v for k, v in state_dict.items()}
 
@@ -11434,22 +12811,35 @@ def main():
         except Exception:
             model.load_state_dict(state_dict, strict=False)
 
-    seq_len = configs["seq_len"]
+    # 配置参数
     batch_size = configs["batch_size"]
-    batchidx = batch_size - 1
-    cur_idx = 0
+    current_frame_index = configs["current_frame_index"]
+    seq_len = configs["seq_len"]
+    mini_batch = current_frame_index + 1
+    batchidx  = batch_size -1
+    cur_idx = seq_len-1
+    steps_acc = mini_batch + 1 - seq_len
+
     epochs = configs["epoch"]
     load_types = configs["load_types"]
     types_names = sorted(list(load_types.keys()))
-    lr = configs.get("lr", 1e-3)
+    # 优化器（可按需改成 AdamW 等）
+    total_lr = configs.get("lr", 1e-3)          # config 中的 lr 视为总学习率
+    if world_size > 1:
+        lr = total_lr / world_size              # 单卡学习率 = 总学习率 / GPU 数量
+    else:
+        lr = total_lr
     weight_decay = configs.get("weight_decay", 1e-4)
     max_grad_norm = configs.get("max_grad_norm", 5)
     
-
-    log_dir = os.path.join(os.path.dirname(script_path), configs["log_dir"])
+    
+    log_dir = os.path.join(os.path.dirname(script_path),configs["log_dir"])
+    # os.makedirs(log_dir,exist_ok=True)
+    # 日志文件名（带时间戳）
+    # log_file = os.path.join(log_dir, f"train_{time.strftime('%Y%m%d_%H%M%S')}.log")
     if rank == 0:
         os.makedirs(log_dir, exist_ok=True)
-        log_file = os.path.join(log_dir, f"train_accu_{time.strftime('%Y%m%d_%H%M%S')}.log")
+        log_file = os.path.join(log_dir, f"train_{time.strftime('%Y%m%d_%H%M%S')}.log")
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s',
@@ -11465,29 +12855,21 @@ def main():
         # 禁用非主进程的日志输出
         logging.basicConfig(level=logging.ERROR)
 
-    
 
     active = []
     useful_type_names = []
-    for i, type_name in enumerate(types_names):
+    for i,type_name in enumerate(types_names):
         if load_types[type_name]:
-            dataloader, sampler = build_dataloader(configs, mode=type_name)
+            dataloader,sampler = build_dataloader(configs,mode=type_name)
             active.append((type_name, dataloader, sampler))
             useful_type_names.append(type_name)
-
+        
     steps_per_epoch = max(len(dl) for _, dl, _ in active)
+    logging.info(f"steps_per_epoch: {steps_per_epoch}")
 
-    # 累积版：每个 dataloader batch 只 optimizer.step 一次，调度器步数与外层对齐
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay,betas=(0.9,0.95))
     total_steps = epochs * steps_per_epoch
-    if rank == 0:
-        logging.info(
-            f"[train_accu] epochs: {epochs}; steps_per_epoch: {steps_per_epoch}, "
-            f"total_steps (optimizer steps): {total_steps}"
-        )
-    optimizer = torch.optim.Adam(
-        model.parameters(), lr=lr, weight_decay=weight_decay, betas=(0.9, 0.95)
-    )
-    warmup_steps = int(0.05 * total_steps)
+    warmup_steps = configs["warmup_steps"]# int(0.05 * total_steps) 
     scheduler = create_scheduler_with_warmup(
         optimizer,
         warmup_steps=warmup_steps,
@@ -11495,40 +12877,48 @@ def main():
         base_lr=lr,
         eta_min=0
     )
+    if rank == 0:
+        logging.info(
+            f"[train] epochs: {epochs}; steps_per_epoch: {steps_per_epoch}, "
+            f"total_steps (optimizer steps): {total_steps}"
+        )
+        logging.info(f"Total LR (global): {total_lr:.2e}, Per-GPU LR: {lr:.2e}, world_size: {world_size}")
+    # scheduler = lr_scheduler.CosineAnnealingLR(optimizer,T_max=steps_per_epoch*epochs,eta_min=0)
 
     iteration = -1
     start_epoch = 0
-    if strict and configs["resume"]:
-        optimizer.load_state_dict(checkpoint['optimizer'])
+    if  strict and configs["resume"]:      
+        optimizer.load_state_dict(checkpoint['optimizer'])  # 加载优化器参数
         for state in optimizer.state.values():
             for k, v in state.items():
                 if isinstance(v, torch.Tensor):
                     state[k] = v.to(device)
-        scheduler.load_state_dict(checkpoint['lr_schedule'])
+        scheduler.load_state_dict(checkpoint['lr_schedule'])  # 加载优化器参数
         iteration = checkpoint['iteration'] + 1
         start_epoch = checkpoint['epoch']
 
+    
     log_print_interval = configs.get("log_print_interval", 10)
     log_save_interval = configs.get("log_save_interval", 100)
     ckpt_save_interval = configs.get("ckpt_save_interval", 100)
-
     
+    # 
+    # os.system(f"cp {config_path} {log_dir}")
     # writer = SummaryWriter(logdir=log_dir)
-
+    
+    # logging.info("Config:\n"+json.dumps(configs,indent=4))
     model.train()
-
-    for epoch in range(start_epoch, epochs):
+    for epoch in range(start_epoch,epochs):
         np.random.seed()
         for _, _, sp in active:
             if sp is not None and hasattr(sp, "set_epoch"):
                 sp.set_epoch(epoch)
         iters = [iter(dl) for _, dl, _ in active]
-
+        
         for batch_idx in range(steps_per_epoch):
-
             # torch.cuda.empty_cache()
 
-            batches = []
+            batches = [] 
             type_names = []
             for i, (type_name, dl, _) in enumerate(active):
                 try:
@@ -11538,19 +12928,17 @@ def main():
                     batch = next(iters[i])
                 batches.append((type_name, batch))
                 type_names.append(type_name)
-            inputs_tensor = {}
+            inputs_tensor = {} # bs, M, T, 8, 3, 128, 384
             gts_values = {}
             gt_names = configs["gt_names"]
-
-            input_names = configs["input_names"]
+            
+            input_names = configs["input_names"]  #["x","rots","trans","intrins","distorts","post_rots","post_trans","ego_poses"]
             for type_name, batch in batches:
                 for input_name in input_names:
                     if input_name not in inputs_tensor.keys():
-                        inputs_tensor[input_name] = batch[input_name][:, None]
+                        inputs_tensor[input_name] = batch[input_name][:,None]
                     else:
-                        inputs_tensor[input_name] = torch.cat(
-                            [inputs_tensor[input_name], batch[input_name][:, None]], 1
-                        )
+                        inputs_tensor[input_name] = torch.cat([inputs_tensor[input_name],batch[input_name][:,None]],1)
                 names = gt_names[type_name]
                 gts_value = {}
                 for name in names:
@@ -11558,216 +12946,234 @@ def main():
                         continue
                     gts_value[name] = batch[name]
                 gts_values[type_name] = gts_value
-
+            
+            # 将输入搬到 device
+            # device = configs["device"]
             for k, v in inputs_tensor.items():
                 if isinstance(v, torch.Tensor):
                     inputs_tensor[k] = v.to(device)
 
-            metas = recursive_to_device(gts_values, device)
-
-            min_batch_num = inputs_tensor["x"].shape[2]
-            # 与 train.py 一致：mb >= seq_len-1 的步数；loss 按此平均，使梯度尺度接近逐步 step 时对 loss 取平均
-            total_accu_steps = max(1, min_batch_num - (seq_len - 1))
-
-            bev_feats = []
+            # 组装 metas（把 dynamic / static 的真值合并）
+            metas = recursive_to_device(gts_values,device) #metas["dynamic"]["gt_labels_det3D"] =  list(2, 5, n*d)
             optimizer.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
+            iteration += 1
+            pre_bev = []
+            for ii in tqdm(range(mini_batch), desc="Processing frames",leave=False):
+                x = inputs_tensor["x"][:,:,ii:ii+1]
+                rots = inputs_tensor["rots"][:,:,ii:ii+1]
+                trans = inputs_tensor["trans"][:,:,ii:ii+1]
+                intrins = inputs_tensor["intrins"][:,:,ii:ii+1]
+                distorts = inputs_tensor["distorts"][:,:,ii:ii+1]
+                post_rots = inputs_tensor["post_rots"][:,:,ii:ii+1]
+                post_trans = inputs_tensor["post_trans"][:,:,ii:ii+1]
+                ego_poses = inputs_tensor["ego_poses"][:,:,:ii+1][:,:,-1*seq_len:]
 
-            for mb in range(min_batch_num):
-                x = inputs_tensor["x"][:, :, mb:mb + 1]
-                rots = inputs_tensor["rots"][:, :, mb:mb + 1]
-                trans = inputs_tensor["trans"][:, :, mb:mb + 1]
-                intrins = inputs_tensor["intrins"][:, :, mb:mb + 1]
-                distorts = inputs_tensor["distorts"][:, :, mb:mb + 1]
-                post_rots = inputs_tensor["post_rots"][:, :, mb:mb + 1]
-                post_trans = inputs_tensor["post_trans"][:, :, mb:mb + 1]
-                ego_pose = inputs_tensor["ego_pose"][:, :, mb + 1 - seq_len:mb + 1]
-                if mb < seq_len - 1:
+                metas_ii = {}
+                for type,gt_infos in metas.items():
+                    type_gts = {}
+                    for key,gts in gt_infos.items(): # key,gts = gt_labels_det3D,gts
+                        gts_batch = []
+                        for gt in gts:
+                            gts_batch.append([gt[ii]])
+                        type_gts[key] = gts_batch
+                    metas_ii[type] = type_gts
+
+                
+                if ii < cur_idx:
                     with torch.no_grad():
-                        outputs = model(
-                            x, rots, trans, intrins, distorts, post_rots, post_trans, [],
-                            metas=None,
-                            decoder=False,
+                        outputs = model(x, rots,trans, intrins,distorts,post_rots,post_trans,ego_poses,pre_bev=pre_bev,
+                            metas=metas_ii,
+                            decoder= False,
                             task_names=useful_type_names,
-                            pre_features=bev_feats,
-                            pre_stream=True,
+                            prepare_pre_bev = True
                         )
                 else:
-                    # iteration += 1
-                    metas_mb = {}
-                    for tyepe_name, type_gt in metas.items():
-                        new_type_gt = {}
-                        for key, gts in type_gt.items():
-                            bi_gts = []
-                            for gt in gts:
-                                bi_gts.append([gt[mb - (seq_len - 1)]])
-                            new_type_gt[key] = bi_gts
-                        metas_mb[tyepe_name] = new_type_gt
-
-                    outputs = model(
-                        x, rots, trans, intrins, distorts, post_rots, post_trans, ego_pose,
-                        metas=metas_mb,
-                        decoder=True if iteration % log_save_interval == 0 else False,
+                    outputs = model(x, rots,trans, intrins,distorts,post_rots,post_trans,ego_poses,pre_bev=pre_bev,
+                        metas=metas_ii,
+                        decoder= True if iteration % log_save_interval == 0 else False,
                         task_names=useful_type_names,
-                        pre_features=bev_feats,
-                        pre_stream=False,
+                        prepare_pre_bev = False
                     )
-                
+
+                pre_bev.append(outputs["cur_bev"].detach())
+                pre_bev = pre_bev[-1*(seq_len-1):]
 
                 total_loss = outputs.get("total_loss", None)
                 if total_loss is None:
                     continue
 
-                scaled_loss = total_loss / total_accu_steps
-                if mb == min_batch_num - 1:   # 最后一个 mb
+
+                scaled_loss = total_loss / steps_acc
+                # if ii == mini_batch - 1:   # 最后一个 mb
+                #     scaled_loss.backward()
+                # else:
+                #     with model.no_sync():
+                #         scaled_loss.backward()
+
+                if ii == mini_batch - 1:   # 最后一个 micro-batch
                     scaled_loss.backward()
                 else:
-                    with model.no_sync():
+                    if world_size > 1:
+                        with model.no_sync():
+                            scaled_loss.backward()
+                    else:
                         scaled_loss.backward()
-                
-                bev_feats.append(outputs["bev_feat"].detach())
-                bev_feats = bev_feats[-1 * (seq_len - 1):]
-
+                    
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
-            iteration += 1
+
+                
 
 
-            
-            
-
-
-            if rank == 0 and iteration % log_print_interval == 0:
+            if rank == 0 and  iteration % log_print_interval == 0:
                 current_lr = optimizer.param_groups[0]['lr']
                 writer.add_scalar('epoch', epoch, iteration)
                 writer.add_scalar('lr', current_lr, iteration)
-                logging.info(
-                    f"Iteration [{iteration}] Epoch [{epoch+1}/{epochs}] "
-                    f"Step [{batch_idx+1}/{steps_per_epoch}] mb[{mb}] n_accu={total_accu_steps}; "
-                    f"LR: {current_lr:.6f}; loss: {float(total_loss.detach().cpu()):.4f}"
-                )
-                message = "/t"
+                logging.info(f"Iteration [{iteration}] Epoch [{epoch+1}/{epochs}] Step [{batch_idx+1}/{steps_per_epoch}]; LR: {current_lr:.6f}; "
+                    f"loss: {float(total_loss.detach().cpu()):.4f}")
+                message = ""
                 writer.add_scalar('all_loss/loss', total_loss, iteration)
                 losses = outputs.get("losses", None)
                 if losses is not None:
-                    for k, v in losses.items():
+                    for k,v in losses.items():
                         if k.startswith("det3d_"):
                             if "dn" in k:
-                                writer.add_scalar(k.replace("det3d_", "det3d/dn/"), v, iteration)
+                                writer.add_scalar(k.replace("det3d_","det3d/dn/"), v, iteration)
                             else:
-                                writer.add_scalar(k.replace("det3d_", "det3d/ori/"), v, iteration)
+                                writer.add_scalar(k.replace("det3d_","det3d/ori/"), v, iteration)
                         elif k.startswith("map3d_"):
-                            writer.add_scalar(k.replace("map3d_", "map3d/"), v, iteration)
-                        message += f"{k}:{float(v.detach().cpu()):.4f}; "
+                            writer.add_scalar(k.replace("map3d_","map3d/"), v, iteration)
+                        message += f"{k}:{float(v.detach().cpu()):.4f}; \t"
                 logging.info(message)
 
+
             if rank == 0 and iteration % log_save_interval == 0:
+                # 可视化真值
+                
+
                 from dataset.dataset import denormalize_img
                 import cv2
-                imgs = x[batchidx, :, cur_idx].cpu()
+                imgs = inputs_tensor["x"][batchidx,:,cur_idx]
                 for j, type_name in enumerate(type_names):
-                    for i, img in enumerate(imgs[j]):
-                        img_np = denormalize_img(img)
+                    for i, img in enumerate(imgs[j]) :
+                        img_np =  denormalize_img(img)
                         img_cv = cv2.cvtColor(np.array(img_np), cv2.COLOR_RGB2BGR)
-                        writer.add_image(
-                            f'{type_name}/input_img/{i}', img_cv,
-                            global_step=iteration, dataformats='HWC'
-                        )
+                        # cv2.imwrite(f"{j}_{i}.jpg", img_cv)
+                        writer.add_image(f'{type_name}/input_img/{i}', img_cv, global_step=iteration, dataformats='HWC')
+
+
 
                 camera_names = configs["camera_names"]
-                if "dynamic" in metas_mb.keys():
-                    meta = metas_mb["dynamic"]
-                    label_path = meta["label_path"][batchidx][cur_idx]
+                if "dynamic" in metas.keys():
+                    meta = metas["dynamic"]
+                    label_path = meta["label_path"][batchidx][cur_idx]# 最后一个batch的最后一帧(当前在)
                     gt_labels_det3D = meta["gt_labels_det3D"][batchidx][cur_idx].cpu().numpy()
                     gt_bboxes_det3D = meta["gt_bboxes_det3D"][batchidx][cur_idx].cpu().numpy()
                     gt_labels_det3D_mask = meta["gt_labels_det3D_mask"][batchidx][cur_idx].cpu().numpy()
-
-                    from utils.vis_gt import vis_dynamic_gt, vis_dynamic_pred
-                    gt_dynamic_canvas, gt_dynamic_images = vis_dynamic_gt(
-                        camera_names, label_path, gt_labels_det3D, gt_bboxes_det3D,
-                        gt_labels_det3D_mask, None
-                    )
-
+                    gt_bboxes_det3D_mask = meta["gt_bboxes_det3D_mask"][batchidx][cur_idx].cpu().numpy()
+                    if iteration == 10:
+                        print(1)
+                    
+                    from utils.vis_gt import vis_dynamic_gt,vis_dynamic_pred
+                    try:
+                        gt_dynamic_canvas,gt_dynamic_images = vis_dynamic_gt(camera_names,label_path, gt_labels_det3D, gt_bboxes_det3D, gt_labels_det3D_mask, gt_bboxes_det3D_mask)
+                    except:
+                        print(1)
+                    # 预测值
                     det3d_result = outputs["det3d_result"][-1]
                     boxes_3d = det3d_result["boxes_3d"].detach().cpu().numpy()
                     scores_3d = det3d_result["scores_3d"].detach().cpu().numpy()
                     labels_3d = det3d_result["labels_3d"].detach().cpu().numpy()
                     cls_scores = det3d_result["cls_scores"].detach().cpu().numpy()
 
-                    pt_dynamic_canvas, pt_dynamic_images = vis_dynamic_pred(
-                        camera_names=camera_names,
-                        label_path=label_path,
-                        boxes_3d=boxes_3d,
-                        scores_3d=scores_3d,
-                        labels_3d=labels_3d,
-                        score_thresh=0.3
-                    )
-                    for k, v in gt_dynamic_images.items():
-                        writer.add_image(
-                            f'dynamic/gt/{k}', cv2.cvtColor(v, cv2.COLOR_RGB2BGR),
-                            global_step=iteration, dataformats='HWC'
-                        )
-                    for k, v in pt_dynamic_images.items():
-                        writer.add_image(
-                            f'dynamic/pt/{k}', cv2.cvtColor(v, cv2.COLOR_RGB2BGR),
-                            global_step=iteration, dataformats='HWC'
-                        )
+                    pt_dynamic_canvas,pt_dynamic_images = vis_dynamic_pred(
+                                                                camera_names=camera_names,  # 来自 config/config.py
+                                                                label_path=label_path,
+                                                                boxes_3d=boxes_3d,
+                                                                scores_3d=scores_3d,
+                                                                labels_3d=labels_3d,
+                                                                score_thresh=0.3  # 可调
+                                                            ) #img_cv = cv2.cvtColor(np.array(img_np), cv2.COLOR_RGB2BGR)
+                    keys = gt_dynamic_images.keys()
+                    for k in keys:
+                        gt = cv2.cvtColor(gt_dynamic_images[k], cv2.COLOR_RGB2BGR)
+                        pt = cv2.cvtColor(pt_dynamic_images[k], cv2.COLOR_RGB2BGR)
+                        merge = np.concatenate([gt,pt],1)
+                        writer.add_image(f'dynamic/gt_pt/{k}', merge, global_step=iteration, dataformats='HWC')
+                    # for k,v in gt_dynamic_images.items():
+                    #     writer.add_image(f'dynamic/gt/{k}', cv2.cvtColor(v, cv2.COLOR_RGB2BGR), global_step=iteration, dataformats='HWC')
+                    # for k,v in pt_dynamic_images.items():  
+                    #     writer.add_image(f'dynamic/pt/{k}', cv2.cvtColor(v, cv2.COLOR_RGB2BGR), global_step=iteration, dataformats='HWC')
 
-                if "static" in metas_mb.keys():
-                    meta = metas_mb["static"]
+
+
+                if "static" in metas.keys():
+                    meta = metas["static"]
                     label_path = meta["label_path"][batchidx][cur_idx]
                     gt_labels_map3D = meta["gt_labels_map3D"][batchidx][cur_idx].cpu().numpy()
                     gt_pts_map3D = meta["gt_pts_map3D"][batchidx][cur_idx].cpu().numpy()
 
                     from utils.vis_gt import vis_static_gt
-                    gt_static_canvas, gt_static_images = vis_static_gt(
-                        camera_names, label_path, gt_labels_map3D, gt_pts_map3D
-                    )
+                    gt_static_canvas,gt_static_images = vis_static_gt(camera_names,label_path,gt_labels_map3D,gt_pts_map3D)
 
+
+                    # 2) 画预测
+                    # map_polylines 是 decode 出的结果，通常是 list 长度 B*T
                     map_polylines = outputs["map3d_out"]["map_polylines"]
                     poly = map_polylines[batchidx * seq_len + cur_idx]
                     pred_labels = poly["labels"].detach().cpu().numpy()
                     if poly["pts"].dim() == 3:
-                        pred_pts = poly["pts"].detach().cpu().numpy()
+                            pred_pts = poly["pts"].detach().cpu().numpy()
                     else:
+                        # (N, num_orders, num_pts, 2)，取 order=0
                         pred_pts = poly["pts"][:, 0].detach().cpu().numpy()
 
-                    pt_static_canvas, pt_static_images = vis_static_gt(
-                        camera_names=camera_names,
-                        label_path=label_path,
-                        labels=pred_labels,
-                        pts=pred_pts,
-                    )
+                    pt_static_canvas,pt_static_images = vis_static_gt(
+                                                            camera_names=camera_names,
+                                                            label_path=label_path,
+                                                            labels=pred_labels,
+                                                            pts=pred_pts,
+                                                        )
+                    keys = gt_static_images.keys()
+                    for k in keys:
+                        gt = cv2.cvtColor(gt_static_images[k], cv2.COLOR_RGB2BGR)
+                        pt = cv2.cvtColor(pt_static_images[k], cv2.COLOR_RGB2BGR)
+                        merge = np.concatenate([gt,pt],1)
+                        writer.add_image(f'static/gt_pt/{k}', merge, global_step=iteration, dataformats='HWC')
 
-                    for k, v in gt_static_images.items():
-                        writer.add_image(
-                            f'static/gt/{k}', cv2.cvtColor(v, cv2.COLOR_RGB2BGR),
-                            global_step=iteration, dataformats='HWC'
-                        )
-                    for k, v in pt_static_images.items():
-                        writer.add_image(
-                            f'static/pt/{k}', cv2.cvtColor(v, cv2.COLOR_RGB2BGR),
-                            global_step=iteration, dataformats='HWC'
-                        )
+                    # for k,v in gt_static_images.items():
+                    #     writer.add_image(f'static/gt/{k}', cv2.cvtColor(v, cv2.COLOR_RGB2BGR), global_step=iteration, dataformats='HWC')
+                    # for k,v in pt_static_images.items():
+                    #     writer.add_image(f'static/pt/{k}', cv2.cvtColor(v, cv2.COLOR_RGB2BGR), global_step=iteration, dataformats='HWC')
+
 
             if rank == 0 and iteration % ckpt_save_interval == 0:
                 model.eval()
-                torch.save(model.module.state_dict(), os.path.join(log_dir, f"iter{iteration}.pth"))
+                torch.save(model.state_dict(), os.path.join(log_dir,f"iter{iteration}.pth"))
                 model.train()
+
             if world_size > 1:
                 torch.distributed.barrier()
+
+        # model.eval()
+        # checkpoint = {
+        #     "state_dict": model.state_dict(),
+        #     'optimizer': optimizer.state_dict(),
+        #     "epoch": epoch,
+        #     "iteration": iteration,
+        #     'lr_schedule': scheduler.state_dict()
+        # }
+        # torch.save(checkpoint, os.path.join(log_dir,f"iter{iteration}_epoch{epoch}.pth"))
+        # model.train()
+# 
 
 
 
 
 if __name__ == "__main__":
     main()
-    """
-    # 节点 0（主节点）
-    torchrun --nnodes=2 --nproc_per_node=8 --rdzv_endpoint=master_ip:29500 train_accu.py
-    # 节点 1
-    torchrun --nnodes=2 --nproc_per_node=8 --rdzv_endpoint=master_ip:29500 train_accu.py
-    """
-
+    # CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_gpuxn.py
 ----------------------------------------

@@ -29,6 +29,7 @@ class DenoisingSampler(nn.Module):
         alpha: float = 0.25,
         gamma: float = 2.0,
         eps: float = 1e-12,
+        state_dims = 11
     ):
         super().__init__()
         self.num_dn_groups = num_dn_groups
@@ -43,10 +44,11 @@ class DenoisingSampler(nn.Module):
         self.alpha = alpha
         self.gamma = gamma
         self.eps = eps
+        self.state_dims = state_dims
 
     def encode_reg_target(self, box_target, reg_masks, device=None):
         """将 GT 框 (x,y,z,w,l,h,yaw,vx,vy,vz) 编码为 11 维：(x,y,z,log(w),log(l),log(h),sin(yaw),cos(yaw),vx,vy,vz)。"""
-        state_dims = 11
+        # state_dims = self.state_dims
         outputs = []
         outputs_mask = []
         for i, box in enumerate(box_target):
@@ -55,8 +57,9 @@ class DenoisingSampler(nn.Module):
             yaw = box[..., 6]
             sin_yaw = torch.sin(yaw).unsqueeze(-1)
             cos_yaw = torch.cos(yaw).unsqueeze(-1)
-            vel = box[..., 7:10] if box.shape[-1] >= 10 else box.new_zeros(*box.shape[:-1], 3)
-            out = torch.cat([xyz, whl, sin_yaw, cos_yaw, vel], dim=-1)
+            vel = box[..., 7:10] 
+            traj = box[..., 10:120] 
+            out = torch.cat([xyz, whl, sin_yaw, cos_yaw, vel,traj], dim=-1)
             if reg_masks is not None:
                 reg_mask = reg_masks[i]
                 mask = torch.cat(
@@ -66,6 +69,7 @@ class DenoisingSampler(nn.Module):
                         reg_mask[..., 6:7],
                         reg_mask[..., 6:7],
                         reg_mask[..., 7:10],
+                        reg_mask[..., 10:120],
                     ],
                     dim=-1,
                 )
@@ -101,16 +105,17 @@ class DenoisingSampler(nn.Module):
         return cost
 
     def _box_cost(self, box_pred, box_target, instance_reg_weights, reg_masks=None):
-        bs = box_pred.shape[0]
+        state_dims = self.state_dims
+        bs,num,dim = box_pred.shape
         cost = []
         for i in range(bs):
             if len(box_target[i]) == 0:
                 cost.append(None)
                 continue
-            diff = torch.abs(box_pred[i, :, None] - box_target[i][None])  # (num_pred, M, D)
-            static_w = instance_reg_weights[i][None]                     # (1, M, D)
+            diff = torch.abs(box_pred[i, :, None] - box_target[i][None,:,:dim])  # (num_pred, M, D)
+            static_w = instance_reg_weights[i][None,:,:dim]                     # (1, M, D)
             if reg_masks is not None:
-                dynamic_w = reg_masks[i][None]                            # (1, M, D)
+                dynamic_w = reg_masks[i][None,:,:dim]                            # (1, M, D)
             else:
                 dynamic_w = torch.ones_like(static_w)
             weight = static_w * dynamic_w * box_pred.new_tensor(self.reg_weights)
@@ -179,22 +184,24 @@ class DenoisingSampler(nn.Module):
                 ))
             else:
                 indices.append((None, None))
-
+        state_dims = self.state_dims
         output_cls_target = cls_target[0].new_ones(bs, num_pred, dtype=torch.long) * -1 # torch.Size([10, 100]) -- 6
         output_box_target = box_pred.new_zeros(box_pred.shape)# torch.Size([10, 100, 11])
         output_reg_weights = box_pred.new_zeros(box_pred.shape)
+        output_traj_target = box_pred.new_zeros(*box_pred.shape[:2],110) + 999.
         for i, (pred_idx, target_idx) in enumerate(indices): # bs = 10
             if pred_idx is None or len(cls_target[i]) == 0:
                 continue
             output_cls_target[i, pred_idx] = cls_target[i][target_idx] # 100ge 位置除了指定的位置其他值为6
-            output_box_target[i, pred_idx] = box_target_encoded[i][target_idx]
-            static_weight = reg_weights[i][target_idx]
+            output_box_target[i, pred_idx] = box_target_encoded[i][target_idx,:state_dims]
+            output_traj_target[i, pred_idx] = box_target_encoded[i][target_idx,state_dims:]
+            static_weight = reg_weights[i][target_idx,:state_dims]
             if reg_masks is not None:
-                dynamic_mask = reg_masks[i][target_idx]
+                dynamic_mask = reg_masks[i][target_idx,:state_dims]
                 output_reg_weights[i, pred_idx] = static_weight * dynamic_mask
             else:
                 output_reg_weights[i, pred_idx] = static_weight
-        return output_cls_target, output_box_target, output_reg_weights
+        return output_cls_target, output_box_target, output_reg_weights,output_traj_target
 
     def get_dn_anchors(self, cls_target, box_target,reg_masks=None, gt_instance_id=None):
         """
@@ -202,6 +209,7 @@ class DenoisingSampler(nn.Module):
         cls_target: list of (N_gt,) 类别；box_target: list of (N_gt, 10) 或 (N_gt, 11)  decoded 框。
         Returns: (dn_anchor, dn_reg_target, dn_cls_target, dn_attn_mask, valid_mask, dn_id_target)
         """
+        state_dims = self.state_dims
         if self.num_dn_groups <= 0:
             return None
         if self.num_temp_dn_groups <= 0:
@@ -226,6 +234,8 @@ class DenoisingSampler(nn.Module):
         box_target, reg_masks = self.encode_reg_target(
             box_target, reg_masks, cls_target.device
         )
+        box_target = [box[...,:state_dims] for box in box_target]
+        reg_masks =  [mask[...,:state_dims] for mask in reg_masks]
         if reg_masks is not None:
             reg_masks = [
                 F.pad(

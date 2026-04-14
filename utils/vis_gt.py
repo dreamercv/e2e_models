@@ -211,6 +211,30 @@ def draw_bev_traj(bev=None,bev_h=200*8,bev_w=80*8,trajs=None,world_x=200,world_y
         cv2.circle(bev, (int(px),int(py)), 1, color, 2)  # 注意：OpenCV使用(x,y)即(列,行)
     return bev
 
+def draw_traj(bev=None,pos = (0,0),bev_h=200*8,bev_w=80*8,trajs=None,masks=None,world_x=200,world_y=80,color=(0,0,255)):
+    # trajs = trajs.astype(np.uint16)
+    ego = (bev_w//2,120*8)
+    if bev is None:
+        bev = np.zeros((bev_h,bev_w,3),dtype=np.uint8) + 255
+    traj_x,traj_y = trajs[:,0],trajs[:,1]
+    piex_y = ego[1] - traj_x * (bev_h /world_x )
+    piex_x = ego[0] - traj_y * (bev_w /world_y )
+
+
+    # x,y = pos
+    # p_y = ego[1] - x * (bev_h /world_x )
+    # p_x = ego[0] - y * (bev_w /world_y )
+    # cv2.circle(bev, (int(p_x),int(p_y)), 2, (0,0,0), 2)
+
+    # print(piex_x,piex_y)
+    for i in range(len(piex_x)):
+    # 用不同颜色表示轨迹点
+        px, py = piex_x[i],piex_y[i]
+        mask = masks[i]
+        if mask==0:continue
+        cv2.circle(bev, (int(px),int(py)), 1, color, 2)  # 注意：OpenCV使用(x,y)即(列,行)
+    return bev
+
 def draw_bev_object(pts, bird_view=None, world_size_x=200, world_size_y=80, 
                     out_size_h=200*8, out_size_w=80*8, ego_position=120,
                     color=(0, 255, 0), thickness=2, draw_edges=True, fill_color=None):
@@ -434,7 +458,7 @@ def vis_dynamic_gt(camera_names,label_path,labels,bboxes,label_masks=None,bboxes
             else:
                 color = class_colors[int(label)]
             
-            x, y, z, width, length, height, yaw, vx,vy,vz = bboxes[i]
+            x, y, z, width, length, height, yaw, vx,vy,vz = bboxes[i,:10]
             pitch,roll = 0,0
 
             box3d_lidar = create_3d_bbox_corners([x,y,z],[length,width,height],[roll,pitch,yaw])
@@ -470,7 +494,7 @@ def vis_dynamic_gt(camera_names,label_path,labels,bboxes,label_masks=None,bboxes
         else:
             color = class_colors[int(label)]
         
-        x, y, z, width, length, height, yaw, vx,vy,vz = bboxes[i]
+        x, y, z, width, length, height, yaw, vx,vy,vz = bboxes[i,:10]
         pitch,roll = 0,0
         box3d_lidar = create_3d_bbox_corners([x,y,z],[length,width,height],[roll,pitch,yaw])
 
@@ -485,7 +509,26 @@ def vis_dynamic_gt(camera_names,label_path,labels,bboxes,label_masks=None,bboxes
             color=class_colors[int(label)],  # 使用分配的颜色
             thickness=2,
             fill_color=color  # 根据visibility_token填充
-        )
+        ) 
+        if traj_mask is not None:
+            if label_mask != 0:
+                dt = 0.1
+                his_len = 5
+                traj_v = bboxes[i,10:].reshape(-1,2)
+                traj_mask = bboxes_masks[i,10:].reshape(-1,2)
+                pos = np.array([x,y])[None]
+                fur_traj = np.cumsum(traj_v[his_len:] * dt,0) + pos
+                history_v = traj_v[:his_len]  
+                history_v_rev = history_v[::-1]
+                history_offset = -np.cumsum(history_v_rev * dt, axis=0)
+                history_coords_rev = pos + history_offset 
+                his_traj = history_coords_rev[::-1]
+                reconstructed = np.vstack([his_traj, fur_traj])
+                bev_img = draw_traj(bev=bev_img,pos={x, y},bev_h=200*8,bev_w=80*8,trajs=reconstructed,masks=traj_mask[:,0],world_x=200,world_y=80,color=class_colors[int(label)])
+            # print(1)
+        # 绘制轨迹
+        cv2.imwrite("bev.jpg",bev_img)
+
     images["bev"] = bev_img
     # cv2.imwrite(f"bev.jpg", bev_img)
     # print("bev",bev_img.shape)

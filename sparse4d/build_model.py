@@ -48,6 +48,7 @@ def build_det3D_head(
         instance_grad=True,
         anchor_grad=True,
         cls_threshold_to_reg=-1,
+        anchor_dim=11,
 ):
     """从 model.py 拷贝的 Sparse4D BEV head 构建函数，用于测试。"""
     if anchor_init is None:

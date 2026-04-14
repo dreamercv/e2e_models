@@ -6,37 +6,44 @@
 @E-mail       :afb5szh@bosch.com
 @Version      :V1.0.0
 @Description  :
-    整体思路----数据不同源版本，并且分段训练：
-        1、时序图像作为输入（2*bs*5*8*3*128*384）,其中5表示时序五帧，8表示环视相机一共有8个，2表示两种数据:只标注目标相关的动态数据和只标注了车道线相关的金泰数据,3*128*384是输入图像的尺寸
-        2、输入图像经过自定义的纯2d卷积网络，下采样四倍，输出的通道数是256，卷积网络输出的大小为2*bs*5*8*256*32*96,我称这个模型是image_backbone模块
-        3、image_backbone的输出经过内外参的转换将其投影到3d的bev空间，具体方法为：在自车坐标系初始化一个200米*80米*6米(xyz)的3d空间,然后通过内外参将其转到像素坐标coor，然后根据coor的索引将image_backbone的像素特征对齐到3d空间,多视角就可以融合成一个bev空间。这个模块称之为bev_backbone,输出的大小是2*bs*5*256*200*80
-        4、时序融合模块algin_module:bev_backbone的输出是5帧，通过自车的相对位姿将特征图对齐warp/插值方式，对齐方式如下：
-            第一帧：第一帧F1,输出维度是bs*256*200*80
-            第二帧：第一帧对齐到第二帧，conv(cat(algin(F1),F2)) = algin_F2,输出维度是bs*256*200*80
-            第三帧：将对齐后的第二帧对齐在第三帧，conv(cat(algin(algin_F2),F3)) = algin_F3,输出维度是bs*256*200*80
-            第四帧：将对齐后的第三帧对齐到第四帧，conv(cat(algin(algin_F3),F4)) = algin_F4,输出维度是bs*256*200*80
-            第五帧：将对齐后的第四帧对齐到第五帧，conv(cat(algin(algin_F4),F5)) = algin_F5,输出维度是bs*256*200*80
-            algin_F1_5 = cat(F1,algin_F2,algin_F3,algin_F4,algin_F5)
-            这样就的得到了时序对齐的特征algin_F1_5 ,输出维度是2*bs*5*256*200*80，与上一帧对齐，最久可以对齐历史五帧（记忆历史五帧的信息）
-        5、split_module:该模块将两种数据分开，分别为dynamic_input=bs*5*256*200*80，static_input=bs*5*256*200*80
+            整体思路----数据不同源版本，并且分段训练：
+                1、时序图像作为输入（2*bs*5*8*3*128*384）,其中5表示时序五帧，8表示环视相机一共有8个，2表示两种数据:只标注目标相关的动态数据和只标注了车道线相关的金泰数据,3*128*384是输入图像的尺寸
+                2、输入图像经过自定义的纯2d卷积网络，下采样四倍，输出的通道数是256，卷积网络输出的大小为2*bs*5*8*256*32*96,我称这个模型是image_backbone模块
+                3、image_backbone的输出经过内外参的转换将其投影到3d的bev空间，具体方法为：在自车坐标系初始化一个200米*80米*6米(xyz)的3d空间,然后通过内外参将其转到像素坐标coor，然后根据coor的索引将image_backbone的像素特征对齐到3d空间,多视角就可以融合成一个bev空间。这个模块称之为bev_backbone,输出的大小是2*bs*5*256*200*80
+                4、时序融合模块algin_module:bev_backbone的输出是5帧，通过自车的相对位姿将特征图对齐warp/插值方式，对齐方式如下：
+                    第一帧：第一帧F1,输出维度是bs*256*200*80
+                    第二帧：第一帧对齐到第二帧，conv(cat(algin(F1),F2)) = algin_F2,输出维度是bs*256*200*80
+                    第三帧：将对齐后的第二帧对齐在第三帧，conv(cat(algin(algin_F2),F3)) = algin_F3,输出维度是bs*256*200*80
+                    第四帧：将对齐后的第三帧对齐到第四帧，conv(cat(algin(algin_F3),F4)) = algin_F4,输出维度是bs*256*200*80
+                    第五帧：将对齐后的第四帧对齐到第五帧，conv(cat(algin(algin_F4),F5)) = algin_F5,输出维度是bs*256*200*80
+                    algin_F1_5 = cat(F1,algin_F2,algin_F3,algin_F4,algin_F5)
+                    这样就的得到了时序对齐的特征algin_F1_5 ,输出维度是2*bs*5*256*200*80，与上一帧对齐，最久可以对齐历史五帧（记忆历史五帧的信息）
+                5、split_module:该模块将两种数据分开，分别为dynamic_input=bs*5*256*200*80，static_input=bs*5*256*200*80
 
-        世界模型分支
-            6、在algin_module模块的输出后接入decoder，输入上一帧，输出当前帧的bev然后和当前帧的bev计算相似度从而达到重建bev的效果。
+                世界模型分支
+                    6、在algin_module模块的输出后接入decoder，输入上一帧，输出当前帧的bev然后和当前帧的bev计算相似度从而达到重建bev的效果。
 
-        动态分支：
-            7、det_head目标检测输出头:algin_module的输出dynamic_input后接入sparse4d的输出头，将在bev上获取检测的instance（bs，5*900*256）和anchor(bs*5*900*11),900指的是最大目标数量900，256是instance的特征维度，11是anchor的预测值包括：x,y,z,w,h,l,vx,vy,vz,yaw,id
-            8、动态目标轨迹预测头(obj_traj_head)：（融合历史五帧信息出当前一帧的轨迹）将algin_module输出的第五帧帧和检测第五帧的instance，以及历史历史5帧的轨迹（bs*900*10）作为动态目标迹预测头的输入，最后预测出当前帧(第五帧)周围目标5秒的轨迹（bs*900*100）和对应的insance（bs*900*256），其中100是50*2，2是xy两个分量，50是未来50帧
+                动态分支：
+                    7、det_head目标检测输出头:algin_module的输出dynamic_input后接入sparse4d的输出头，将在bev上获取检测的instance（bs，5*900*256）和anchor(bs*5*900*11),900指的是最大目标数量900，256是instance的特征维度，11是anchor的预测值包括：x,y,z,w,h,l,vx,vy,vz,yaw,id
+                    8、动态目标轨迹预测头(obj_traj_head)：（融合历史五帧信息出当前一帧的轨迹）将algin_module输出的第五帧帧和检测第五帧的instance，以及历史历史5帧的轨迹（bs*900*10）作为动态目标迹预测头的输入，最后预测出当前帧(第五帧)周围目标5秒的轨迹（bs*900*100）和对应的insance（bs*900*256），其中100是50*2，2是xy两个分量，50是未来50帧
 
-        静态分支
-            9、map_head地图检测头:algin_module输出对齐后的bev特征static_input后接入maptr的输出头，将在bev上获取map的instance（bs*5*200*256）和anchor(bs*5*200*3),200指的是最大地图instance为200个，3是(x,y和类别)
-            10、自车未来行驶的拓扑轨迹头-ego_static_head:将maphead的instance和algin_module的最后一帧特征拿出来，输入到ego_static_head中，输出以自车为起点到bev边缘的行驶轨迹(bs*1*20*2)以及对应的instance(bs*1*256),20*2是从自车为起点，等步长走到bev的边缘
-        
-        端到端分支 ： 上面分支训练收敛后才能启动该阶段的训练
-            11、端到端轨迹头e2ehead:将algin_module的bevfeature(bs*256*200*80)、det的instance(bs*900*256)和动态目标轨迹的instance(bs*900*256)、map的instance(bs*200*256)以及自车未来拓扑轨迹的instance(bs*1*256)的最后一帧取出来作，输入到轨迹头中，即希望输出的端到端轨迹中有5帧的信息融合，输出形状是bs*100。其中bevfeature是bev的场景描述，det的instance和动态目标轨迹的instance是动态场景的理解，map的instance和自车拓扑轨迹是静态场景理解。经过上述的所有场景的融合形成了最终的端到端轨迹
-
-
+                静态分支
+                    9、map_head地图检测头:algin_module输出对齐后的bev特征static_input后接入maptr的输出头，将在bev上获取map的instance（bs*5*200*256）和anchor(bs*5*200*3),200指的是最大地图instance为200个，3是(x,y和类别)
+                    10、自车未来行驶的拓扑轨迹头-ego_static_head:将maphead的instance和algin_module的最后一帧特征拿出来，输入到ego_static_head中，输出以自车为起点到bev边缘的行驶轨迹(bs*1*20*2)以及对应的instance(bs*1*256),20*2是从自车为起点，等步长走到bev的边缘
+                
+                端到端分支 ： 上面分支训练收敛后才能启动该阶段的训练
+                    11、端到端轨迹头e2ehead:将algin_module的bevfeature(bs*256*200*80)、det的instance(bs*900*256)和动态目标轨迹的instance(bs*900*256)、map的instance(bs*200*256)以及自车未来拓扑轨迹的instance(bs*1*256)的最后一帧取出来作，输入到轨迹头中，即希望输出的端到端轨迹中有5帧的信息融合，输出形状是bs*100。其中bevfeature是bev的场景描述，det的instance和动态目标轨迹的instance是动态场景的理解，map的instance和自车拓扑轨迹是静态场景理解。经过上述的所有场景的融合形成了最终的端到端轨迹
 
 
+
+由于数据不同源，所以训练逻辑如下：
+    1、假设在dynamic数据上，可以先训练3d+目标轨迹，再训练端到端轨迹
+    2、假设在static数据上，可以选训练map+静态轨迹，再训练端到端轨迹
+    3、假设既要3d表征和map表征以及目标轨迹和静态轨迹，分阶段训练：
+        3.1、先训练3d表征和目标轨迹
+        3.2、再训练map表征和静态轨迹
+        3.3、将上述输入到端到端，最后训练端到端轨迹
+    4、假设想要端到端的训练(图像输入，轨迹输出)，那么就是同源数据，直接训练即可
 '''
 
 
@@ -50,6 +57,113 @@ import torchvision
 import torch
 import random
 
+# configs = {
+#     # 总的参数
+#     "grid_conf" : {
+#         'xbound': [-80.0, 120.0, 1],
+#         'ybound': [-40.0, 40.0, 1],
+#         'zbound': [-2.0, 4.0, 1.0]
+#     },
+
+#     "clip_paths":{
+#         "dynamic":["/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/det.txt"],
+#         "static":["/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/map.txt"],
+#         "dynamic_static":["/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/dynamic_static.txt"],
+#         "e2e":["/home/fb/project/models/Sparse4D-main/projects/e2e_models/dataset/clip_dataset/e2e.txt"],
+#     },
+#     "camera_infos":{
+#         "FrontCam02":{
+#             "resize_lim": [(0.1, 0.1),  (0.17,0.23), (0.35, 0.45)],
+#             "bot_pct_lim":[(0.15, 0.25),(0.27, 0.37),(0.37,0.47)]
+#         },     #前 大
+#         "RearCam01":     {"resize_lim":[(0.2, 0.3)],"bot_pct_lim":[(0.2, 0.5)]},      #后方
+#         "SideFrontCam01":{"resize_lim":[(0.2, 0.3)],"bot_pct_lim":[(0.2, 0.5)]}, #左前
+#         "SideFrontCam02":{"resize_lim":[(0.2, 0.3)],"bot_pct_lim":[(0.2, 0.5)]}, #右前
+#         "SideRearCam01": {"resize_lim":[(0.2, 0.3)],"bot_pct_lim":[(0.2, 0.5)]},  #左后
+#         "SideRearCam02": {"resize_lim":[(0.2, 0.3)],"bot_pct_lim":[(0.2, 0.5)]}   #右后
+#     },
+#     'rot_lim': (-0.0, 0.0),
+#     "flip":False,
+
+#     'final_dim': (128, 384),
+
+#     "mode":"dynamic",
+
+
+#     "train_clips":2, # -1 所有，[]指定几个，xxx.txt写进txt中指定的，>0前N个
+    
+#     "total_len":20+1+50, # 一共71帧，当前帧是第21帧，往前20帧，往后50帧 ，最后一帧索引对应着70 ，未来50帧为了获取真值
+#     "current_frame_index":20,# 0 1 2 3 4 5 ... [20] 21 22 23 ... 70
+    
+
+
+#     "task_flag":{
+#         "det2D":False,
+#         "det3D":True,
+
+#         "map2D":False,
+#         "map3D":False,
+
+#         "obj_dynamic_traj":False,
+#         "e2e_static_traj":False,
+#         "e2e_dynamic_traj":False,
+#     },
+#     "task_class_names":{
+#         "dynamic":["det3D","obj_dynamic_traj","det2D","e2e_dynamic_traj"], 
+#         "static":["map3D","map2D","e2e_static_traj","e2e_dynamic_traj"],
+#         "dynamic_static":[
+#             "det3D","obj_dynamic_traj","det2D",
+#             "map3D","map2D","e2e_static_traj",
+#             "e2e_dynamic_traj"
+#             ],
+#         "e2e":[
+#             "e2e_static_traj",
+#             "e2e_dynamic_traj"
+#             ],
+#     },
+#     "task_indexs":{ # 在每次getitem时，随机取值
+#         # 在dyo的label上取值
+#         "det2D":[0,20], # 起始帧和结束帧                #输入N帧输出N帧
+#         "det3D":  [0,20], # 起始帧和结束帧              #输入N帧输出N帧
+#         "obj_dynamic_traj": [0,20], # 起始帧和结束帧    #输入N帧，预测最后一帧的轨迹
+#         # 在lane的label上取值
+#         "map2D":[0,20], # 起始帧和结束帧                #输入N帧输出N帧
+#         "map3D":  [0,20], # 起始帧和结束帧              #输入N帧输出N帧
+
+#         # 在自车位姿上取值
+#         "e2e_dynamic_traj": [0,20], # 起始帧和结束帧    #输入N帧，预测最后一帧的轨迹
+#         "e2e_static_traj":  [0,20], # 起始帧和结束帧    #输入N帧，预测最后一帧的轨迹
+#     },
+#     "seq_len":5, 
+#     # 预测任务的参数
+#     "his_lens":{ # 历史长度 ,对于预测任务来说，需要输入历史真值才能预测未来真值，所以上述task_indexs需要减去历史长度
+#         "obj_dynamic_traj":5, # seq_len 必须大于等于 his_lens 否则无法制作真值
+#         "e2e_dynamic_traj":5,
+#     },
+#     "fur_lens":{ # 未来长度
+#         "obj_dynamic_traj": 50,
+#         "e2e_dynamic_traj": 50,
+#     }, # his_lens , fur_lens 即输入历史真值预测未来轨迹
+#     "frequency":{ # 频率 10Hz
+#         "obj_dynamic_traj": 10, # 真值插值成10Hz,即5秒内真值为50个点
+#         "e2e_dynamic_traj": 10, # 真值插值成10Hz,即5秒内真值为50个点
+#     },
+
+
+
+
+
+#     "camera_names":[
+#         "FrontCam02",     #前 
+#         "RearCam01",      #后方
+#         "SideFrontCam01", #左前
+#         "SideFrontCam02", #右前
+#         "SideRearCam01",  #左后
+#         "SideRearCam02"   #右后
+#     ],
+#     # 3D 检测类别：与 convert_det 输出的 object_infos[].sub_category 对应，用于映射到类别下标
+#     "det_class_names": ["car", "truck", "bus", "pedestrian", "bicycle", "motorcycle", "traffic_cone", "barrier"],
+# }
 
 
 
@@ -179,27 +293,11 @@ class Dataset(torch.utils.data.Dataset):
         self.frequency = config["frequency"]
         # self.useful_indexs,self.group_indexs = self.get_input_indexs()
 
-        self.stride = self.total_len - (self.seq_len - 1)
-
-        
-
-
         # 数据准备
         self.get_all_paths()
         self.prepro()
         self.sces_len = [(len(self.ixes[i]) - self.total_len ) for i in self.ixes.keys()]
         self.scenes = [i for i in self.ixes.keys()]
-
-        self.samples = []
-        for clip_name in self.scenes :
-            data = self.ixes[clip_name]
-            start = 0
-            while start < len(data):
-                end = start + self.stride + (self.seq_len - 1)
-                if end > len(data):
-                    end = len(data)
-                self.samples.append([clip_name,end - self.total_len ,end])
-                start += self.stride
 
         # 检测配置
         self.det_class_names = config["det_class_names"]
@@ -243,7 +341,149 @@ class Dataset(torch.utils.data.Dataset):
         return resize,resize_dims,crop,rotate
 
     
+    # def get_cam_pos_embedding(self, post_trans, post_rots, L, aug_params, public_infos):
+    #     ogfH, ogfW = self.final_dim
+    #     fH, fW = ogfH // self.ds, ogfW // self.ds
+    #     rays = self.rays
+
+    #     N, _ = post_trans.shape
+    #     points = rays - post_trans.view(N, 1, 1, 1, 3)  # (25, 32, 128, 3)
+    #     points = torch.inverse(post_rots).view(N, 1, 1, 1, 3, 3).matmul(points.unsqueeze(-1))
+    #     points = points.squeeze().view(N // 6, 6, 32, 96, 3).numpy()
+
+    #     seq_len = N // 6
+    #     cam_pos = {}
+    #     for key in public_infos.keys():
+    #         public_info = public_infos[key]
+    #         NewCameraMatrix = public_info["NewCameraMatrix"]
+    #         lidar2cam_param = public_info["lidar2cam_param"]
+    #         intrin = np.array(lidar2cam_param['cameraMatrix'])
+    #         distort = np.array(lidar2cam_param['distortion_coeffs'])
+    #         CAM = key_list[key]
+
+    #         if CAM == "front":  # 前
+    #             pointsx = points[:, 0:3, :, :, 0].reshape(-1)
+    #             pointsy = points[:, 0:3, :, :, 1].reshape(-1)
+    #             V = np.c_[pointsx, pointsy]
+    #             points_new = cv2.undistortPoints(V, intrin, distort, None, NewCameraMatrix).reshape(-1, 2)
+    #             ds = np.ones((points_new.shape[0], 1)).astype(np.float32)
+    #             points1 = np.c_[points_new, ds].astype(np.float32)
+    #             points1 = torch.tensor(points1).view(seq_len * 3, 32, 96, 3).unsqueeze(1).unsqueeze(-1)
+    #             NewCameraMatrix = torch.tensor(NewCameraMatrix).expand(seq_len * 3, 3, 3)
+    #             points1 = torch.inverse(NewCameraMatrix).view(seq_len * 3, 1, 1, 1, 3, 3).matmul(points1).squeeze(
+    #                 -1)  # torch.Size([10, 1, 32, 128, 3])
+    #             cam_pos[CAM] = self.positional_encoding(points1[..., :2], L).view(seq_len, 3, fH, fW, -1).permute(0, 1,
+    #                                                                                                               4, 2,
+    #                                                                                                               3)
+    #         elif CAM == "back":  # 后
+    #             pointsx = points[:, 3, :, :, 0].reshape(-1)
+    #             pointsy = points[:, 3, :, :, 1].reshape(-1)
+    #             V = np.c_[pointsx, pointsy]
+    #             points_new = cv2.undistortPoints(V, intrin, distort, None, NewCameraMatrix).reshape(-1, 2)
+    #             ds = np.ones((points_new.shape[0], 1)).astype(np.float32)
+    #             points1 = np.c_[points_new, ds].astype(np.float32)
+    #             points1 = torch.tensor(points1).view(seq_len, 32, 96, 3).unsqueeze(1).unsqueeze(-1)
+
+    #             NewCameraMatrix = torch.tensor(NewCameraMatrix).expand(seq_len, 3, 3)
+    #             points1 = torch.inverse(NewCameraMatrix).view(seq_len, 1, 1, 1, 3, 3).matmul(points1).squeeze(-1)
+    #             cam_pos[CAM] = self.positional_encoding(points1[..., :2], L).view(seq_len, 1, fH, fW, -1).permute(0, 1,
+    #                                                                                                               4, 2,
+    #                                                                                                               3)
+    #         elif CAM == "left":  # 左
+    #             whole_img_size = (1920, 1536)
+    #             D = np.array([distort[0], distort[1], distort[4], distort[5]]).astype(np.float32)
+    #             NewCameraMatrix = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(intrin, D, whole_img_size,
+    #                                                                                      None, balance=1)
+    #             pointsx = points[:, 4, :, :, 0].reshape(-1)
+    #             pointsy = points[:, 4, :, :, 1].reshape(-1)
+    #             V = np.c_[pointsx, pointsy]
+    #             V = V[:, np.newaxis, :]
+    #             points_new = cv2.fisheye.undistortPoints(V, intrin, D, P=NewCameraMatrix).reshape(-1, 2)
+    #             ds = np.ones((points_new.shape[0], 1)).astype(np.float32)
+    #             points1 = np.c_[points_new, ds].astype(np.float32)
+    #             points1 = torch.tensor(points1).view(seq_len, 32, 96, 3).unsqueeze(1).unsqueeze(-1)
+
+    #             NewCameraMatrix = torch.tensor(NewCameraMatrix).expand(seq_len, 3, 3)
+    #             points1 = torch.inverse(NewCameraMatrix).view(seq_len, 1, 1, 1, 3, 3).matmul(points1).squeeze(-1)
+    #             cam_pos[CAM] = self.positional_encoding(points1[..., :2], L).view(seq_len, 1, fH, fW, -1).permute(0, 1,
+    #                                                                                                               4, 2,
+    #                                                                                                               3)
+    #         elif CAM == "right":  # 右
+    #             whole_img_size = (1920, 1536)
+    #             D = np.array([distort[0], distort[1], distort[4], distort[5]]).astype(np.float32)
+    #             NewCameraMatrix = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(intrin, D, whole_img_size,
+    #                                                                                      None, balance=1)
+    #             pointsx = points[:, 5, :, :, 0].reshape(-1)
+    #             pointsy = points[:, 5, :, :, 1].reshape(-1)
+    #             V = np.c_[pointsx, pointsy]
+    #             V = V[:, np.newaxis, :]
+    #             points_new = cv2.fisheye.undistortPoints(V, intrin, D, P=NewCameraMatrix).reshape(-1, 2)
+    #             ds = np.ones((points_new.shape[0], 1)).astype(np.float32)
+    #             points1 = np.c_[points_new, ds].astype(np.float32)
+    #             points1 = torch.tensor(points1).view(seq_len, 32, 96, 3).unsqueeze(1).unsqueeze(-1)
+
+    #             NewCameraMatrix = torch.tensor(NewCameraMatrix).expand(seq_len, 3, 3)
+    #             points1 = torch.inverse(NewCameraMatrix).view(seq_len, 1, 1, 1, 3, 3).matmul(points1).squeeze(-1)
+    #             cam_pos[CAM] = self.positional_encoding(points1[..., :2], L).view(seq_len, 1, fH, fW, -1).permute(0, 1,
+    #                                                                                                               4, 2,
+    #                                                                                                               3)
+    #         # 最好再把原始的x,y也保留并concat起来
+    #     cam_pos_embedding = torch.cat([cam_pos['front'], cam_pos['back'], cam_pos['left'], cam_pos['right']],
+    #                                   dim=1).view(seq_len * 6, 16, 32, 96)
+    #     return cam_pos_embedding
     
+    # def gen_camera_pos_encoding(self, post_img, post_rot, post_tran, intrin, distort, L=4):
+    #     """
+    #     根据增强后的相机参数生成每张图的相机位置编码（camera position embedding）。
+
+    #     参数:
+    #         post_img: (N, 3, H, W) 增强后的图像，只用 N/H/W
+    #         post_rot: (N, 3, 3) 相机到 ego 的旋转矩阵 R
+    #         post_tran: (N, 3)   相机在 ego 坐标下的位置 t（目前不显式用到）
+    #         intrin: (N, 3, 3)   增强后的相机内参
+    #         distort: (N, 8)     畸变参数（当前实现未显式使用）
+    #         L:                  位置编码的频率参数，与你现有 self.positional_encoding 一致
+
+    #     返回:
+    #         cam_pos_embed: (N, C, fH, fW)，C 由 self.positional_encoding 决定，
+    #         fH,fW = final_dim // ds
+    #     """
+    #     import torch
+
+    #     device = post_img.device
+    #     N, _, H, W = post_img.shape
+    #     ogfH, ogfW = self.final_dim        # 例如 (128, 384)
+    #     fH, fW = ogfH // self.ds, ogfW // self.ds   # 例如 (32, 96)
+
+    #     # 特征图网格 (fH, fW)，用增强后图像的分辨率做缩放
+    #     ys = torch.linspace(0.5, H - 0.5, fH, device=device)
+    #     xs = torch.linspace(0.5, W - 0.5, fW, device=device)
+    #     grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")   # (fH, fW)
+
+    #     ones = torch.ones_like(grid_x)
+    #     pix = torch.stack([grid_x, grid_y, ones], dim=-1)        # (fH, fW, 3)
+    #     pix = pix.view(1, fH, fW, 3).repeat(N, 1, 1, 1)          # (N, fH, fW, 3)
+    #     pix_h = pix.view(N, -1, 3).unsqueeze(-1)                 # (N, fH*fW, 3, 1)
+
+    #     # 像素 -> 相机归一化坐标（深度设为 1）
+    #     intrin_inv = torch.inverse(intrin)                       # (N, 3, 3)
+    #     cam_dirs = intrin_inv.view(N, 1, 3, 3).matmul(pix_h).squeeze(-1)  # (N, fH*fW, 3)
+    #     cam_dirs = cam_dirs / (cam_dirs.norm(dim=-1, keepdim=True) + 1e-6)
+
+    #     # 相机系 -> ego 系（方向向量）
+    #     ego_dirs = post_rot.view(N, 1, 3, 3).matmul(
+    #         cam_dirs.unsqueeze(-1)
+    #     ).squeeze(-1)                                            # (N, fH*fW, 3)
+
+    #     # 取前两维 (dx, dy) 作为位置编码输入
+    #     dirs_xy = ego_dirs[..., :2].view(N, fH, fW, 2)           # (N, fH, fW, 2)
+
+    #     # 调用已有的 positional_encoding，保持与 get_cam_pos_embedding 风格一致
+    #     cam_pos_embed = self.positional_encoding(dirs_xy, L)     # (N, fH, fW, C)
+    #     cam_pos_embed = cam_pos_embed.permute(0, 3, 1, 2).contiguous()  # (N, C, fH, fW)
+
+    #     return cam_pos_embed
+
 
     def get_image_data(self,recs):
         "输出增强后的图片(裁剪/旋转)，以及增强的参数，相关的内外惨"
@@ -374,10 +614,13 @@ class Dataset(torch.utils.data.Dataset):
         il = self.det_gt_names
         for label_path in recs:
             obj_traj_path = label_path.replace(".json","_object_trajectory.npy")
+            obj_traj_path_fix = label_path.replace(".json","_object_trajectory2.npy")
+            object_trajectorys_fix = {}
+            object_trajectorys = {}
             if os.path.exists(obj_traj_path):
                 object_trajectorys =  np.load(obj_traj_path, allow_pickle=True).item()
-            else:
-                object_trajectorys = {}
+            if os.path.exists(obj_traj_path_fix):
+                object_trajectorys_fix =  np.load(obj_traj_path_fix, allow_pickle=True).item()
             
             with open(label_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -385,7 +628,10 @@ class Dataset(torch.utils.data.Dataset):
             labels_list = []
             bboxes_list = []
             labels_maks_list,bboxes_mask_list = [],[]
-            for track_id, obj in object_infos.items():
+            for track_id, obj in object_infos.items(): # {'x': 17.53896713256836, 'y': 12.292121887207031, 'z': 0.7497396469116211}
+                traj,traj_mask = self.get_anno_obj_dynamic_traj1(track_id, object_trajectorys, object_trajectorys_fix,dt=0.1)
+                # if len(traj) != 110:
+                #     traj,traj_mask = self.get_anno_obj_dynamic_traj1(track_id, object_trajectorys, object_trajectorys_fix,dt=0.1)
                 label_mask,bboxes_mask = 1,[1 for i in range(10)]
                 pos = obj.get("position")
                 rot = obj.get("rotation")
@@ -413,10 +659,14 @@ class Dataset(torch.utils.data.Dataset):
                 h = self.gt_value("height",dim,bboxes_mask,5)# float(dim.get("height", 0))
                 yaw = self.gt_value("yaw",rot,bboxes_mask,6)#float(rot.get("yaw", 0.0))
                 vx,vy,vz = self.diff(object_trajectorys,track_id,bboxes_mask,dt=dt,idx=7)
-                bboxes_list.append([x, y, z, w, length, h, yaw, vx,vy,vz])
+                anchor = [x, y, z, w, length, h, yaw, vx,vy,vz] 
+                out = anchor + traj
+                # if len(out) != 120:
+                #     print(len(out))
+                bboxes_list.append(out)
                 labels_list.append(cls_id)
                 labels_maks_list.append(label_mask)
-                bboxes_mask_list.append(bboxes_mask)
+                bboxes_mask_list.append(bboxes_mask + traj_mask )
             if len(labels_list) == 0:
                 gt_labels_per_frame.append(torch.zeros(0, dtype=torch.long))
                 gt_bboxes_per_frame.append(torch.zeros(0, 10, dtype=torch.float32))
@@ -427,6 +677,7 @@ class Dataset(torch.utils.data.Dataset):
                 gt_bboxes_per_frame.append(torch.tensor(bboxes_list, dtype=torch.float32))
                 gt_labels_per_frame_mask.append(torch.tensor(labels_maks_list, dtype=torch.long))
                 gt_bboxes_per_frame_mask.append(torch.tensor(bboxes_mask_list, dtype=torch.float32))
+                    
         # return gt_labels_per_frame, gt_bboxes_per_frame
         return {
             "gt_labels_det3D":gt_labels_per_frame,
@@ -434,6 +685,121 @@ class Dataset(torch.utils.data.Dataset):
             "gt_labels_det3D_mask":gt_labels_per_frame_mask,
             "gt_bboxes_det3D_mask":gt_bboxes_per_frame_mask,
         }
+
+    def merge_traj(self,track_id,object_trajectorys,object_trajectorys_fix):
+        
+        object_trajectory = object_trajectorys.get(track_id,None) # 当前trackid 没有轨迹，可能是没有跟踪到的目标
+        if object_trajectory is None:
+            return -1,None
+        obj_trajectory_in_ego = object_trajectory["obj_trajectory_in_ego"]
+        mask_full = obj_trajectory_in_ego[:, -1]
+        cur_idx_arr = np.where(mask_full == 0)[0]
+        if cur_idx_arr.size == 0:
+            return -1,None # 没有找到当前帧索引的叶返回None
+        cur_idx = int(cur_idx_arr[0])
+        if len(object_trajectorys_fix) == 0:
+            return cur_idx, obj_trajectory_in_ego #不需要合并的直接返回对应的轨迹即可
+        
+        # 开始合并，有一批数据在ego坐标系下，当前帧的位姿都是0，存在问题fix对当前帧进行了修复
+        object_trajectory_fix = object_trajectorys_fix[track_id]
+        obj_trajectory_in_ego_fix = object_trajectory_fix["obj_trajectory_in_ego"]
+        obj_trajectory_in_ego[cur_idx,:3] = obj_trajectory_in_ego_fix[cur_idx,:3]
+        return cur_idx , obj_trajectory_in_ego
+
+    def get_anno_obj_dynamic_traj1(self,track_id, object_trajectorys, object_trajectorys_fix,dt=0.1):
+        """
+        从 object_trajectory_in_ego 中获取目标在自车坐标系下的动态轨迹，并做插值补全：
+        - mask=-1: 该帧目标消失
+        - mask=0: 该帧为“当前帧”
+        - mask=1: 该帧存在目标
+        对于每个轨迹，在第一次出现 1 和最后一次出现 1 之间，将 mask=-1 的位置用线性插值
+        补全 xyz，并将这些位置的 mask 置为 1。
+        然后在当前帧附近截取一个时间窗（默认前 40 帧、后 50 帧），计算速度轨迹。
+        """
+        his_len,fur_len,cur_len = self.his_lens["obj_dynamic_traj"],self.fur_lens["obj_dynamic_traj"] , 1
+        traj_len = (his_len + fur_len + cur_len ) - 1 # 换算成速度需要减去一个
+        traj_out = [0 for i in range(traj_len * 2)]
+        mask_out = [0 for i in range(traj_len*2)]
+        cur_idx , traj_mask = self.merge_traj(track_id, object_trajectorys, object_trajectorys_fix)
+        if traj_mask is None:
+            return traj_out,mask_out
+        
+        # 得到了当前帧索引和轨迹，按照配置文件获取对应历史和未来轨迹，并差分转成轨迹
+        coords_full = traj_mask[:, :3].astype(np.float32)  # (T, 3)
+        mask_full = traj_mask[:, -1].astype(np.float32)    # (T,)
+        T = coords_full.shape[0]
+        real_start_idx = cur_idx - his_len
+        real_end_idx = cur_idx + fur_len
+        start_idx = max(0, real_start_idx)
+        end_idx = min(T - 1, real_end_idx)
+        coords = coords_full[start_idx:end_idx + 1].copy()
+        mask = mask_full[start_idx:end_idx + 1].copy()
+        mask[mask==0]=1
+        one_idx = np.where(mask == 1)[0]
+
+        if one_idx.size < 2:
+            return traj_out,mask_out
+            
+        s = int(one_idx[0])
+        e = int(one_idx[-1])
+        x = np.arange(s, e + 1, dtype=np.float32)
+        mask[:s] = 0
+        mask[e+1:] = 0 
+        # 有效点：mask>=0（包括 0 和 1）
+        valid = mask[s:e + 1] >= 0
+        x_valid = x[valid]
+        if x_valid.size >= 2:
+            for d in range(3):
+                y_seg = coords[s:e + 1, d]
+                y_valid = y_seg[valid]
+                # 用相邻有效点对 -1 位置做线性插值
+                y_interp = np.interp(x, x_valid, y_valid)
+                missing = mask[s:e + 1] < 0
+                coords[s:e + 1, d][missing] = y_interp[missing]
+            # 被插值的位置视作存在目标
+            mask[s:e + 1][mask[s:e + 1] < 0] = 1.
+                
+        # 计算速度：一阶差分 / dt，长度为 L-1
+        traj = (coords[1:] - coords[:-1]) / dt # 当前+历史=5帧，未来是50帧
+        
+        mask[s] = 0
+        mask = mask[1:]
+        traj[mask == 0] = 999.
+        traj = traj[:,:2].reshape(-1).tolist()
+        mask = mask.tolist() #和traj_v保持一致
+        mask += mask
+
+        # 还原
+        pos = coords_full[cur_idx,:2][None]
+        traj_n = np.array(traj).reshape(-1,2)
+        
+        fur_traj = np.cumsum(traj_n[his_len:] * dt,0) + pos
+        history_v = traj_n[:his_len]               # 形状 (5, 2)，顺序：v[0]→v[4]
+        history_v_rev = history_v[::-1] # 逆序，现在第1个是 v[4]（从历史最后一点到当前点）
+        history_offset = -np.cumsum(history_v_rev * dt, axis=0)  # 负的累积位移
+        history_coords_rev = pos + history_offset          # 形状 (5, 2)，顺序：coords[4], coords[3], ..., coords[0]
+        # 如需按时间顺序（从早到晚）排列，再反转一次
+        his_traj = history_coords_rev[::-1]  # 形状 (5, 2)，对应 coords[0] 到 coords[4]
+
+        reconstructed = np.vstack([his_traj, pos, fur_traj])
+
+        start_traj = []
+        end_traj = []
+        start_mask = []
+        end_mask = []
+        if real_start_idx < 0:
+            start_traj = [0 for i in range(-1*real_start_idx*2)]
+            start_mask = [0 for i in range(-1*real_start_idx*2)]
+        if real_end_idx > T-1:
+            end_traj = [0 for i in range((real_end_idx - (T-1))*2)]
+            end_mask = [0 for i in range((real_end_idx - (T-1))*2)]
+        traj = start_traj + traj + end_traj
+        mask = start_mask + mask + end_mask
+        return traj,mask
+
+
+
+
 
     def get_anno_map3D(self, recs):
         """
@@ -623,14 +989,21 @@ class Dataset(torch.utils.data.Dataset):
         """
 
 
-        label_path = recs[-1]  # 只选择最后一帧作为真值
+        label_path =  recs[self.current_frame_index] # 只选择最后一帧作为真值
         obj_traj_path = label_path.replace(".json", "_object_trajectory.npy")
+        obj_traj_path_fix = label_path.replace(".json", "_object_trajectory2.npy")
+        
+            
         if os.path.exists(obj_traj_path):
             object_trajectorys = np.load(obj_traj_path, allow_pickle=True).item()
+            if os.path.exists(obj_traj_path_fix):
+                object_trajectorys_fix = np.load(obj_traj_path_fix, allow_pickle=True).item()
+            else:
+                object_trajectorys_fix = None
         else:
             object_trajectorys = {}
 
-        trackids = []
+        # trackids = []
         obj_trajs = []
         masks = []
 
@@ -644,6 +1017,8 @@ class Dataset(torch.utils.data.Dataset):
             if cur_idx_arr.size == 0:
                 continue
             cur_idx = int(cur_idx_arr[0])
+            if object_trajectorys_fix is not None:
+                coords_full[cur_idx,:] = object_trajectorys_fix[trackid]["obj_trajectory_in_ego"][cur_idx,:3].astype(np.float32)
 
             T = coords_full.shape[0]
             start_idx = max(0, cur_idx - self.his_lens["obj_dynamic_traj"])
@@ -676,7 +1051,7 @@ class Dataset(torch.utils.data.Dataset):
             traj_v = (coords[1:] - coords[:-1]) / dt # 当前+历史=5帧，未来是50帧
             mask[s] = -1.
             mask = mask[1:] #和traj_v保持一致
-            trackids.append(trackid)
+            # trackids.append(trackid)
             obj_trajs.append(traj_v)
             masks.append(mask.tolist())
 
@@ -693,15 +1068,15 @@ class Dataset(torch.utils.data.Dataset):
 
 
         return {
-            "dynamic_trackids": trackids,
+            # "dynamic_trackids": trackids,
             "dynamic_trajs": obj_trajs,
             "dynamic_traj_masks": masks,
         }
 
     def get_Hz_by_filename_from_json(self, paths):
-        filename1 = paths[0].strip(os.sep).split(os.sep)[-1].replace(".json","").replace("_LidarFusion.json", "").replace("_MainLidar01.json","")
-        filename2 = paths[1].strip(os.sep).split(os.sep)[-1].replace(".json","").replace("_LidarFusion.json", "").replace("_MainLidar01.json","")
-        dt = abs(int(filename1.split(".")[-1][:3]) - int(filename2.split(".")[-1][:3]) / 1000) # 秒为单位
+        filename1 = paths[0].strip(os.sep).split(os.sep)[-1].replace("_LidarFusion.json", "").replace("_MainLidar01.json","")
+        filename2 = paths[1].strip(os.sep).split(os.sep)[-1].replace("_LidarFusion.json", "").replace("_MainLidar01.json","")
+        dt = abs(int(filename1.split(".")[-1][:3]) - int(filename2.split(".")[-1][:3]) )/ 1000 # 秒为单位
         # Hz = 1 / dt # Hz为单位
         return dt
 
@@ -800,14 +1175,15 @@ class Dataset(torch.utils.data.Dataset):
             T_ego2wld_cur = TransformationmatrixEgo(ego_pose["orientation"],ego_pose["position"])
             ego_poses.append(T_ego2wld_cur)
         return np.array(ego_poses)
-
+        
     def get_algin_theta_mat(self,recs):
         theta_mats = []
-        for i ,rec in enumerate(recs[:5]):
+        for i ,rec in enumerate(recs):
             label = json.load(open(rec,"r"))
             ego_pose = label["ego_pose"]
             T_ego2wld_cur = TransformationmatrixEgo(ego_pose["orientation"],ego_pose["position"])
             if i == 0:
+                
                 theta_mat = np.array([
                     [1.,0.,0.],
                     [0.,1.,0.]
@@ -835,58 +1211,6 @@ class Dataset(torch.utils.data.Dataset):
                 theta_mat = (pre_mat@(rel_pose@post_mat))[:2,:]
             T_ego2wld_pre = T_ego2wld_cur
             theta_mats.append(theta_mat)
-
-        Ts = []
-        
-        for i ,rec in enumerate(recs[:5]):
-            label = json.load(open(rec,"r"))
-            ego_pose = label["ego_pose"]
-            T_ego2wld_cur = TransformationmatrixEgo(ego_pose["orientation"],ego_pose["position"])
-            Ts.append(T_ego2wld_cur)
-
-        theta_mats1 = []
-        for i ,rec in enumerate(recs[:5]):
-            T_ego2wld_pre = Ts[i]
-            T_ego2wld_cur = Ts[4]
-            
-            sx = self.bevh / 2
-            sy = self.bevw / 2
-            pose_diff = np.linalg.inv(T_ego2wld_pre)@T_ego2wld_cur
-            yaw = np.arctan2(pose_diff[1,0], pose_diff[0,0])
-            dx = pose_diff[0, 3]
-            dy = pose_diff[1, 3]
-            cos = np.cos(yaw)
-            sin = np.sin(yaw)
-            eye = np.zeros((3,3),dtype=np.float32)
-            rel_pose = eye.copy()
-            rel_pose[2,2]=1
-            rel_pose[0,0],rel_pose[0,1],rel_pose[0,2] = cos,-sin,dx
-            rel_pose[1,0],rel_pose[1,1],rel_pose[1,2] = sin,cos,dy
-            pre_mat = np.array([[0., 1./sy, 0.], # 车头往下
-                                [1./sx, 0., -1/5],
-                                [0., 0., 1.]])
-            post_mat = np.array([[0., sx, sx/5],
-                                [sy, 0., 0.],
-                                [0., 0., 1.]])
-            theta_mat = (pre_mat@(rel_pose@post_mat))[:2,:]
-            theta_mats1.append(theta_mat)
-        
-        theta_mat =  np.array([
-                    [1.,0.,0.],
-                    [0.,1.,0.],
-                    [0.,0.,1.]
-                ])
-        theta_mats2 = []
-        for i in range(5):
-            if i == 0:
-                theta_mat_pre = np.eye(3,dtype=np.float32)
-            else:
-                
-                theta_mat_i = np.eye(3,dtype=np.float32)
-                theta_mat_i[:2] =  theta_mats[i]
-                theta_mat_pre =  np.linalg.inv(theta_mat_pre)@theta_mat_i
-            theta_mats2.append(theta_mat_pre)
-         
         return np.array(theta_mats)
 
     def gt_value(self,m,src,mask,idx):
@@ -953,32 +1277,27 @@ class Dataset(torch.utils.data.Dataset):
 
     def get_input_indexs(self):
         image_indexs = [i for i in range(self.current_frame_index+1)]
-        gt_indexs = image_indexs[self.seq_len-1:]
+        gt_indexs = image_indexs# image_indexs[self.seq_len-1:]
         return image_indexs,gt_indexs
         
 
 
     def __getitem__(self, index):
-        # sces_len = self.sces_len
-        # scenes = self.scenes
-        # sce_id = [i for i in range(len(sces_len)) if (sum(sces_len[:i]) <= index and sum(sces_len[:i + 1]) > index)][0]
-        # clip_name = scenes[sce_id]
-        # sce_id_ind = index - sum(sces_len[:sce_id])
-
-        
-
-        # rec = self.ixes[clip_name][sce_id_ind:sce_id_ind + self.total_len]
-
-        clip_name,start_idx,end_idx = self.samples[index]
-        rec =  self.ixes[clip_name][start_idx:end_idx]
-
+        sces_len = self.sces_len
+        scenes = self.scenes
+        sce_id = [i for i in range(len(sces_len)) if (sum(sces_len[:i]) <= index and sum(sces_len[:i + 1]) > index)][0]
+        clip_name = scenes[sce_id]
+        sce_id_ind = index - sum(sces_len[:sce_id])
+        rec = self.ixes[clip_name][sce_id_ind:sce_id_ind + self.total_len]
         dt = self.get_Hz_by_filename_from_json(rec)
         mode = self.dynamic_static_data(clip_name) # 判断那种数据类型，是否指标了动态数据，还是只标了静态数据，还是两者都标注了
         image_indexs,gt_indexs= self.get_input_indexs()  # 16 17 18 19 20
         #数据增强部分
-        image_recs = [rec[i] for i in image_indexs]
-        
-        imgs, rots, trans, intrins, distorts, post_rots, post_trans,intervals,timestamps = self.get_image_data(image_recs)
+        recs = [rec[i] for i in image_indexs]
+        label_paths = {
+            "label_path":recs
+        }
+        imgs, rots, trans, intrins, distorts, post_rots, post_trans,intervals,timestamps = self.get_image_data(recs)
         images_parma = {
             "x": imgs,                  # 14 8 3 128 384 # 最后在batch上拼接 # bs * T * 8 * 3 * 128 * 384
             "rots": rots,               # 14 8 3 3        
@@ -992,19 +1311,15 @@ class Dataset(torch.utils.data.Dataset):
         }
 
         #时序对其部分
-        ego_pose = self.get_ego_pose(image_recs)
-        ego_pose_matrixs = {
-            "ego_pose": torch.Tensor(ego_pose)
+        # theta_mats = self.get_algin_theta_mat(recs)
+        ego_poses = self.get_ego_pose(recs)
+        algin_matrixs = {
+            "ego_poses": torch.Tensor(ego_poses)
         }
 
-        gt_recs = [rec[i] for i in gt_indexs]
-
-        label_paths = {
-            "label_path":gt_recs
-        }
 
         anno_infos = {}
-        
+        gt_recs = [rec[i] for i in gt_indexs]
 
         # 有哪些任务收集哪些真值
         if mode == "dynamic" or mode == "dynamic_static":
@@ -1012,8 +1327,8 @@ class Dataset(torch.utils.data.Dataset):
                 anno_infos.update(self.get_anno_det2D(gt_recs))
             if self.task_flags["det3D"]:
                 anno_infos.update(self.get_anno_det3D(gt_recs,dt=dt))
-            # if self.task_flags["obj_dynamic_traj"]:
-            #     anno_infos.update(self.get_anno_obj_dynamic_traj(gt_recs,dt=dt))
+            if self.task_flags["obj_dynamic_traj"]:
+                anno_infos.update(self.get_anno_obj_dynamic_traj(gt_recs,dt=dt))
 
         if mode == "static" or mode == "dynamic_static":
             if self.task_flags["map2D"]:
@@ -1033,7 +1348,7 @@ class Dataset(torch.utils.data.Dataset):
 
         out = {}
         out.update(images_parma)
-        out.update(ego_pose_matrixs)
+        out.update(algin_matrixs)
         out.update(anno_infos)
         out.update(label_paths)
 
@@ -1041,7 +1356,7 @@ class Dataset(torch.utils.data.Dataset):
 
 
     def __len__(self):
-        return len(self.samples)
+        return sum([(len(self.ixes[i]) - self.total_len) for i in self.ixes.keys()])
     
     def prepro(self):
         all_clip_names = list(self.clip2path.keys())
@@ -1124,8 +1439,8 @@ def custom_collate(batch):
         if key in ['gt_labels_det3D', 'gt_bboxes_det3D',
                    'gt_labels_det3D_mask', 'gt_bboxes_det3D_mask',
                    'gt_labels_map3D', 'gt_bboxes_map3D', 'gt_pts_map3D',
-                   'gt_obj_dynamic_traj']:
-            out[key] = values  # 保持为 list of samples' original data
+                   'dynamic_trajs','dynamic_traj_masks']:
+            out[key] = values  # 保持为 list of samples' original
             continue
 
         # 处理需要堆叠的 Tensor 或 NumPy 数组

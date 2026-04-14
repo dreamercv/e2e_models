@@ -4,7 +4,7 @@ configs = {
 
     "device":"cuda",# cuda cpu
     "warmup_steps":10,
-    "lr":1e-3,
+    "lr":1e-3, # 总学习率
     "max_grad_norm": 5,
     "weight_decay":1e-4,
     "resume":False,
@@ -12,16 +12,17 @@ configs = {
     "backbone":"resnet18",
     "backbone_path":"../resnet18-f37072fd.pth",
 
+    "bn2gn_num_groups":32,
 
     "is_train": True,
-    "batch_size": 8,
+    "batch_size": 2, #单卡batchsize
     "num_workers": 1,
-    "epoch": 200,
+    "epoch": 400,
     "seq_len": 5,
 
 
-    "log_dir": "../logs/only_dynamic_0401_5frames_dn_algin_cnsx2_oriroi_newdepth_newaug_campos_learn_giou_stream_demo",
-    "log_save_interval": 10,
+    "log_dir": "../logs/only_dynamic_0407_gradx5_nograd4_gpuxn_dynamictraj",
+    "log_save_interval": 1,
     "log_print_interval": 1,
     "ckpt_save_interval":100,
 
@@ -31,6 +32,19 @@ configs = {
         "dynamic_static": False,
         "e2e": False,
     },
+
+    "task_flag": { # 启动哪些任务
+        "det2D": False,
+        "det3D": True,
+        "obj_dynamic_traj": True,
+
+        "map2D": False,
+        "map3D": True,
+        "e2e_static_traj": True,
+
+        "e2e_dynamic_traj": True,
+    },
+
     # 总的参数
     "grid_conf": {
         'xbound': [-80.0, 120.0, 1],
@@ -73,22 +87,12 @@ configs = {
     "mode": "static",  # 默认加载动态数据
     
 
-    "train_clips":["20250508072555"],# ["20260101010101"],  # -1 所有，[]指定几个，xxx.txt写进txt中指定的，>0前N个
+    "train_clips": ["20260101010101"],  # -1 所有，[]指定几个，xxx.txt写进txt中指定的，>0前N个
 
-    "total_len": 20 + 1 + 50,  # 一共71帧，当前帧是第21帧，往前20帧，往后50帧 ，最后一帧索引对应着70 ，未来50帧为了获取真值
-    "current_frame_index": 20,  # 0 1 2 3 4 5 ... [20] 21 22 23 ... 70
+    "total_len": 8 + 1 + 50,  # 一共71帧，当前帧是第21帧，往前20帧，往后50帧 ，最后一帧索引对应着70 ，未来50帧为了获取真值
+    "current_frame_index": 8,  # 0 1 2 3 4 5 ... [20] 21 22 23 ... 70
 
-    "task_flag": {
-        "det2D": False,
-        "det3D": True,
-        "obj_dynamic_traj": True,
-
-        "map2D": False,
-        "map3D": True,
-        "e2e_static_traj": True,
-
-        "e2e_dynamic_traj": True,
-    },
+    
     "task_class_names": {
         "dynamic": ["det2D", "det3D", "obj_dynamic_traj"],
         "static": ["map3D", "map2D", "e2e_static_traj"],
@@ -162,7 +166,7 @@ configs = {
         ],
         "e2e": ["gt_e2e_dynamic_traj","label_path"]
     },
-    "input_names": ["x", "rots", "trans", "intrins", "distorts", "post_rots", "post_trans", "ego_pose","intervals","timestamps"],
+    "input_names": ["x", "rots", "trans", "intrins", "distorts", "post_rots", "post_trans", "ego_poses","intervals","timestamps"],
 
     # 模型相关
     "img_outchannels": 256,
@@ -200,6 +204,17 @@ configs = {
         "instance_grad":False,
         "anchor_grad":True,
         "cls_threshold_to_reg":-1,
+        "anchor_dim":11,
+    },
+    "traj_dynamic":{
+        "nbooks":1,
+        "d_model":256,
+        "nhead":4,
+        "num_layers":3,
+        "vqvae_num_slots":1024,
+        "e_dim":256,
+        "n_e":1,
+        "freeze_vqvae":False,
     },
     # tracking
     "track_head": {

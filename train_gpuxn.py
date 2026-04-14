@@ -12,7 +12,7 @@ import os
 import sys
 import json
 import argparse
-
+import random
 from tqdm import tqdm
 import numpy as np
 import torch
@@ -99,42 +99,64 @@ def main():
     args = parser.parse_args()
 
     script_path = os.path.abspath(__file__)
+
+    if 'LOCAL_RANK' in os.environ:
+        local_rank = int(os.environ['LOCAL_RANK'])
+    else:
+        local_rank = args.local_rank
     
 
-    if args.local_rank != -1:
-        torch.cuda.set_device(args.local_rank)
-        device=torch.device("cuda", args.local_rank)
+    if local_rank != -1:
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
         torch.distributed.init_process_group(backend="nccl", init_method='env://')
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+    else:
+        device = configs.get("device", "cuda")
+        rank = 0
+        world_size = 1
 
 
     set_seed(seed=42)
 
-    device = configs["device"]
+
     model = Model(configs).to(device)
+    if local_rank != -1:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[local_rank], output_device=local_rank,
+            find_unused_parameters=True
+        )
 
     # BN层多卡数据共享均值方差
     num_gpus = torch.cuda.device_count()
     
-    # # print("num_gpus:",num_gpus)
-    # if num_gpus > 1:
-    #     # model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
-    #     model.to(device)
-    #     model = nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True)
-    # else:
-    #     model.to(device)
+    
 
-    path_checkpoint = configs.get("pretrain",None)
-    strict=False
+    path_checkpoint = configs.get("pretrain", None)
+    strict = False
+    checkpoint = None
     if path_checkpoint is not None:
-        checkpoint = torch.load(path_checkpoint, map_location=device)  # 加载断
+        checkpoint = torch.load(path_checkpoint, map_location=device)
         if "state_dict" not in checkpoint.keys():
-            model.load_state_dict(checkpoint, strict=False)
+            state_dict = checkpoint
+
+            # model.load_state_dict(checkpoint, strict=False)
         else:
-            try:
-                model.load_state_dict(checkpoint["state_dict"], strict=True)
-                strict = True
-            except:
-                model.load_state_dict(checkpoint["state_dict"], strict=False)
+            state_dict = checkpoint["state_dict"]
+        
+        if local_rank != -1 and not any(k.startswith('module.') for k in state_dict):
+                # 添加 'module.' 前缀
+            state_dict = {'module.' + k: v for k, v in state_dict.items()}
+        elif local_rank == -1 and any(k.startswith('module.') for k in state_dict):
+            # 去除 'module.' 前缀
+            state_dict = {k[7:]: v for k, v in state_dict.items()}
+
+        try:
+            model.load_state_dict(state_dict, strict=True)
+            strict = True
+        except Exception:
+            model.load_state_dict(state_dict, strict=False)
 
     # 配置参数
     batch_size = configs["batch_size"]
@@ -149,25 +171,37 @@ def main():
     load_types = configs["load_types"]
     types_names = sorted(list(load_types.keys()))
     # 优化器（可按需改成 AdamW 等）
-    lr = configs.get("lr", 1e-3)
+    total_lr = configs.get("lr", 1e-3)          # config 中的 lr 视为总学习率
+    if world_size > 1:
+        lr = total_lr / world_size              # 单卡学习率 = 总学习率 / GPU 数量
+    else:
+        lr = total_lr
     weight_decay = configs.get("weight_decay", 1e-4)
     max_grad_norm = configs.get("max_grad_norm", 5)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay,betas=(0.9,0.95))
+    
     
     log_dir = os.path.join(os.path.dirname(script_path),configs["log_dir"])
-    os.makedirs(log_dir,exist_ok=True)
+    # os.makedirs(log_dir,exist_ok=True)
     # 日志文件名（带时间戳）
-    log_file = os.path.join(log_dir, f"train_{time.strftime('%Y%m%d_%H%M%S')}.log")
+    # log_file = os.path.join(log_dir, f"train_{time.strftime('%Y%m%d_%H%M%S')}.log")
+    if rank == 0:
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(log_dir, f"train_{time.strftime('%Y%m%d_%H%M%S')}.log")
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s',
+            handlers=[
+                logging.FileHandler(log_file),
+                logging.StreamHandler()
+            ]
+        )
+        writer = SummaryWriter(logdir=log_dir)
+        config_path = os.path.join(os.path.dirname(script_path), "config/config.py")
+        os.system(f"cp {config_path} {log_dir}")
+    else:
+        # 禁用非主进程的日志输出
+        logging.basicConfig(level=logging.ERROR)
 
-    # 配置 logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s',
-        handlers=[
-            logging.FileHandler(log_file),  # 输出到文件
-            logging.StreamHandler()         # 输出到控制台
-        ]
-    )
 
     active = []
     useful_type_names = []
@@ -180,7 +214,7 @@ def main():
     steps_per_epoch = max(len(dl) for _, dl, _ in active)
     logging.info(f"steps_per_epoch: {steps_per_epoch}")
 
-
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay,betas=(0.9,0.95))
     total_steps = epochs * steps_per_epoch
     warmup_steps = configs["warmup_steps"]# int(0.05 * total_steps) 
     scheduler = create_scheduler_with_warmup(
@@ -190,7 +224,12 @@ def main():
         base_lr=lr,
         eta_min=0
     )
-
+    if rank == 0:
+        logging.info(
+            f"[train] epochs: {epochs}; steps_per_epoch: {steps_per_epoch}, "
+            f"total_steps (optimizer steps): {total_steps}"
+        )
+        logging.info(f"Total LR (global): {total_lr:.2e}, Per-GPU LR: {lr:.2e}, world_size: {world_size}")
     # scheduler = lr_scheduler.CosineAnnealingLR(optimizer,T_max=steps_per_epoch*epochs,eta_min=0)
 
     iteration = -1
@@ -210,9 +249,9 @@ def main():
     log_save_interval = configs.get("log_save_interval", 100)
     ckpt_save_interval = configs.get("ckpt_save_interval", 100)
     
-    config_path = os.path.join(os.path.dirname(script_path),"config/config.py")
-    os.system(f"cp {config_path} {log_dir}")
-    writer = SummaryWriter(logdir=log_dir)
+    # 
+    # os.system(f"cp {config_path} {log_dir}")
+    # writer = SummaryWriter(logdir=log_dir)
     
     # logging.info("Config:\n"+json.dumps(configs,indent=4))
     model.train()
@@ -224,7 +263,7 @@ def main():
         iters = [iter(dl) for _, dl, _ in active]
         
         for batch_idx in range(steps_per_epoch):
-            torch.cuda.empty_cache()
+            # torch.cuda.empty_cache()
 
             batches = [] 
             type_names = []
@@ -263,10 +302,9 @@ def main():
 
             # 组装 metas（把 dynamic / static 的真值合并）
             metas = recursive_to_device(gts_values,device) #metas["dynamic"]["gt_labels_det3D"] =  list(2, 5, n*d)
-
+            optimizer.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
             iteration += 1
-            # mini_batch = inputs_tensor["x"].shape[2]
-            # steps_acc = mini_batch - seq_len
             pre_bev = []
             for ii in tqdm(range(mini_batch), desc="Processing frames",leave=False):
                 x = inputs_tensor["x"][:,:,ii:ii+1]
@@ -312,30 +350,38 @@ def main():
                 if total_loss is None:
                     continue
 
-                # optimizer.zero_grad()
-                # total_loss.backward()
-                # optimizer.step()
-
-                # total_loss.backward()
 
                 scaled_loss = total_loss / steps_acc
-                scaled_loss.backward()
+                # if ii == mini_batch - 1:   # 最后一个 mb
+                #     scaled_loss.backward()
+                # else:
+                #     with model.no_sync():
+                #         scaled_loss.backward()
+
+                if ii == mini_batch - 1:   # 最后一个 micro-batch
+                    scaled_loss.backward()
+                else:
+                    if world_size > 1:
+                        with model.no_sync():
+                            scaled_loss.backward()
+                    else:
+                        scaled_loss.backward()
                     
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             optimizer.step()
             scheduler.step()
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
                 
 
 
-            if iteration % log_print_interval == 0:
+            if rank == 0 and  iteration % log_print_interval == 0:
                 current_lr = optimizer.param_groups[0]['lr']
                 writer.add_scalar('epoch', epoch, iteration)
                 writer.add_scalar('lr', current_lr, iteration)
                 logging.info(f"Iteration [{iteration}] Epoch [{epoch+1}/{epochs}] Step [{batch_idx+1}/{steps_per_epoch}]; LR: {current_lr:.6f}; "
                     f"loss: {float(total_loss.detach().cpu()):.4f}")
-                message = "/t"
+                message = ""
                 writer.add_scalar('all_loss/loss', total_loss, iteration)
                 losses = outputs.get("losses", None)
                 if losses is not None:
@@ -347,11 +393,11 @@ def main():
                                 writer.add_scalar(k.replace("det3d_","det3d/ori/"), v, iteration)
                         elif k.startswith("map3d_"):
                             writer.add_scalar(k.replace("map3d_","map3d/"), v, iteration)
-                        message += f"{k}:{float(v.detach().cpu()):.4f}; "
+                        message += f"{k}:{float(v.detach().cpu()):.4f}; \t"
                 logging.info(message)
 
 
-            if iteration % log_save_interval == 0:
+            if rank == 0 and iteration % log_save_interval == 0:
                 # 可视化真值
                 
 
@@ -374,10 +420,15 @@ def main():
                     gt_labels_det3D = meta["gt_labels_det3D"][batchidx][cur_idx].cpu().numpy()
                     gt_bboxes_det3D = meta["gt_bboxes_det3D"][batchidx][cur_idx].cpu().numpy()
                     gt_labels_det3D_mask = meta["gt_labels_det3D_mask"][batchidx][cur_idx].cpu().numpy()
+                    gt_bboxes_det3D_mask = meta["gt_bboxes_det3D_mask"][batchidx][cur_idx].cpu().numpy()
+                    if iteration == 10:
+                        print(1)
                     
                     from utils.vis_gt import vis_dynamic_gt,vis_dynamic_pred
-                    gt_dynamic_canvas,gt_dynamic_images = vis_dynamic_gt(camera_names,label_path, gt_labels_det3D, gt_bboxes_det3D, gt_labels_det3D_mask, None)
-                    
+                    try:
+                        gt_dynamic_canvas,gt_dynamic_images = vis_dynamic_gt(camera_names,label_path, gt_labels_det3D, gt_bboxes_det3D, gt_labels_det3D_mask, gt_bboxes_det3D_mask)
+                    except:
+                        print(1)
                     # 预测值
                     det3d_result = outputs["det3d_result"][-1]
                     boxes_3d = det3d_result["boxes_3d"].detach().cpu().numpy()
@@ -393,10 +444,16 @@ def main():
                                                                 labels_3d=labels_3d,
                                                                 score_thresh=0.3  # 可调
                                                             ) #img_cv = cv2.cvtColor(np.array(img_np), cv2.COLOR_RGB2BGR)
-                    for k,v in gt_dynamic_images.items():
-                        writer.add_image(f'dynamic/gt/{k}', cv2.cvtColor(v, cv2.COLOR_RGB2BGR), global_step=iteration, dataformats='HWC')
-                    for k,v in pt_dynamic_images.items():  
-                        writer.add_image(f'dynamic/pt/{k}', cv2.cvtColor(v, cv2.COLOR_RGB2BGR), global_step=iteration, dataformats='HWC')
+                    keys = gt_dynamic_images.keys()
+                    for k in keys:
+                        gt = cv2.cvtColor(gt_dynamic_images[k], cv2.COLOR_RGB2BGR)
+                        pt = cv2.cvtColor(pt_dynamic_images[k], cv2.COLOR_RGB2BGR)
+                        merge = np.concatenate([gt,pt],1)
+                        writer.add_image(f'dynamic/gt_pt/{k}', merge, global_step=iteration, dataformats='HWC')
+                    # for k,v in gt_dynamic_images.items():
+                    #     writer.add_image(f'dynamic/gt/{k}', cv2.cvtColor(v, cv2.COLOR_RGB2BGR), global_step=iteration, dataformats='HWC')
+                    # for k,v in pt_dynamic_images.items():  
+                    #     writer.add_image(f'dynamic/pt/{k}', cv2.cvtColor(v, cv2.COLOR_RGB2BGR), global_step=iteration, dataformats='HWC')
 
 
 
@@ -427,17 +484,26 @@ def main():
                                                             labels=pred_labels,
                                                             pts=pred_pts,
                                                         )
+                    keys = gt_static_images.keys()
+                    for k in keys:
+                        gt = cv2.cvtColor(gt_static_images[k], cv2.COLOR_RGB2BGR)
+                        pt = cv2.cvtColor(pt_static_images[k], cv2.COLOR_RGB2BGR)
+                        merge = np.concatenate([gt,pt],1)
+                        writer.add_image(f'static/gt_pt/{k}', merge, global_step=iteration, dataformats='HWC')
 
-                    for k,v in gt_static_images.items():
-                        writer.add_image(f'static/gt/{k}', cv2.cvtColor(v, cv2.COLOR_RGB2BGR), global_step=iteration, dataformats='HWC')
-                    for k,v in pt_static_images.items():
-                        writer.add_image(f'static/pt/{k}', cv2.cvtColor(v, cv2.COLOR_RGB2BGR), global_step=iteration, dataformats='HWC')
+                    # for k,v in gt_static_images.items():
+                    #     writer.add_image(f'static/gt/{k}', cv2.cvtColor(v, cv2.COLOR_RGB2BGR), global_step=iteration, dataformats='HWC')
+                    # for k,v in pt_static_images.items():
+                    #     writer.add_image(f'static/pt/{k}', cv2.cvtColor(v, cv2.COLOR_RGB2BGR), global_step=iteration, dataformats='HWC')
 
 
-            if iteration % ckpt_save_interval == 0:
-                    model.eval()
-                    torch.save(model.state_dict(), os.path.join(log_dir,f"iter{iteration}.pth"))
-                    model.train()
+            if rank == 0 and iteration % ckpt_save_interval == 0:
+                model.eval()
+                torch.save(model.state_dict(), os.path.join(log_dir,f"iter{iteration}.pth"))
+                model.train()
+
+            if world_size > 1:
+                torch.distributed.barrier()
 
         # model.eval()
         # checkpoint = {
@@ -456,3 +522,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_gpuxn.py
